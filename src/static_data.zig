@@ -1204,6 +1204,13 @@ const StaticDataBuilder = struct {
             }
             written += 1;
         }
+        // Object formats such as wasm require a section's relocations in offset
+        // order, and a record's fields are copied in field order, not layout order.
+        std.mem.sort(StaticDataRelocation, result, {}, struct {
+            fn lessThan(_: void, a: StaticDataRelocation, b: StaticDataRelocation) bool {
+                return a.offset < b.offset;
+            }
+        }.lessThan);
         return result;
     }
 
