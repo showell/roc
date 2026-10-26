@@ -1,0 +1,41 @@
+# One filtered Zig test suite on one Linux runner, for checking a single
+# change on this fork without dispatching the whole Core Compiler CI. Lives on
+# the fork's main only; never part of a PR branch.
+name: One test (fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The branch or commit to test
+        required: true
+      step:
+        description: The build step, e.g. run-test-zig-module-compile
+        required: true
+      filter:
+        description: -Dtest-filter, a substring of the test's name
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: xyzzylabs/setup-zig@09d85d9dbb73308882e7a26e61a8f706eed40df1 # ratchet:xyzzylabs/setup-zig@v1.0.2
+        with:
+          version: 0.17.0
+          use-cache: false
+      - uses: actions/cache@v6.1.0 # ratchet:actions/cache@v6.1.0
+        with:
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
+          key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-deps-${{ runner.os }}-${{ runner.arch }}-
+      - name: The step, filtered
+        run: zig build ${{ inputs.step }} -Dtest-filter="${{ inputs.filter }}" --summary all
