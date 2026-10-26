@@ -689,8 +689,10 @@ test "hoisted Dec and I128 list constants keep their elements 16-aligned in stat
 fn expectElementsSixteenAligned(exports: []const static_data_exports.StaticDataExport, elements: []const u8) !void {
     for (exports) |static_export| {
         const at = std.mem.indexOf(u8, static_export.bytes, elements) orelse continue;
-        try std.testing.expect(static_export.alignment >= 16);
-        try std.testing.expectEqual(@as(usize, 0), at % 16);
+        if (static_export.alignment < 16 or at % 16 != 0) {
+            std.debug.print("{s}: elements at byte {d} of an export aligned to {d} (symbol_offset {d})\n", .{ static_export.symbol_name, at, static_export.alignment, static_export.symbol_offset });
+            return error.StaticDataElementsMisaligned;
+        }
         return;
     }
     return error.StaticDataElementsNotFound;
