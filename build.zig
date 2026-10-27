@@ -2994,6 +2994,7 @@ pub fn build(b: *std.Build) void {
             eval_args_list.append(b.allocator, "--filter") catch @panic("OOM");
             eval_args_list.append(b.allocator, f) catch @panic("OOM");
         }
+        eval_args_list.append(b.allocator, "--llvm") catch @panic("OOM");
         break :blk eval_args_list.toOwnedSlice(b.allocator) catch @panic("OOM");
     } else run_args;
     _ = install_and_run(
