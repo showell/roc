@@ -10,6 +10,7 @@ const deep_nesting_tests = @import("eval_deep_nesting_tests.zig");
 const highest_lowest_tests = @import("eval_highest_lowest_tests.zig");
 const issue_tests = @import("eval_issue_tests.zig");
 const interpreter_style_tests = @import("eval_interpreter_style_tests.zig");
+const alignment_corpus_tests = @import("eval_alignment_corpus_tests.zig");
 const low_level_tests = @import("eval_low_level_tests.zig");
 const match_tests = @import("eval_match_tests.zig");
 const polymorphism_tests = @import("eval_polymorphism_tests.zig");
@@ -8267,4 +8268,4 @@ const core_tests = [_]TestCase{
     },
 };
 
-pub const tests = @import("eval_set_tests.zig").tests ++ core_tests ++ comptime_finalization_tests.tests ++ crypto_tests.tests ++ deep_nesting_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ match_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests ++ iter_alloc_tests.tests ++ simd_tests.tests ++ value_representation_tests.tests;
+pub const tests = @import("eval_set_tests.zig").tests ++ core_tests ++ comptime_finalization_tests.tests ++ crypto_tests.tests ++ deep_nesting_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ match_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests ++ iter_alloc_tests.tests ++ simd_tests.tests ++ value_representation_tests.tests ++ alignment_corpus_tests.tests;

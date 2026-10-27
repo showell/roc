@@ -290,6 +290,9 @@ const jobs = [_]Job{
     // `run-test-eval` leaves LLVM out for speed. This focused run keeps the
     // exact-bit float contract on every host without it.
     .{ .name = "run-test-eval-llvm-float-bits", .kind = .harness },
+    // Optimized LLVM turns a misaligned 16-byte value into a crash; this
+    // corpus puts Dec, I128 and U128 where alignment matters.
+    .{ .name = "run-test-eval-llvm-alignment", .kind = .harness },
     // The modules these load are WebAssembly, so one host is enough.
     .{ .name = "run-test-repl-wasm", .placement = .primary_host },
     .{ .name = "run-test-echo-wasm", .placement = .primary_host },

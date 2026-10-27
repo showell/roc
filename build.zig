@@ -1759,6 +1759,7 @@ pub fn build(b: *std.Build) void {
     const build_test_eval_runner_step = b.step("build-test-eval-runner", "Build eval test runner");
     const run_test_eval_step = b.step("run-test-eval", "Run eval tests in parallel across enabled backends");
     const run_test_eval_llvm_float_bits_step = b.step("run-test-eval-llvm-float-bits", "Check that float results agree bit for bit across backends, LLVM included");
+    const run_test_eval_llvm_alignment_step = b.step("run-test-eval-llvm-alignment", "Check that 16-byte values stay aligned under LLVM, through the alignment corpus");
     const run_test_simd_differential_step = b.step("run-test-simd-differential", "Run the exhaustive integer-SIMD oracle corpus through every compiler consumer");
     const build_test_eval_host_effects_runner_step = b.step("build-test-eval-host-effects-runner", "Build runtime host-effects eval test runner");
     const run_test_eval_host_effects_step = b.step("run-test-eval-host-effects", "Run runtime host-effects eval tests across supported backends");
@@ -3020,6 +3021,21 @@ pub fn build(b: *std.Build) void {
     run_llvm_float_bits_eval.addPassthruArgs();
     run_llvm_float_bits_eval.step.dependOn(build_test_eval_runner_step);
     run_test_eval_llvm_float_bits_step.dependOn(&run_llvm_float_bits_eval.step);
+
+    // Optimized LLVM is the backend that turns a misaligned 16-byte value
+    // into a crash, through aligned vector loads, so the alignment corpus
+    // runs with LLVM on every pull request.
+    const run_llvm_alignment_eval = b.addRunArtifact(eval_test_exe);
+    run_llvm_alignment_eval.addArgs(&.{
+        "--llvm",
+        "--threads",
+        "1",
+        "--filter",
+        "alignment corpus:",
+    });
+    run_llvm_alignment_eval.addPassthruArgs();
+    run_llvm_alignment_eval.step.dependOn(build_test_eval_runner_step);
+    run_test_eval_llvm_alignment_step.dependOn(&run_llvm_alignment_eval.step);
 
     const run_simd_eval = b.addRunArtifact(eval_test_exe);
     run_simd_eval.addArgs(&.{
