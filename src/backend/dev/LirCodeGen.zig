@@ -25742,6 +25742,11 @@ test "entrypoint arg offsets preserve Roc alignment order" {
     try codegen.computeEntrypointArgOffsets(&.{ .bool, .i64 }, offsets[0..]);
 
     try std.testing.expectEqualSlices(u32, &.{ 8, 0 }, offsets[0..]);
+
+    // Each argument takes a slot of at least 8 bytes, as the LLVM entrypoint
+    // wrapper that fills the buffer lays it out.
+    try codegen.computeEntrypointArgOffsets(&.{ .u32, .u32 }, offsets[0..]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 8 }, offsets[0..]);
 }
 
 test "entrypoint param slots round aggregates to ABI word width" {
