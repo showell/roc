@@ -7502,6 +7502,122 @@ Builtin :: [].{
 				}
 			}
 
+			## Returns `Bool.True` if the byte is an ASCII digit, `'0'` to `'9'`.
+			## ```roc
+			## expect U8.is_ascii_digit('7')
+			##
+			## expect !U8.is_ascii_digit('a')
+			## ```
+			is_ascii_digit : U8 -> Bool
+			is_ascii_digit = |byte| byte >= '0' and byte <= '9'
+
+			## Returns `Bool.True` if the byte is an ASCII hexadecimal digit: `'0'` to `'9'`,
+			## `'a'` to `'f'`, or `'A'` to `'F'`.
+			## ```roc
+			## expect U8.is_ascii_hex_digit('F')
+			##
+			## expect !U8.is_ascii_hex_digit('g')
+			## ```
+			is_ascii_hex_digit : U8 -> Bool
+			is_ascii_hex_digit = |byte| U8.is_ascii_digit(byte) or (byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F')
+
+			## Returns `Bool.True` if the byte is an ASCII letter, `'a'` to `'z'` or `'A'` to `'Z'`.
+			##
+			## Like every ASCII method on [U8], this returns `Bool.False` for the bytes
+			## `128` to `255`. They are never ASCII: in UTF-8 they are the parts of longer
+			## characters, so the bytes of a letter like `é` are not alphabetic here. For
+			## letters beyond ASCII, see the [`unicode` package](https://github.com/roc-lang/unicode).
+			## ```roc
+			## expect U8.is_ascii_alphabetic('q')
+			##
+			## expect !"é".to_utf8().any(|byte| byte.is_ascii_alphabetic())
+			## ```
+			is_ascii_alphabetic : U8 -> Bool
+			is_ascii_alphabetic = |byte| (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z')
+
+			## Returns `Bool.True` if the byte is an ASCII letter or digit: `'a'` to `'z'`,
+			## `'A'` to `'Z'`, or `'0'` to `'9'`.
+			## ```roc
+			## expect U8.is_ascii_alphanumeric('Z')
+			##
+			## expect !U8.is_ascii_alphanumeric('_')
+			## ```
+			is_ascii_alphanumeric : U8 -> Bool
+			is_ascii_alphanumeric = |byte| U8.is_ascii_alphabetic(byte) or U8.is_ascii_digit(byte)
+
+			## Returns `Bool.True` if the byte is ASCII whitespace: a space, a tab (`'\t'`), a
+			## line feed (`'\n'`), a vertical tab (`11`), a form feed (`12`), or a carriage
+			## return (`'\r'`).
+			##
+			## These are the ASCII characters [Str.trim] removes. Some formats define
+			## whitespace differently: HTML leaves out the vertical tab, and JSON allows only
+			## space, tab, line feed, and carriage return. When reading a format like that,
+			## check its own definition.
+			## ```roc
+			## expect U8.is_ascii_whitespace('\t')
+			##
+			## expect !U8.is_ascii_whitespace('_')
+			## ```
+			is_ascii_whitespace : U8 -> Bool
+			is_ascii_whitespace = |byte| byte == ' ' or (byte >= '\t' and byte <= '\r')
+
+			## Returns `Bool.True` if the byte is ASCII punctuation: one of the 32 printable
+			## ASCII characters that are not a letter, a digit, or a space.
+			## ```
+			## ! " # $ % & ' ( ) * + , - . / : ; < = > ? @ [ \ ] ^ _ ` { | } ~
+			## ```
+			## ```roc
+			## expect U8.is_ascii_punctuation('~')
+			##
+			## expect !U8.is_ascii_punctuation(' ')
+			## ```
+			is_ascii_punctuation : U8 -> Bool
+			is_ascii_punctuation = |byte| (byte >= '!' and byte <= '/') or (byte >= ':' and byte <= '@') or (byte >= '[' and byte <= '`') or (byte >= '{' and byte <= '~')
+
+			## Returns `Bool.True` if the byte is an ASCII control character: `0` to `31`, or
+			## `127` (delete). Tab, line feed, and carriage return are control characters too.
+			## ```roc
+			## expect U8.is_ascii_control('\n')
+			##
+			## expect !U8.is_ascii_control(' ')
+			## ```
+			is_ascii_control : U8 -> Bool
+			is_ascii_control = |byte| byte < ' ' or byte == 127
+
+			## Returns the byte with an ASCII uppercase letter, `'A'` to `'Z'`, made lowercase.
+			## Every other byte is returned unchanged.
+			##
+			## This is the rule [Str.with_ascii_lowercased] applies to each byte of a string.
+			## ```roc
+			## expect U8.with_ascii_lowercased('Q') == 'q'
+			##
+			## expect U8.with_ascii_lowercased('[') == '['
+			## ```
+			with_ascii_lowercased : U8 -> U8
+			with_ascii_lowercased = |byte|
+				if byte >= 'A' and byte <= 'Z' {
+					byte + ('a' - 'A')
+				} else {
+					byte
+				}
+
+			## Returns the byte with an ASCII lowercase letter, `'a'` to `'z'`, made uppercase.
+			## Every other byte is returned unchanged.
+			##
+			## This is the rule [Str.with_ascii_uppercased] applies to each byte of a string.
+			## ```roc
+			## expect U8.with_ascii_uppercased('q') == 'Q'
+			##
+			## expect U8.with_ascii_uppercased('{') == '{'
+			## ```
+			with_ascii_uppercased : U8 -> U8
+			with_ascii_uppercased = |byte|
+				if byte >= 'a' and byte <= 'z' {
+					byte - ('a' - 'A')
+				} else {
+					byte
+				}
+
 			## Iterator of integers beginning with this `U8` and ending with the other `U8`.
 			## (Use [U8.until] instead to end with the other `U8` minus one.)
 			## Returns an empty iterator if this `U8` is greater than the other.
