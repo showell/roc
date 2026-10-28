@@ -7519,7 +7519,7 @@ Builtin :: [].{
 			## expect !U8.is_ascii_hex_digit('g')
 			## ```
 			is_ascii_hex_digit : U8 -> Bool
-			is_ascii_hex_digit = |byte| U8.is_ascii_digit(byte) or (byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F')
+			is_ascii_hex_digit = |byte| U8.is_ascii_digit(byte) or (byte >= 'a' and byte <= 'f')
 
 			## Returns `Bool.True` if the byte is an ASCII letter, `'a'` to `'z'` or `'A'` to `'Z'`.
 			##
