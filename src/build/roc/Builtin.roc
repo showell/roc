@@ -7503,6 +7503,7 @@ Builtin :: [].{
 			}
 
 			## Returns `Bool.True` if the byte is an ASCII digit, `'0'` to `'9'`.
+			## `Bool.False` for every byte from `128` to `255`.
 			## ```roc
 			## expect U8.is_ascii_digit('7')
 			##
@@ -7512,7 +7513,7 @@ Builtin :: [].{
 			is_ascii_digit = |byte| byte >= '0' and byte <= '9'
 
 			## Returns `Bool.True` if the byte is an ASCII hexadecimal digit: `'0'` to `'9'`,
-			## `'a'` to `'f'`, or `'A'` to `'F'`.
+			## `'a'` to `'f'`, or `'A'` to `'F'`. `Bool.False` for every byte from `128` to `255`.
 			## ```roc
 			## expect U8.is_ascii_hex_digit('F')
 			##
@@ -7522,11 +7523,11 @@ Builtin :: [].{
 			is_ascii_hex_digit = |byte| U8.is_ascii_digit(byte) or (byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F')
 
 			## Returns `Bool.True` if the byte is an ASCII letter, `'a'` to `'z'` or `'A'` to `'Z'`.
+			## `Bool.False` for every byte from `128` to `255`.
 			##
-			## Like every ASCII method on [U8], this returns `Bool.False` for the bytes
-			## `128` to `255`. They are never ASCII: in UTF-8 they are the parts of longer
-			## characters, so the bytes of a letter like `é` are not alphabetic here. For
-			## letters beyond ASCII, see the [`unicode` package](https://github.com/roc-lang/unicode).
+			## In UTF-8, every byte of a character beyond ASCII is `128` or more, so the
+			## bytes of a letter like `é` are not alphabetic here. For letters beyond ASCII,
+			## see the [`unicode` package](https://github.com/roc-lang/unicode).
 			## ```roc
 			## expect U8.is_ascii_alphabetic('q')
 			##
@@ -7536,7 +7537,7 @@ Builtin :: [].{
 			is_ascii_alphabetic = |byte| (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z')
 
 			## Returns `Bool.True` if the byte is an ASCII letter or digit: `'a'` to `'z'`,
-			## `'A'` to `'Z'`, or `'0'` to `'9'`.
+			## `'A'` to `'Z'`, or `'0'` to `'9'`. `Bool.False` for every byte from `128` to `255`.
 			## ```roc
 			## expect U8.is_ascii_alphanumeric('Z')
 			##
@@ -7547,9 +7548,10 @@ Builtin :: [].{
 
 			## Returns `Bool.True` if the byte is ASCII whitespace: a space, a tab (`'\t'`), a
 			## line feed (`'\n'`), a vertical tab (`11`), a form feed (`12`), or a carriage
-			## return (`'\r'`).
+			## return (`'\r'`). `Bool.False` for every byte from `128` to `255`.
 			##
-			## These are the ASCII characters [Str.trim] removes. Some formats define
+			## These are the six bytes of C's `isspace`, and the ASCII characters
+			## [Str.trim] removes. Some formats define
 			## whitespace differently: HTML leaves out the vertical tab, and JSON allows only
 			## space, tab, line feed, and carriage return. When reading a format like that,
 			## check its own definition.
@@ -7562,7 +7564,8 @@ Builtin :: [].{
 			is_ascii_whitespace = |byte| byte == ' ' or (byte >= '\t' and byte <= '\r')
 
 			## Returns `Bool.True` if the byte is ASCII punctuation: one of the 32 printable
-			## ASCII characters that are not a letter, a digit, or a space.
+			## ASCII characters that are not a letter, a digit, or a space. `Bool.False` for
+			## every byte from `128` to `255`.
 			## ```
 			## ! " # $ % & ' ( ) * + , - . / : ; < = > ? @ [ \ ] ^ _ ` { | } ~
 			## ```
@@ -7576,6 +7579,7 @@ Builtin :: [].{
 
 			## Returns `Bool.True` if the byte is an ASCII control character: `0` to `31`, or
 			## `127` (delete). Tab, line feed, and carriage return are control characters too.
+			## `Bool.False` for every byte from `128` to `255`.
 			## ```roc
 			## expect U8.is_ascii_control('\n')
 			##
@@ -7585,7 +7589,7 @@ Builtin :: [].{
 			is_ascii_control = |byte| byte < ' ' or byte == 127
 
 			## Returns the byte with an ASCII uppercase letter, `'A'` to `'Z'`, made lowercase.
-			## Every other byte is returned unchanged.
+			## Every other byte is returned unchanged, every byte from `128` to `255` among them.
 			##
 			## This is the rule [Str.with_ascii_lowercased] applies to each byte of a string.
 			## ```roc
@@ -7602,7 +7606,7 @@ Builtin :: [].{
 				}
 
 			## Returns the byte with an ASCII lowercase letter, `'a'` to `'z'`, made uppercase.
-			## Every other byte is returned unchanged.
+			## Every other byte is returned unchanged, every byte from `128` to `255` among them.
 			##
 			## This is the rule [Str.with_ascii_uppercased] applies to each byte of a string.
 			## ```roc
