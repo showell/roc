@@ -46,7 +46,7 @@ jobs:
       - name: Run the repro
         working-directory: segv_repro
         run: |
-          set -u
+          set +e
           mkdir -p ../out
           ROC="$GITHUB_WORKSPACE/zig-out/bin/roc"
           step() {
@@ -61,10 +61,13 @@ jobs:
           step build "$ROC" build --no-cache main.roc
           step run-ctfe env ROC_CTFE_DEMAND_TRACE=1 "$ROC" --no-cache main.roc
           step run-lir env ROC_LIR_DUMP=shown "$ROC" --no-cache main.roc
-          step run-lir-greet env ROC_LIR_DUMP=greet "$ROC" --no-cache main.roc
-          step gdb-run gdb -q -batch -ex "handle SIGPIPE nostop" -ex run -ex bt -ex "info registers rip" -ex "x/6i \$pc" -ex "thread apply all bt" --args "$ROC" --no-cache main.roc
-          step gdb-build gdb -q -batch -ex "handle SIGPIPE nostop" -ex run -ex bt -ex "thread apply all bt" --args "$ROC" build --no-cache main.roc
           cat ../out/summary.txt
+          # The step fails when the repro does.
+          "$ROC" --no-cache main.roc && "$ROC" build --no-cache main.roc && ./main
+
+      - name: Regression test
+        if: matrix.variant == 'debug'
+        run: zig build run-test-cli -- --suite subcommands --filter test/cli/method_call_reaches_imported_static_list/ 2>&1 | tee out/test-cli.log; exit "${PIPESTATUS[0]}"
 
       - name: Upload output
         if: always()
