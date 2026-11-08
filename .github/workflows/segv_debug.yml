@@ -1,0 +1,74 @@
+on:
+  push:
+    branches: [segv-debug-build, segv-fix]
+  workflow_dispatch:
+
+name: SEGV repro with a diagnostic compiler
+
+permissions: {}
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: debug
+            flags: -Doptimize=Debug
+          - variant: releasefast-diag
+            flags: -Doptimize=ReleaseFast -Ddev-diagnostics=true -Dstrip=false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
+
+      - uses: xyzzylabs/setup-zig@09d85d9dbb73308882e7a26e61a8f706eed40df1 # ratchet:xyzzylabs/setup-zig@v1.0.2
+        with:
+          version: 0.17.0
+          use-cache: false
+
+      - name: Cache Zig dependency packages
+        uses: actions/cache@v6.1.0 # ratchet:actions/cache@v6.1.0
+        with:
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
+          key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-deps-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install gdb
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+
+      - name: Build roc
+        run: zig build roc ${{ matrix.flags }}
+
+      - name: Run the repro
+        working-directory: segv_repro
+        run: |
+          set -u
+          mkdir -p ../out
+          ROC="$GITHUB_WORKSPACE/zig-out/bin/roc"
+          step() {
+            name="$1"; shift
+            echo "=== $name: $*" | tee -a ../out/summary.txt
+            "$@" > "../out/$name.log" 2>&1
+            echo "exit $?" | tee -a ../out/summary.txt
+            tail -n 60 "../out/$name.log"
+          }
+          step check "$ROC" check --no-cache main.roc
+          step run "$ROC" --no-cache main.roc
+          step build "$ROC" build --no-cache main.roc
+          step run-ctfe env ROC_CTFE_DEMAND_TRACE=1 "$ROC" --no-cache main.roc
+          step run-lir env ROC_LIR_DUMP=shown "$ROC" --no-cache main.roc
+          step run-lir-greet env ROC_LIR_DUMP=greet "$ROC" --no-cache main.roc
+          step gdb-run gdb -q -batch -ex "handle SIGPIPE nostop" -ex run -ex bt -ex "info registers rip" -ex "x/6i \$pc" -ex "thread apply all bt" --args "$ROC" --no-cache main.roc
+          step gdb-build gdb -q -batch -ex "handle SIGPIPE nostop" -ex run -ex bt -ex "thread apply all bt" --args "$ROC" build --no-cache main.roc
+          cat ../out/summary.txt
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v7.0.1 # ratchet:actions/upload-artifact@v7.0.1
+        with:
+          name: segv-${{ matrix.variant }}
+          path: out/
