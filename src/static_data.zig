@@ -439,6 +439,13 @@ const StaticInitializerMachine = struct {
         for (self.modules.imports) |view| {
             if (std.mem.eql(u8, &view.key.bytes, &module.bytes)) return view.const_store;
         }
+        std.debug.print("SEGV-DEBUG stored module {x}\n", .{module.bytes[0..]});
+        {
+            const rv = CheckedModule.importedView(root.module);
+            std.debug.print("SEGV-DEBUG root {x} {s}\n", .{ root.module.key.bytes[0..], rv.canonical_names.moduleNameText(rv.module_identity.module_name) });
+        }
+        for (root.relation_modules) |view| std.debug.print("SEGV-DEBUG relation {x} {s}\n", .{ view.key.bytes[0..], view.canonical_names.moduleNameText(view.module_identity.module_name) });
+        for (self.modules.imports) |view| std.debug.print("SEGV-DEBUG import {x} {s}\n", .{ view.key.bytes[0..], view.canonical_names.moduleNameText(view.module_identity.module_name) });
         staticDataInvariant("stored static data named a checked module outside the lowering input");
     }
 

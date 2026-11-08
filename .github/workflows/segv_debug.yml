@@ -18,8 +18,6 @@ jobs:
         include:
           - variant: debug
             flags: -Doptimize=Debug
-          - variant: releasefast-diag
-            flags: -Doptimize=ReleaseFast -Ddev-diagnostics=true -Dstrip=false
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
@@ -46,7 +44,7 @@ jobs:
       - name: Run the repro
         working-directory: segv_repro
         run: |
-          set -u
+          set +e
           mkdir -p ../out
           ROC="$GITHUB_WORKSPACE/zig-out/bin/roc"
           step() {
@@ -61,10 +59,9 @@ jobs:
           step build "$ROC" build --no-cache main.roc
           step run-ctfe env ROC_CTFE_DEMAND_TRACE=1 "$ROC" --no-cache main.roc
           step run-lir env ROC_LIR_DUMP=shown "$ROC" --no-cache main.roc
-          step run-lir-greet env ROC_LIR_DUMP=greet "$ROC" --no-cache main.roc
-          step gdb-run gdb -q -batch -ex "handle SIGPIPE nostop" -ex run -ex bt -ex "info registers rip" -ex "x/6i \$pc" -ex "thread apply all bt" --args "$ROC" --no-cache main.roc
-          step gdb-build gdb -q -batch -ex "handle SIGPIPE nostop" -ex run -ex bt -ex "thread apply all bt" --args "$ROC" build --no-cache main.roc
+          step run-root-imports-view sh -c "cd ../segv_repro_import && '$ROC' --no-cache main.roc"
           cat ../out/summary.txt
+          exit 0
 
       - name: Upload output
         if: always()
