@@ -29179,7 +29179,10 @@ const ImportedTemplateClosureBuilder = struct {
     /// this a closure that names no other part of `View` would leave `View`
     /// out of the lowering input of every module that imports this one. A
     /// local target's own closure is walked; an imported target is recorded
-    /// as an imported procedure or callable-eval binding is.
+    /// as an imported procedure or callable-eval binding is. Evidence nodes
+    /// are shared, so a chain of method calls reaches one node by many paths;
+    /// each node is expanded once, or the walk grows exponentially with the
+    /// chain.
     fn appendDirectDispatchTargets(
         self: *ImportedTemplateClosureBuilder,
         table: StaticDispatchPlanTableRef,
@@ -29188,6 +29191,8 @@ const ImportedTemplateClosureBuilder = struct {
         const plans = self.context.static_dispatch_plans;
         var evidence_nodes: std.ArrayListUnmanaged(static_dispatch.EvidenceNodeId) = .empty;
         defer evidence_nodes.deinit(self.context.allocator);
+        var expanded: std.AutoHashMapUnmanaged(static_dispatch.EvidenceNodeId, void) = .empty;
+        defer expanded.deinit(self.context.allocator);
         for (plans.template_refs[table.start..][0..table.len]) |plan_id| {
             switch (plans.plans[@backingInt(plan_id)].resolution) {
                 .direct_closed, .direct_parametric => |direct| try evidence_nodes.append(self.context.allocator, direct.evidence),
@@ -29196,6 +29201,7 @@ const ImportedTemplateClosureBuilder = struct {
             }
         }
         while (evidence_nodes.pop()) |node_id| {
+            if ((try expanded.getOrPut(self.context.allocator, node_id)).found_existing) continue;
             const node = plans.evidenceNode(node_id);
             switch (node.target.kind) {
                 .procedure => |procedure| {
