@@ -6,6 +6,63 @@ const lir = @import("lir");
 const layout = @import("layout");
 const harness = @import("lower_to_lir_harness.zig");
 
+test "boxy deferred packets pin native and wasm32 inline boundaries" {
+    inline for (.{ .{ 15, "U16", "to_u16_wrap", 60 }, .{ 16, "U16", "to_u16_wrap", 64 }, .{ 17, "U16", "to_u16_wrap", 68 }, .{ 15, "U32", "to_u32_wrap", 120 }, .{ 16, "U32", "to_u32_wrap", 128 }, .{ 17, "U32", "to_u32_wrap", 136 } }) |case| {
+        const tuples = comptime blk: {
+            var ty: []const u8 = "(";
+            var value: []const u8 = "(";
+            var different: []const u8 = "(";
+            for (0..case[0]) |index| {
+                const separator = if (index == 0) "" else ", ";
+                ty = ty ++ separator ++ case[1];
+                value = value ++ separator ++ "value";
+                different = different ++ separator ++ if (index + 1 == case[0]) "value.plus_wrap(1)" else "value";
+            }
+            break :blk .{ .ty = ty ++ ")", .value = value ++ ")", .different = different ++ ")" };
+        };
+        const source = "Packet : " ++ tuples.ty ++ "\n" ++
+            "equal : Packet, Packet -> Bool\nequal = |a, b| a == b\n" ++
+            "forward : Box((Packet, Packet -> Bool)), Packet, Packet -> Bool\n" ++
+            "forward = |boxed, a, b| Box.unbox(boxed)(a, b)\n" ++
+            "main! = |args| {\nvalue = args.len()." ++ case[2] ++ "()\n" ++
+            "boxed = Box.box(equal)\na = " ++ tuples.value ++ "\nb = " ++ tuples.different ++ "\n" ++
+            "echo!(Str.inspect((forward(boxed, a, a), forward(boxed, a, b))))\nOk({})\n}";
+        for ([_]@import("base").target.TargetUsize{ .u32, .u64 }) |width| {
+            try harness.expectLirInspectionWithOptions(source, .{ .specialization_strategy = .boxy, .proc_debug_names = true, .target_usize = width }, struct {
+                fn inspectPacket(store: *const lir.LirStore, layouts: *const layout.Store) harness.LowerToLirHarnessError!void {
+                    var found = false;
+                    for (store.getProcSpecs(), 0..) |proc, index| {
+                        const name = store.procDebugName(@fromBackingInt(@intCast(index))) orelse continue;
+                        if (!std.mem.eql(u8, name, "forward") and !std.mem.endsWith(u8, name, ".forward")) continue;
+                        var pending: std.ArrayList(lir.LIR.CFStmtId) = .empty;
+                        defer pending.deinit(std.testing.allocator);
+                        var seen = collections.DenseMap(lir.LIR.CFStmtId, void).init(std.testing.allocator);
+                        defer seen.deinit();
+                        try pending.append(std.testing.allocator, proc.body.get().?);
+                        while (pending.pop()) |id| {
+                            if ((try seen.getOrPut(id)).found_existing) continue;
+                            const stmt = store.getCFStmt(id);
+                            if (stmt == .dyn) {
+                                const op = store.stmtRow(stmt.dyn.data);
+                                if (op == .call_erased) {
+                                    try std.testing.expect(op.call_erased.deferred);
+                                    const args = op.call_erased.args orelse return error.TestUnexpectedResult;
+                                    try std.testing.expect(store.localDyn(args) == null);
+                                    const args_layout = layouts.getLayout(store.getLocal(args).layout_idx);
+                                    try std.testing.expectEqual(@as(usize, case[3]), @as(usize, layouts.layoutSize(args_layout)));
+                                    found = true;
+                                }
+                            }
+                            try lir.BodyClone.appendSuccessors(store, &pending, id, std.testing.allocator);
+                        }
+                    }
+                    try std.testing.expect(found);
+                }
+            }.inspectPacket);
+        }
+    }
+}
+
 test "boxy declared primitives lower directly at closed and open call sites" {
     for ([_]@import("base").target.TargetUsize{ .u32, .u64 }) |width| {
         try harness.expectLirInspectionWithOptions(
@@ -29,7 +86,7 @@ test "boxy declared primitives lower directly at closed and open call sites" {
                     defer pending.deinit(std.testing.allocator);
                     var visited = collections.DenseMap(lir.LIR.CFStmtId, void).init(std.testing.allocator);
                     defer visited.deinit();
-                    try pending.append(std.testing.allocator, proc.body.?);
+                    try pending.append(std.testing.allocator, proc.body.get().?);
                     var operations: usize = 0;
                     while (pending.pop()) |id| {
                         if ((try visited.getOrPut(id)).found_existing) continue;
@@ -69,7 +126,7 @@ test "boxy worker reads the composite parameter and result descriptor once from 
                     const args = store.getLocalSpan(proc.args);
                     try std.testing.expectEqual(@as(usize, 2), args.len);
                     const param = store.localDyn(collections.GuardedList.at(args, 0)) orelse return error.TestUnexpectedResult;
-                    const result = store.localDyn(proc.dyn_result orelse return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
+                    const result = store.localDyn(proc.dyn_result.get() orelse return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
                     try std.testing.expectEqual(param.desc, result.desc);
                 }
                 try std.testing.expect(found);
@@ -108,7 +165,7 @@ fn inspect(store: *const lir.LirStore, _: *const layout.Store) harness.LowerToLi
         defer work.deinit(std.testing.allocator);
         var visited = collections.DenseMap(lir.LIR.CFStmtId, void).init(std.testing.allocator);
         defer visited.deinit();
-        try work.append(std.testing.allocator, proc.body.?);
+        try work.append(std.testing.allocator, proc.body.get().?);
         var records: usize = 0;
         var calls: usize = 0;
         var constructed: ?lir.LIR.LocalId = null;
@@ -167,7 +224,7 @@ fn inspectEntries(store: *const lir.LirStore, _: *const layout.Store) harness.Lo
         defer pending.deinit(std.testing.allocator);
         var visited = collections.DenseMap(lir.LIR.CFStmtId, void).init(std.testing.allocator);
         defer visited.deinit();
-        try pending.append(std.testing.allocator, proc.body.?);
+        try pending.append(std.testing.allocator, proc.body.get().?);
         // The descriptor each record the body builds is built with, and the
         // argument blocks of its erased calls.
         var record_descs = collections.DenseMap(lir.LIR.LocalId, lir.LIR.LocalId).init(std.testing.allocator);
@@ -176,7 +233,7 @@ fn inspectEntries(store: *const lir.LirStore, _: *const layout.Store) harness.Lo
         defer call_args.deinit(std.testing.allocator);
         const params = store.getLocalSpan(proc.args);
         // An erased worker's last parameter is the erased ABI's reuse input.
-        const reuse_params: usize = @intFromBool(proc.erased_reuse_arg != null);
+        const reuse_params: usize = @intFromBool(proc.erased_reuse_arg != .none);
         const param: ?lir.LIR.LocalId = if (params.len == 2 + reuse_params) collections.GuardedList.at(params, 0) else null;
         var forwards_param = false;
         var extracts_param = false;
@@ -241,7 +298,7 @@ test "boxy worker reads dynamic nominal backing descriptors from its type table"
                     defer pending.deinit(std.testing.allocator);
                     var visited = collections.DenseMap(lir.LIR.CFStmtId, void).init(std.testing.allocator);
                     defer visited.deinit();
-                    try pending.append(std.testing.allocator, proc.body.?);
+                    try pending.append(std.testing.allocator, proc.body.get().?);
                     var table_reads: usize = 0;
                     while (pending.pop()) |id| {
                         if ((try visited.getOrPut(id)).found_existing) continue;

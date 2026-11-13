@@ -92,9 +92,9 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "str")))
-			(e-dispatch-call (method "map_err") (constraint-fn-var 307)
+			(e-dispatch-call (method "map_err") (constraint-fn-var 306)
 				(receiver
-					(e-call (constraint-fn-var 304)
+					(e-call (constraint-fn-var 303)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

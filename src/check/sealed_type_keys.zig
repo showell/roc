@@ -31,6 +31,7 @@ const Allocator = std.mem.Allocator;
 const ModuleEnv = can.ModuleEnv;
 const Var = types.Var;
 const TypeKeyInfo = canonical_type_keys.TypeKeyInfo;
+const CheckedTypeId = @import("checked_ids.zig").CheckedTypeId;
 
 const KeySlot = collections.OnceSlot(TypeKeyInfo, .sealed_type_key);
 // This is a host storage choice, fixed at compilation. An OS allocation
@@ -104,31 +105,28 @@ const StorageMemory = struct {
     directory_bytes: usize = 0,
 };
 
-/// A fresh anonymous/private mapping (Windows: reserve and commit). Only
-/// PageAllocator.map promises the zero bytes required here; Allocator.alloc
-/// may recycle bytes and poison them even when its underlying allocator maps.
+/// Fresh zero pages from the compiler's page primitive. Slots are claimed on
+/// demand by the variables consumers ask about, so the mapping is sparse: a
+/// claimed slot makes one small page resident, never a huge page, and
+/// untouched pages are never resident. An allocator's block may be recycled
+/// and dirty, so only a fresh mapping supplies the zero bytes required here.
 const ZeroedKeyMapping = struct {
     slots: []KeySlot,
-    reserved_bytes: usize,
+    pages: collections.zeroed_pages.Pages,
 
     fn init(_: Allocator, count: usize) Allocator.Error!ZeroedKeyMapping {
         const bytes = std.math.mul(usize, count, @sizeOf(KeySlot)) catch return error.OutOfMemory;
-        if (bytes == 0) return .{ .slots = &.{}, .reserved_bytes = 0 };
-        const page_size = std.heap.pageSize();
         comptime std.debug.assert(@alignOf(KeySlot) <= std.heap.page_size_min);
-        const padded = std.math.add(usize, bytes, page_size - 1) catch return error.OutOfMemory;
-        const reserved_bytes = padded & ~(page_size - 1);
-        const raw = std.heap.PageAllocator.map(reserved_bytes, .fromByteUnits(page_size)) orelse return error.OutOfMemory;
-        const slots: [*]KeySlot = @ptrCast(@alignCast(raw));
-        // No memset, Allocator wrapper, huge-page advice, or result read.
-        return .{ .slots = slots[0..count], .reserved_bytes = reserved_bytes };
+        const pages = try collections.zeroed_pages.map(bytes, .sparse);
+        if (bytes == 0) return .{ .slots = &.{}, .pages = pages };
+        const slots: [*]KeySlot = @ptrCast(@alignCast(pages.bytes.ptr));
+        // No memset, Allocator wrapper, or result read.
+        return .{ .slots = slots[0..count], .pages = pages };
     }
 
     fn deinit(self: ZeroedKeyMapping, _: Allocator) void {
-        if (self.reserved_bytes == 0) return;
-        const raw: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(self.slots.ptr));
-        // Direct unmap neither poisons memory nor scans slot states.
-        std.heap.PageAllocator.unmap(raw[0..self.reserved_bytes]);
+        // Unmapping neither poisons memory nor scans slot states.
+        self.pages.unmap();
     }
 
     fn slot(self: ZeroedKeyMapping, _: Allocator, _: std.Io, raw: usize) Allocator.Error!*KeySlot {
@@ -136,7 +134,7 @@ const ZeroedKeyMapping = struct {
     }
 
     fn memory(self: ZeroedKeyMapping) StorageMemory {
-        return .{ .logical_bytes = self.slots.len * @sizeOf(KeySlot), .reserved_bytes = self.reserved_bytes };
+        return .{ .logical_bytes = self.slots.len * @sizeOf(KeySlot), .reserved_bytes = self.pages.bytes.len };
     }
 };
 
@@ -181,6 +179,27 @@ const HeapKeyPages = struct {
 };
 const KeyIndex = std.AutoHashMapUnmanaged([32]u8, Var);
 
+/// A canonical id memo in one atomic word. Zero is the empty slot, so the
+/// column can start on fresh zero pages, and an id `n` is stored as `n + 1`.
+/// `maxInt(u32)` has no stored form: it is left unmemoized, so its readers
+/// compute the same immutable answer each time.
+pub const CanonicalIdSlot = struct {
+    word: std.atomic.Value(u32) = .init(0),
+
+    pub fn get(self: *const CanonicalIdSlot) ?CheckedTypeId {
+        const word = self.word.load(.acquire);
+        if (word == 0) return null;
+        return @fromBackingInt(word - 1);
+    }
+
+    /// Concurrent publishers must publish the same immutable answer.
+    pub fn put(self: *CanonicalIdSlot, id: CheckedTypeId) void {
+        const raw = @backingInt(id);
+        if (raw == std.math.maxInt(u32)) return;
+        self.word.store(raw + 1, .release);
+    }
+};
+
 /// The key slots of one module's sealed source types.
 pub const SealedTypeKeys = struct {
     allocator: Allocator,
@@ -197,16 +216,20 @@ pub const SealedTypeKeys = struct {
     writer: ?canonical_type_keys.TypeWriter = null,
     /// Per variable: 0 while unknown, else 1 + whether a walk found the
     /// variable reaches an identity variable.
-    identity: []std.atomic.Value(u8),
+    identity: collections.zeroed_pages.SparseSlice(std.atomic.Value(u8)),
+    /// Canonical ids of settled source types, recorded on first request.
+    canonical: collections.zeroed_pages.SparseSlice(CanonicalIdSlot),
 
     /// Key slots for `env`'s sealed store. `allocator` must be safe to use
     /// from every thread that reads the module's types.
     pub fn create(allocator: Allocator, io: std.Io, env: *const ModuleEnv) Allocator.Error!*SealedTypeKeys {
         const keys = try allocator.create(SealedTypeKeys);
         errdefer allocator.destroy(keys);
-        const identity = try allocator.alloc(std.atomic.Value(u8), @intCast(env.types.len()));
-        @memset(identity, .init(0));
-        keys.* = .{ .allocator = allocator, .io = io, .env = env, .identity = identity };
+        var identity = try collections.zeroed_pages.SparseSlice(std.atomic.Value(u8)).init(allocator, @intCast(env.types.len()));
+        errdefer identity.deinit(allocator);
+        var canonical_ids = try collections.zeroed_pages.SparseSlice(CanonicalIdSlot).init(allocator, identity.items.len);
+        errdefer canonical_ids.deinit(allocator);
+        keys.* = .{ .allocator = allocator, .io = io, .env = env, .identity = identity, .canonical = canonical_ids };
         return keys;
     }
 
@@ -218,7 +241,8 @@ pub const SealedTypeKeys = struct {
             allocator.destroy(index);
         }
         if (self.writer) |*writer| writer.deinit();
-        allocator.free(self.identity);
+        self.identity.deinit(allocator);
+        self.canonical.deinit(allocator);
         allocator.destroy(self);
     }
 
@@ -233,15 +257,17 @@ pub const SealedTypeKeys = struct {
         defer self.writer_mutex.unlock(self.io);
         const storage_memory = if (self.table.peek()) |backing| backing.memory() else StorageMemory{};
         const memory: canonical_type_keys.TypeWriter.KeyMemory = if (self.writer) |*writer| writer.retainedKeyMemory() else .{};
-        const slots = if (self.table.peek() != null) self.identity.len else 0;
+        const slots = if (self.table.peek() != null) self.identity.items.len else 0;
         const slot_bytes = storage_memory.allocated_bytes;
         const directory_bytes = storage_memory.directory_bytes;
-        const identity_bytes = self.identity.len * @sizeOf(std.atomic.Value(u8));
+        const identity_bytes = self.identity.items.len * @sizeOf(std.atomic.Value(u8));
         const index_bytes = if (self.index.peek()) |index| @sizeOf(KeyIndex) + type_key_engine.hashRetainedBytes([32]u8, Var, index.*) else @as(usize, 0);
         const persistent = memory.engine.persistent();
         const scratch = memory.engine.scratch + memory.adapter_scratch;
         const total = @sizeOf(SealedTypeKeys) + directory_bytes + slot_bytes + identity_bytes + index_bytes + persistent + scratch + memory.owned_ranks;
-        std.debug.print("boxy-work: type-key-memory phase={s} owner={x} vars={d} slots={d} successful_keys={d} owner_bytes={d} slot_heap_requested_bytes={d} identity_bytes={d} index_bytes={d} writer_present={d} descriptions_bytes={d} class_index_bytes={d} summaries_bytes={d} identity_maps_bytes={d} persistent_bytes={d} engine_scratch_bytes={d} adapter_scratch_bytes={d} scratch_bytes={d} owned_rank_bytes={d} heap_requested_bytes={d} nodes={d} classes={d} summaries={d} map_nodes={d} directory_bytes={d} slot_logical_bytes={d} slot_reserved_virtual_bytes={d} storage_backend={s} module={s}\n", .{
+        // These owners are shared by both strategies; memory observations are
+        // not evidence that a compilation performed Boxy lowering.
+        std.debug.print("type-key-memory: phase={s} owner={x} vars={d} slots={d} successful_keys={d} owner_bytes={d} slot_heap_requested_bytes={d} identity_bytes={d} index_bytes={d} writer_present={d} descriptions_bytes={d} class_index_bytes={d} summaries_bytes={d} identity_maps_bytes={d} persistent_bytes={d} engine_scratch_bytes={d} adapter_scratch_bytes={d} scratch_bytes={d} owned_rank_bytes={d} heap_requested_bytes={d} nodes={d} classes={d} summaries={d} map_nodes={d} directory_bytes={d} slot_logical_bytes={d} slot_reserved_virtual_bytes={d} storage_backend={s} module={s}\n", .{
             phase,                @intFromPtr(self),     self.env.types.len(),              slots,                      self.successful_keys,         @sizeOf(SealedTypeKeys),       slot_bytes,
             identity_bytes,       index_bytes,           @intFromBool(self.writer != null), memory.engine.descriptions, memory.engine.class_index,    memory.engine.summaries,       memory.engine.identity_maps,
             persistent,           memory.engine.scratch, memory.adapter_scratch,            scratch,                    memory.owned_ranks,           total,                         memory.nodes,
@@ -256,12 +282,12 @@ pub const SealedTypeKeys = struct {
 
     fn allocateStorage(self: *SealedTypeKeys) Allocator.Error!KeyStorage {
         if (self.test_fail_storage.enabled()) return error.OutOfMemory;
-        return KeyStorage.init(self.allocator, self.identity.len);
+        return KeyStorage.init(self.allocator, self.identity.items.len);
     }
 
     fn slot(self: *SealedTypeKeys, var_: Var) Allocator.Error!*KeySlot {
         const raw: usize = @backingInt(var_);
-        std.debug.assert(raw < self.identity.len);
+        std.debug.assert(raw < self.identity.items.len);
         const storage_ = try self.storage();
         return storage_.slot(self.allocator, self.io, raw);
     }
@@ -294,8 +320,8 @@ pub const SealedTypeKeys = struct {
     /// Whether `var_` reaches an identity variable, when a walk recorded it.
     pub fn knownIdentity(self: *const SealedTypeKeys, var_: Var) ?bool {
         const index: usize = @backingInt(var_);
-        std.debug.assert(index < self.identity.len);
-        return switch (self.identity[index].load(.acquire)) {
+        std.debug.assert(index < self.identity.items.len);
+        return switch (self.identity.items[index].load(.acquire)) {
             0 => null,
             1 => false,
             else => true,
@@ -305,8 +331,18 @@ pub const SealedTypeKeys = struct {
     /// Record whether `var_` reaches an identity variable.
     pub fn recordIdentity(self: *SealedTypeKeys, var_: Var, value: bool) void {
         const index: usize = @backingInt(var_);
-        std.debug.assert(index < self.identity.len);
-        self.identity[index].store(if (value) 2 else 1, .release);
+        std.debug.assert(index < self.identity.items.len);
+        self.identity.items[index].store(if (value) 2 else 1, .release);
+    }
+
+    /// The previously recorded canonical id of a settled source type.
+    pub fn knownCanonical(self: *const SealedTypeKeys, var_: Var) ?CheckedTypeId {
+        return self.canonical.items[@backingInt(var_)].get();
+    }
+
+    /// Record the canonical id selected from the immutable source key index.
+    pub fn recordCanonical(self: *SealedTypeKeys, var_: Var, id: CheckedTypeId) void {
+        self.canonical.items[@backingInt(var_)].put(id);
     }
 
     /// The lowest reached checked representative of `view`'s store whose key
@@ -340,6 +376,36 @@ pub const SealedTypeKeys = struct {
         }
     };
 };
+
+test "canonical id slots distinguish unknown from every encodable id" {
+    for ([_]u32{ 0, 1 << 31, std.math.maxInt(u32) - 1 }) |raw| {
+        var slot: CanonicalIdSlot = .{};
+        try std.testing.expect(slot.get() == null);
+        const id: CheckedTypeId = @fromBackingInt(raw);
+        slot.put(id);
+        try std.testing.expectEqual(id, slot.get().?);
+    }
+}
+
+test "a canonical id slot leaves the unencodable largest id unmemoized" {
+    var slot: CanonicalIdSlot = .{};
+    slot.put(@fromBackingInt(std.math.maxInt(u32)));
+    try std.testing.expect(slot.get() == null);
+    slot.put(@fromBackingInt(7));
+    slot.put(@fromBackingInt(std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(CheckedTypeId, @fromBackingInt(7)), slot.get().?);
+}
+
+test "the zero word is an empty canonical id slot of four bytes" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(CanonicalIdSlot));
+    // One column below the small-table threshold and one on fresh zero pages.
+    const page_backed_len = collections.zeroed_pages.small_table_bytes / @sizeOf(CanonicalIdSlot) + 1;
+    for ([_]usize{ 8, page_backed_len }) |len| {
+        var column = try collections.zeroed_pages.SparseSlice(CanonicalIdSlot).init(std.testing.allocator, len);
+        defer column.deinit(std.testing.allocator);
+        for (column.items) |*slot| try std.testing.expect(slot.get() == null);
+    }
+}
 
 /// Real solver-assigned representatives spanning full pages and a partial
 /// final page. The redirect is reached but must not become an index entry.
@@ -610,7 +676,7 @@ test "source key storage fresh native mappings bypass dirty and failing heap all
     try std.testing.expect(mapping.slots[0].peek() == null);
     const empty = try ZeroedKeyMapping.init(failing.allocator(), 0);
     defer empty.deinit(failing.allocator());
-    try std.testing.expectEqual(@as(usize, 0), empty.reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 0), empty.pages.bytes.len);
     const too_many = std.math.maxInt(usize) / @sizeOf(KeySlot);
     try std.testing.expectError(error.OutOfMemory, ZeroedKeyMapping.init(failing.allocator(), too_many + 1));
     // Multiplication fits, but page rounding does not; no syscall is needed.

@@ -32,6 +32,19 @@ pub fn collectRequiredRcHelpers(
     allocator: Allocator,
     exports: []const StaticDataExport,
 ) Allocator.Error![]layout.RcHelperKey {
+    return collectRcHelpers(allocator, exports, &.{});
+}
+
+/// CTFE must emit callbacks its not-yet-materialized callable results may publish.
+pub fn collectEvaluationRcHelpers(
+    allocator: Allocator,
+    exports: []const StaticDataExport,
+    sets: []const lir.Program.ErasedFns,
+) Allocator.Error![]layout.RcHelperKey {
+    return collectRcHelpers(allocator, exports, sets);
+}
+
+fn collectRcHelpers(allocator: Allocator, exports: []const StaticDataExport, sets: []const lir.Program.ErasedFns) Allocator.Error![]layout.RcHelperKey {
     var seen = std.AutoHashMap(u64, void).init(allocator);
     defer seen.deinit();
     var result = std.ArrayList(layout.RcHelperKey).empty;
@@ -45,6 +58,16 @@ pub fn collectRequiredRcHelpers(
             try result.append(allocator, helper);
         }
     }
+    for (sets) |set| for (set.entries) |entry| {
+        const drop = switch (entry.on_drop) {
+            .none => continue,
+            .rc_helper => |helper| helper,
+        };
+        for ([_]layout.RcHelperKey{ drop, .{ .op = .incref, .layout_idx = drop.layout_idx } }) |helper| {
+            const gop = try seen.getOrPut(helper.encode());
+            if (!gop.found_existing) try result.append(allocator, helper);
+        }
+    };
 
     return try result.toOwnedSlice(allocator);
 }
@@ -64,7 +87,7 @@ pub fn collectReferencedProcs(
 
     for (exports) |data_export| {
         for (data_export.relocations) |relocation| {
-            const proc = relocation.procedure orelse continue;
+            const proc = relocation.procedure.get() orelse continue;
             const gop = try seen.getOrPut(@backingInt(proc));
             if (gop.found_existing) continue;
             try result.append(allocator, proc);
@@ -177,7 +200,7 @@ const StaticInitializerMachine = struct {
     allocations: std.ArrayList(*SymbolicAllocation),
     static_roots: []?*SymbolicValue,
     static_active: []bool,
-    frozen_roots: []?StaticDataSymbolId,
+    frozen_roots: collections.OptionalIndexColumn(StaticDataSymbolId),
     string_backings: std.AutoHashMapUnmanaged(@import("base").StringLiteral.Idx, SymbolicAllocationId),
     /// Frames for initializers that are running, followed by released frames
     /// kept for reuse. An initializer reading a static value evaluates that
@@ -199,14 +222,13 @@ const StaticInitializerMachine = struct {
         @memset(static_roots, null);
         const static_active = try arena_allocator.alloc(bool, static_count);
         @memset(static_active, false);
-        const frozen_roots = try arena_allocator.alloc(?StaticDataSymbolId, static_count);
-        @memset(frozen_roots, null);
+        var frozen_roots = try collections.OptionalIndexColumn(StaticDataSymbolId).initFilled(arena_allocator, static_count);
         if (lowered.frozen_static_data) |frozen| {
             for (frozen.exports, 0..) |item, index| {
                 if (item.value_id) |id| {
                     const raw = @backingInt(id);
-                    if (raw >= static_count or frozen_roots[raw] != null) staticDataInvariant("frozen static slot identity is missing or duplicated");
-                    frozen_roots[raw] = @fromBackingInt(@intCast(index));
+                    if (raw >= static_count or frozen_roots.isPresent(raw)) staticDataInvariant("frozen static slot identity is missing or duplicated");
+                    frozen_roots.set(raw, @fromBackingInt(@as(u32, @intCast(index))));
                 }
             }
         }
@@ -357,20 +379,24 @@ const StaticInitializerMachine = struct {
                         self.writeTargetWord(value.bytes, 0, word);
                         break :blk value;
                     },
-                    .callable => |proc| try self.freezeCallable(proc, if (values.len == 0) null else values[0], .none, definition.layout_idx),
+                    .callable => |function| try self.freezeCallable(function.proc, if (values.len == 0) null else values[0], function.on_drop, definition.layout_idx),
+                    .boxed_sequence => |offset| try self.freezeSequence(values[0], offset, definition.layout_idx),
                     .product, .list, .box, .tag => try self.assembleStored(definition.layout_idx, switch (parts.kind) {
                         .product => .product,
-                        .list => .{ .list = self.layouts().builtinListAbi(definition.layout_idx).elem_layout_idx orelse .zst },
+                        .list => |capacity| .{ .list = .{
+                            .elem_layout = self.layouts().builtinListAbi(definition.layout_idx).elem_layout_idx orelse .zst,
+                            .capacity = capacity,
+                        } },
                         .box => .{ .box = self.layouts().builtinBoxAbi(definition.layout_idx).elem_layout_idx orelse .zst },
                         .tag => |variant| .{ .tag = .{ .variant = variant, .payload_layout = self.tagPayloadLayout(definition.layout_idx, variant) } },
-                        .word, .callable => unreachable, // the outer switch handles scalar words and callables separately
+                        .word, .callable, .boxed_sequence => unreachable, // the outer switch handles these constructions separately
                     }, values),
                 };
                 self.static_active[raw] = false;
                 _ = pending.pop();
                 continue;
             }
-            const initializer = definition.initializer orelse
+            const initializer = definition.initializer.get() orelse
                 staticDataInvariant("static value has neither frozen data nor an initializer");
             if (try self.unevaluatedStaticRead(initializer)) |dependency| {
                 if (self.static_active[@backingInt(dependency)]) staticDataInvariant("static initializer data dependency graph contained a cycle");
@@ -397,7 +423,13 @@ const StaticInitializerMachine = struct {
             self.static_roots[raw] = root;
             return root;
         }
-        if (self.frozen_roots[raw]) |symbol| {
+        if (value.callable.get()) |procedure| {
+            const allocation = try self.erasedCallableAllocation(value.layout_idx, procedure, 0);
+            const root = try self.pointerValue(value.layout_idx, allocation.id, 0);
+            self.static_roots[raw] = root;
+            return root;
+        }
+        if (self.frozen_roots.get(raw)) |symbol| {
             const root = try self.readFrozenValue(symbol, self.lowered.lir_result.static_data_values.items[raw].layout_idx);
             self.static_roots[raw] = root;
             return root;
@@ -412,13 +444,13 @@ const StaticInitializerMachine = struct {
     /// The first static value an initializer reads whose own initializer has
     /// not run yet.
     fn unevaluatedStaticRead(self: *StaticInitializerMachine, proc_id: lir.LIR.LirProcSpecId) MaterializationError!?lir.LIR.StaticDataId {
-        var current = self.store().getProcSpecImmediate(proc_id).body orelse staticDataInvariant("static initializer procedure had no body");
+        var current = self.store().getProcSpecImmediate(proc_id).body.get() orelse staticDataInvariant("static initializer procedure had no body");
         while (true) {
             current = switch (self.store().getCFStmt(current)) {
                 .assign_literal => |assign| blk: {
                     switch (assign.value) {
                         .static_data => |dependency| if (self.static_roots[@backingInt(dependency.id)] == null and
-                            self.frozen_roots[@backingInt(dependency.id)] == null)
+                            !self.frozen_roots.isPresent(@backingInt(dependency.id)))
                         {
                             if (try self.readyStatic(dependency.id) == null) return dependency.id;
                         },
@@ -462,14 +494,10 @@ const StaticInitializerMachine = struct {
     /// input holds.
     fn constStoreOf(self: *const StaticInitializerMachine, module: Checked.ModuleId) *const Checked.ConstStore {
         const root = self.modules.root orelse staticDataInvariant("stored static data had no root checked module");
-        if (std.mem.eql(u8, &root.module.key.bytes, &module.bytes)) return &root.module.const_store;
-        for (root.relation_modules) |view| {
-            if (std.mem.eql(u8, &view.key.bytes, &module.bytes)) return view.const_store;
-        }
-        for (self.modules.imports) |view| {
-            if (std.mem.eql(u8, &view.key.bytes, &module.bytes)) return view.const_store;
-        }
-        staticDataInvariant("stored static data named a checked module outside the lowering input");
+        const program: lir.CheckedPipeline.CheckedModuleSet = .{ .root = root, .imports = self.modules.imports };
+        const view = program.moduleByKey(module) orelse
+            staticDataInvariant("stored static data named a checked module outside the lowering input");
+        return view.const_store;
     }
 
     /// The value of a stored list frozen at `value_layout`
@@ -511,7 +539,7 @@ const StaticInitializerMachine = struct {
         key: StoredValueKey,
         request: StoredRequest,
         shape: union(enum) {
-            list: layout.Idx,
+            list: struct { elem_layout: layout.Idx, capacity: u64 },
             box: layout.Idx,
             product,
             tag: struct { variant: u32, payload_layout: layout.Idx },
@@ -536,27 +564,28 @@ const StaticInitializerMachine = struct {
             .nominal => unreachable, // unwrapStoredNominal stepped past every nominal layer
             .zst => return try self.rememberStored(key, try self.newValue(request.layout_idx)),
             .scalar => |scalar| return try self.rememberStored(key, try self.storedScalar(scalar, request.layout_idx)),
-            .str => |str| return try self.rememberStored(key, try self.storedStr(store_.strBytes(str), request.layout_idx)),
+            .str => |str| return try self.rememberStored(key, try self.storedStr(store_.strBytes(str.bytes), str.capacity, request.layout_idx)),
             .list => |list| {
                 const elem_plan = switch (plans[@backingInt(request.plan)]) {
                     .list => |elem| elem,
-                    .pending, .layout_only, .zst, .scalar, .str, .box, .tuple, .record, .tag_union, .named, .fn_value, .erased_fn, .boxy_fn => staticDataInvariant("stored list had a non-list const plan"),
+                    .pending, .layout_only, .zst, .scalar, .str, .box, .boxed_sequence, .tuple, .record, .tag_union, .named, .fn_value, .erased_fn, .boxy_fn => staticDataInvariant("stored list had a non-list const plan"),
                 };
-                switch (list) {
-                    .empty => return try self.rememberStored(key, try self.storedListValue(request.layout_idx, 0, null)),
-                    .packed_bytes => |packed_list| return try self.rememberStored(key, try self.storedPackedList(store_, packed_list, request.layout_idx)),
+                switch (list.items) {
+                    .empty => return try self.rememberStored(key, try self.storedListValue(request.layout_idx, 0, list.capacity, null)),
+                    .packed_bytes => |packed_list| return try self.rememberStored(key, try self.storedPackedList(store_, packed_list, list.capacity, request.layout_idx)),
                     .nodes => |items| {
                         const abi = self.layouts().builtinListAbi(request.layout_idx);
                         const elem_layout = abi.elem_layout_idx orelse layout.Idx.zst;
                         const children = try a.alloc(StoredRequest, items.len);
                         for (items, children) |item, *child| child.* = .{ .node = item, .plan = elem_plan, .layout_idx = elem_layout };
-                        return try self.pushStored(frames, key, request, .{ .list = elem_layout }, children);
+                        return try self.pushStored(frames, key, request, .{ .list = .{ .elem_layout = elem_layout, .capacity = list.capacity } }, children);
                     },
                 }
             },
             .box => |payload| {
                 const payload_plan = switch (plans[@backingInt(request.plan)]) {
                     .box => |boxed| boxed,
+                    .boxed_sequence => staticDataInvariant("a boxed sequence's callable must be restored by its producer"),
                     .pending, .layout_only, .zst, .scalar, .str, .list, .tuple, .record, .tag_union, .named, .fn_value, .erased_fn, .boxy_fn => staticDataInvariant("stored box had a non-box const plan"),
                 };
                 if (self.layoutValue(request.layout_idx).tag == .box_of_zst) return try self.rememberStored(key, try self.newValue(request.layout_idx));
@@ -569,7 +598,7 @@ const StaticInitializerMachine = struct {
             .tuple, .record => |items| {
                 const item_plans = switch (plans[@backingInt(request.plan)]) {
                     .tuple, .record => |item_plans| item_plans,
-                    .pending, .layout_only, .zst, .scalar, .str, .list, .box, .tag_union, .named, .fn_value, .erased_fn, .boxy_fn => staticDataInvariant("stored product had a non-product const plan"),
+                    .pending, .layout_only, .zst, .scalar, .str, .list, .box, .boxed_sequence, .tag_union, .named, .fn_value, .erased_fn, .boxy_fn => staticDataInvariant("stored product had a non-product const plan"),
                 };
                 if (item_plans.len != items.len) staticDataInvariant("stored product arity differed from its const plan");
                 const base_layout = self.aggregateBaseLayout(request.layout_idx);
@@ -584,7 +613,7 @@ const StaticInitializerMachine = struct {
             .tag => |tag| {
                 const variants = switch (plans[@backingInt(request.plan)]) {
                     .tag_union => |variants| variants,
-                    .pending, .layout_only, .zst, .scalar, .str, .list, .box, .tuple, .record, .named, .fn_value, .erased_fn, .boxy_fn => staticDataInvariant("stored tag had a non-tag-union const plan"),
+                    .pending, .layout_only, .zst, .scalar, .str, .list, .box, .boxed_sequence, .tuple, .record, .named, .fn_value, .erased_fn, .boxy_fn => staticDataInvariant("stored tag had a non-tag-union const plan"),
                 };
                 const variant = for (variants) |candidate| {
                     if (std.mem.eql(u8, candidate.name, tag.tag_name)) break candidate;
@@ -628,7 +657,7 @@ const StaticInitializerMachine = struct {
                     request.plan = named.backing;
                     changed = true;
                 },
-                .pending, .layout_only, .zst, .scalar, .str, .list, .box, .tuple, .record, .tag_union, .fn_value, .erased_fn, .boxy_fn => {},
+                .pending, .layout_only, .zst, .scalar, .str, .list, .box, .boxed_sequence, .tuple, .record, .tag_union, .fn_value, .erased_fn, .boxy_fn => {},
             }
             if (!changed) return request;
         }
@@ -656,7 +685,7 @@ const StaticInitializerMachine = struct {
 
     fn assembleStored(self: *StaticInitializerMachine, value_layout: layout.Idx, shape: @FieldType(StoredFrame, "shape"), values: []const *SymbolicValue) MaterializationError!*SymbolicValue {
         return switch (shape) {
-            .list => |elem_layout| try self.storedListValue(value_layout, values.len, .{ .elem_layout = elem_layout, .items = values }),
+            .list => |list| try self.storedListValue(value_layout, values.len, list.capacity, .{ .elem_layout = list.elem_layout, .items = values }),
             .box => |payload_layout| blk: {
                 if (self.layoutValue(value_layout).tag == .box_of_zst) break :blk try self.newValue(value_layout);
                 const abi = self.layouts().builtinBoxAbi(value_layout);
@@ -768,25 +797,62 @@ const StaticInitializerMachine = struct {
         return value;
     }
 
-    /// A string holding `bytes`: in its descriptor when short enough, else
-    /// in an allocation of its own.
-    fn storedStr(self: *StaticInitializerMachine, bytes: []const u8, layout_idx: layout.Idx) Allocator.Error!*SymbolicValue {
+    /// A string holding `bytes` with room for `capacity`: in its descriptor
+    /// when the capacity fits there, else in an allocation of its own. The
+    /// allocation holds the bytes alone: the descriptor records the capacity,
+    /// which the first copy of the string allocates
+    /// (`builtins.str.RocStr.copyCapacity`).
+    fn storedStr(self: *StaticInitializerMachine, bytes: []const u8, capacity: u64, layout_idx: layout.Idx) Allocator.Error!*SymbolicValue {
+        if (capacity < bytes.len) staticDataInvariant("stored string capacity was below its length");
         const result = try self.newValue(layout_idx);
         const roc_str_size = self.word_size * builtins.str.RocStr.word_count;
-        if (bytes.len < roc_str_size) {
+        if (capacity < roc_str_size) {
             @memcpy(result.bytes[0..bytes.len], bytes);
             result.bytes[roc_str_size - 1] = builtins.str.RocStr.smallStrFlagByte(bytes.len);
             return result;
         }
+        const encoded = builtins.str.RocStr.encodeCapacityForWidth(capacity);
+        if (encoded > self.targetWordMax() or builtins.str.RocStr.decodeCapacityForWidth(encoded) != capacity) return error.OutOfMemory;
+        // A string with no bytes still points into an allocation, whose
+        // static refcount is what keeps the runtime from writing through it.
         const allocation = try self.addAllocation(.u8, bytes.len, self.word_size, false, null);
         @memcpy(allocation.payload.bytes, bytes);
         try result.relocations.append(self.allocator(), .{
             .offset = 0,
             .target = .{ .allocation = allocation.id },
         });
-        self.writeTargetWord(result.bytes, self.word_size, builtins.str.RocStr.encodeCapacityForWidth(bytes.len));
+        self.writeTargetWord(result.bytes, self.word_size, encoded);
         self.writeTargetWord(result.bytes, self.word_size * 2, bytes.len);
         return result;
+    }
+
+    /// The bytes of the string descriptor `value`.
+    fn symbolicStrBytes(self: *const StaticInitializerMachine, value: *const SymbolicValue) []const u8 {
+        const roc_str_size = self.word_size * builtins.str.RocStr.word_count;
+        if (value.bytes.len != roc_str_size) staticDataInvariant("static string had a non-string size");
+        const flag = value.bytes[roc_str_size - 1];
+        if (flag & builtins.str.RocStr.small_str_flag != 0) return value.bytes[0..builtins.str.RocStr.smallStrLenFromFlagByte(flag)];
+        const len: usize = @intCast(self.readTargetWord(value.bytes, self.word_size * 2));
+        for (value.relocations.items) |relocation| {
+            if (relocation.offset != 0) continue;
+            const allocation = switch (relocation.target) {
+                .allocation => |id| self.allocations.items[@backingInt(id)],
+                .frozen_symbol, .procedure, .rc_helper => staticDataInvariant("a static string did not point into an allocation"),
+            };
+            const start: usize = @intCast(relocation.addend);
+            return allocation.payload.bytes[start..][0..len];
+        }
+        staticDataInvariant("a static big string had no bytes pointer");
+    }
+
+    fn targetWordMax(self: *const StaticInitializerMachine) u64 {
+        const unused_bits: std.math.Log2Int(u64) = @intCast((8 - self.word_size) * 8);
+        return @as(u64, std.math.maxInt(u64)) >> unused_bits;
+    }
+
+    /// The largest capacity a list of zero-sized items records on the target.
+    fn maxZeroSizedCapacity(self: *const StaticInitializerMachine) u64 {
+        return builtins.list.RocList.decodeCapacityForWidth(self.targetWordMax());
     }
 
     const StoredItems = struct {
@@ -794,14 +860,27 @@ const StaticInitializerMachine = struct {
         items: []const *SymbolicValue,
     };
 
-    /// A list of `len` items, written into one allocation from `items`.
-    fn storedListValue(self: *StaticInitializerMachine, layout_idx: layout.Idx, len: usize, items: ?StoredItems) Allocator.Error!*SymbolicValue {
+    /// A list of `len` items with room for `capacity`, written into one
+    /// allocation from `items`. The allocation holds the items alone: the
+    /// descriptor records the capacity, which the first copy of the list
+    /// allocates (`builtins.list.RocList.copyCapacity`). A null `items`
+    /// leaves a non-empty list's allocation to the caller.
+    fn storedListValue(self: *StaticInitializerMachine, layout_idx: layout.Idx, len: usize, capacity: u64, items: ?StoredItems) Allocator.Error!*SymbolicValue {
         const result = try self.newValue(layout_idx);
-        self.writeTargetWord(result.bytes, self.word_size, len);
-        self.writeTargetWord(result.bytes, self.word_size * 2, builtins.list.RocList.encodeCapacityForWidth(len));
-        const written = items orelse return result;
         const abi = self.layouts().builtinListAbi(layout_idx);
-        if (len == 0 or abi.elem_size == 0) return result;
+        self.writeTargetWord(result.bytes, self.word_size, len);
+        // Zero-sized items occupy no allocation, so such a list's capacity
+        // is a count alone, bounded by what the target's word encodes.
+        if (abi.elem_size == 0) {
+            try self.writeListCapacity(result, @max(len, @min(capacity, self.maxZeroSizedCapacity())));
+            return result;
+        }
+        try self.writeListCapacity(result, capacity);
+        if (len == 0) {
+            if (capacity != 0) try self.pointAtEmptyListAllocation(result, abi);
+            return result;
+        }
+        const written = items orelse return result;
         const allocation = try self.addAllocation(
             written.elem_layout,
             @as(usize, abi.elem_size) * len,
@@ -817,10 +896,60 @@ const StaticInitializerMachine = struct {
         return result;
     }
 
+    /// Record `capacity` in the list descriptor `value`. A capacity the
+    /// target's word cannot encode is past what that target can address.
+    fn writeListCapacity(self: *StaticInitializerMachine, value: *SymbolicValue, capacity: u64) Allocator.Error!void {
+        const encoded = builtins.list.RocList.encodeCapacityForWidth(capacity);
+        if (encoded > self.targetWordMax() or builtins.list.RocList.decodeCapacityForWidth(encoded) != capacity) return error.OutOfMemory;
+        self.writeTargetWord(value.bytes, self.word_size * 2, encoded);
+    }
+
+    /// Give the non-empty list descriptor `value` an allocation of its own
+    /// when it is a view into a shared one, whose capacity word names that
+    /// allocation instead of a capacity. A list that records a capacity
+    /// points at the start of its allocation.
+    fn ownListItems(self: *StaticInitializerMachine, value: *SymbolicValue, abi: layout.Store.BuiltinListAbi, len: usize) Allocator.Error!void {
+        var items: ?SymbolicRelocation = null;
+        var is_view = false;
+        for (value.relocations.items) |relocation| {
+            if (relocation.offset == 0) items = relocation;
+            if (relocation.offset == self.word_size * 2) is_view = true;
+        }
+        if (!is_view) return;
+        const source = items orelse staticDataInvariant("a static list view had no items pointer");
+        const source_allocation = switch (source.target) {
+            .allocation => |id| self.allocations.items[@backingInt(id)],
+            .frozen_symbol, .procedure, .rc_helper => staticDataInvariant("a static list view did not point into an allocation"),
+        };
+        if (abi.contains_refcounted) staticDataInvariant("a static list view held refcounted items");
+        const elem_layout = abi.elem_layout_idx orelse staticDataInvariant("non-ZST static list had no element layout");
+        const byte_count = @as(usize, abi.elem_size) * len;
+        const allocation = try self.addAllocation(elem_layout, byte_count, abi.elem_alignment, false, null);
+        const start: usize = @intCast(source.addend);
+        @memcpy(allocation.payload.bytes, source_allocation.payload.bytes[start..][0..byte_count]);
+        value.relocations.clearRetainingCapacity();
+        try value.relocations.append(self.allocator(), .{
+            .offset = 0,
+            .target = .{ .allocation = allocation.id },
+        });
+    }
+
+    /// Point the empty list descriptor `value` at an allocation holding no
+    /// items. A list with capacity always points into an allocation, whose
+    /// static refcount is what keeps the runtime from writing through it.
+    fn pointAtEmptyListAllocation(self: *StaticInitializerMachine, value: *SymbolicValue, abi: layout.Store.BuiltinListAbi) Allocator.Error!void {
+        const elem_layout = abi.elem_layout_idx orelse staticDataInvariant("non-ZST static list had no element layout");
+        const allocation = try self.addAllocation(elem_layout, 0, abi.elem_alignment, abi.contains_refcounted, if (abi.contains_refcounted) 0 else null);
+        try value.relocations.append(self.allocator(), .{
+            .offset = 0,
+            .target = .{ .allocation = allocation.id },
+        });
+    }
+
     /// A packed list: its canonical item bytes laid out at the element layout.
-    fn storedPackedList(self: *StaticInitializerMachine, store_: *const Checked.ConstStore, packed_list: check.ConstStore.ConstPackedList, layout_idx: layout.Idx) Allocator.Error!*SymbolicValue {
+    fn storedPackedList(self: *StaticInitializerMachine, store_: *const Checked.ConstStore, packed_list: check.ConstStore.ConstPackedList, capacity: u64, layout_idx: layout.Idx) Allocator.Error!*SymbolicValue {
         const len: usize = packed_list.len;
-        const result = try self.storedListValue(layout_idx, len, null);
+        const result = try self.storedListValue(layout_idx, len, capacity, null);
         const abi = self.layouts().builtinListAbi(layout_idx);
         if (len == 0 or abi.elem_size == 0) return result;
         const elem_layout = abi.elem_layout_idx orelse staticDataInvariant("non-ZST stored packed list had no element layout");
@@ -839,18 +968,26 @@ const StaticInitializerMachine = struct {
     }
 
     fn readFrozenValue(self: *StaticInitializerMachine, symbol: StaticDataSymbolId, value_layout: layout.Idx) MaterializationError!*SymbolicValue {
+        const source = self.lowered.frozen_static_data.?.exports[@backingInt(symbol)];
+        return self.readFrozenRange(symbol, value_layout, source.symbol_offset, self.layouts().layoutSize(self.layoutValue(value_layout)));
+    }
+
+    fn readFrozenRange(self: *StaticInitializerMachine, symbol: StaticDataSymbolId, value_layout: layout.Idx, start: usize, size: usize) MaterializationError!*SymbolicValue {
         const frozen = self.lowered.frozen_static_data.?;
         const source = frozen.exports[@backingInt(symbol)];
-        const value = try self.newValue(value_layout);
-        const start: usize = source.symbol_offset;
-        const end = start + value.bytes.len;
+        const end = start + size;
         if (end > source.bytes.len) staticDataInvariant("frozen symbol does not contain its explicit value layout");
-        @memcpy(value.bytes, source.bytes[start..end]);
+        const value = try self.allocator().create(SymbolicValue);
+        value.* = .{
+            .layout_idx = value_layout,
+            .bytes = try self.allocator().dupe(u8, source.bytes[start..end]),
+            .relocations = .empty,
+        };
         for (source.relocations) |relocation| {
             if (relocation.offset < start or relocation.offset >= end) continue;
             const target: SymbolicRelocation.Target = switch (relocation.target) {
                 .data_symbol => |id| .{ .frozen_symbol = id },
-                .named => if (relocation.procedure) |proc|
+                .named => if (relocation.procedure.get()) |proc|
                     .{ .procedure = proc }
                 else if (relocation.rc_helper) |helper|
                     .{ .rc_helper = helper }
@@ -862,7 +999,7 @@ const StaticInitializerMachine = struct {
                 .target = target,
                 .addend = relocation.addend,
                 .kind = relocation.kind,
-                .callable_capture_offset = relocation.callable_capture_offset,
+                .callable_capture_offset = relocation.callable_capture_offset.get(),
             });
         }
         return value;
@@ -877,8 +1014,8 @@ const StaticInitializerMachine = struct {
             staticDataInvariant("static materializer was asked to execute a runtime procedure");
         }
         if (!proc.args.isEmpty()) staticDataInvariant("static initializer procedure had runtime arguments");
-        if (proc.hosted != null) staticDataInvariant("static initializer procedure was hosted");
-        const body = proc.body orelse staticDataInvariant("static initializer procedure had no body");
+        if (proc.hosted.get() != null) staticDataInvariant("static initializer procedure was hosted");
+        const body = proc.body.get() orelse staticDataInvariant("static initializer procedure had no body");
         const frame = try self.pushFrame();
         defer self.popFrame();
         const locals = frame.slots;
@@ -1029,6 +1166,20 @@ const StaticInitializerMachine = struct {
         }
     }
 
+    fn readTargetWord(self: *const StaticInitializerMachine, bytes: []const u8, offset: u32) u64 {
+        return switch (self.word_size) {
+            4 => std.mem.readInt(u32, bytes[offset..][0..4], .little),
+            8 => std.mem.readInt(u64, bytes[offset..][0..8], .little),
+            else => unreachable, // word_size comes from TargetUsize.size(), which is 4 or 8
+        };
+    }
+
+    /// The value of a `U64` scalar local.
+    fn readU64(_: *const StaticInitializerMachine, value: *const SymbolicValue) u64 {
+        if (value.bytes.len != 8 or value.relocations.items.len != 0) staticDataInvariant("static initializer capacity operand was not a U64 scalar");
+        return std.mem.readInt(u64, value.bytes[0..8], .little);
+    }
+
     fn writeTargetWord(self: *const StaticInitializerMachine, bytes: []u8, offset: u32, word: u64) void {
         const unused_bits: std.math.Log2Int(u64) = @intCast((8 - self.word_size) * 8);
         const max_word = @as(u64, std.math.maxInt(u64)) >> unused_bits;
@@ -1062,6 +1213,8 @@ const StaticInitializerMachine = struct {
         }
     }
 
+    const NewAllocation = struct { id: SymbolicAllocationId, payload: *SymbolicValue };
+
     fn addAllocation(
         self: *StaticInitializerMachine,
         payload_layout: layout.Idx,
@@ -1069,7 +1222,7 @@ const StaticInitializerMachine = struct {
         alignment: u32,
         contains_refcounted: bool,
         list_element_count: ?usize,
-    ) Allocator.Error!struct { id: SymbolicAllocationId, payload: *SymbolicValue } {
+    ) Allocator.Error!NewAllocation {
         const payload = try self.allocator().create(SymbolicValue);
         const bytes = try self.allocator().alloc(u8, payload_size);
         @memset(bytes, 0);
@@ -1397,6 +1550,46 @@ const StaticInitializerMachine = struct {
     ) MaterializationError!*SymbolicValue {
         const args = self.store().getLocalSpan(args_span);
         const target = self.layoutValue(target_layout);
+        if (op == .boxed_sequence_pack) {
+            if (args.len != 2) staticDataInvariant("boxed sequence construction has two operands");
+            const record = local(locals, GuardedList.at(args, 0));
+            const offset = local(locals, GuardedList.at(args, 1));
+            return self.freezeSequence(record, std.mem.readInt(u32, offset.bytes[0..4], .little), target_layout);
+        }
+        // A restored list with spare capacity is the reservation it was
+        // evaluated with (`constListWithSpareCapacity`), which here becomes
+        // the capacity its descriptor records.
+        if (op == .list_with_capacity) {
+            if (args.len != 1) staticDataInvariant("static initializer list_with_capacity arity differed from one");
+            if (target.tag != .list and target.tag != .list_of_zst) staticDataInvariant("static initializer list_with_capacity had non-list target layout");
+            return self.storedListValue(target_layout, 0, self.readU64(local(locals, GuardedList.at(args, 0))), null);
+        }
+        if (op == .list_reserve) {
+            if (args.len != 2) staticDataInvariant("static initializer list_reserve arity differed from two");
+            if (target.tag != .list and target.tag != .list_of_zst) staticDataInvariant("static initializer list_reserve had non-list target layout");
+            const result = try self.cloneValueAs(local(locals, GuardedList.at(args, 0)), target_layout);
+            const abi = self.layouts().builtinListAbi(target_layout);
+            const len = self.readTargetWord(result.bytes, self.word_size);
+            if (len == 0) staticDataInvariant("static initializer list_reserve was given an empty list");
+            const spare = self.readU64(local(locals, GuardedList.at(args, 1)));
+            // Zero-sized items occupy no allocation, so the reservation is a
+            // count alone, bounded by what the target's word encodes.
+            if (abi.elem_size == 0) {
+                try self.writeListCapacity(result, @max(len, @min(len +| spare, self.maxZeroSizedCapacity())));
+                return result;
+            }
+            try self.ownListItems(result, abi, @intCast(len));
+            try self.writeListCapacity(result, std.math.add(u64, len, spare) catch return error.OutOfMemory);
+            return result;
+        }
+        // A restored string with spare capacity, likewise
+        // (`constStrWithSpareCapacity`).
+        if (op == .str_reserve) {
+            if (args.len != 2) staticDataInvariant("static initializer str_reserve arity differed from two");
+            const bytes = self.symbolicStrBytes(local(locals, GuardedList.at(args, 0)));
+            const spare = self.readU64(local(locals, GuardedList.at(args, 1)));
+            return self.storedStr(bytes, std.math.add(u64, bytes.len, spare) catch return error.OutOfMemory, target_layout);
+        }
         if (op != .box_box) {
             staticDataInvariant("non-construction low-level operation reached static initializer materialization");
         }
@@ -1417,6 +1610,46 @@ const StaticInitializerMachine = struct {
         return self.pointerValue(target_layout, allocation.id, 0);
     }
 
+    fn freezeSequence(self: *StaticInitializerMachine, record: *const SymbolicValue, step_offset: u32, target_layout: layout.Idx) MaterializationError!*SymbolicValue {
+        if (record.relocations.items.len != 1 or record.relocations.items[0].offset != step_offset) {
+            staticDataInvariant("a builtin sequence record must contain only its step pointer");
+        }
+        const step = record.relocations.items[0];
+        const source = switch (step.target) {
+            .allocation => |id| blk: {
+                if (step.addend != 0) staticDataInvariant("a sequence step must name an allocation's payload");
+                break :blk self.allocations.items[@backingInt(id)].payload;
+            },
+            .frozen_symbol => |id| blk: {
+                const symbol = self.lowered.frozen_static_data.?.exports[@backingInt(id)];
+                const start = symbol.symbol_offset + @as(usize, @intCast(step.addend));
+                if (start > symbol.bytes.len) staticDataInvariant("a frozen sequence step exceeds its allocation");
+                break :blk (try self.readFrozenRange(id, target_layout, start, symbol.bytes.len - start)).*;
+            },
+            .procedure, .rc_helper => staticDataInvariant("a sequence step must be an erased allocation"),
+        };
+        const size_at = 3 * self.word_size;
+        const capture_size: usize = switch (self.word_size) {
+            4 => std.mem.readInt(u32, source.bytes[size_at..][0..4], .little),
+            8 => @intCast(std.mem.readInt(u64, source.bytes[size_at..][0..8], .little)),
+            else => unreachable, // the target's pointer width is 4 or 8
+        };
+        const live_size = builtins.erased_callable.payloadSizeFor(self.word_size, capture_size);
+        if (live_size > source.bytes.len) staticDataInvariant("a frozen sequence step omitted its captures");
+        const state_offset = std.mem.alignForward(usize, live_size, builtins.erased_callable.capture_alignment);
+        const allocation = try self.addAllocation(target_layout, state_offset + record.bytes.len, builtins.erased_callable.payload_alignment, false, null);
+        @memcpy(allocation.payload.bytes[0..live_size], source.bytes[0..live_size]);
+        for (source.relocations.items) |relocation| {
+            if (relocation.offset < live_size) try allocation.payload.relocations.append(self.allocator(), relocation);
+        }
+        @memcpy(allocation.payload.bytes[state_offset..][0..record.bytes.len], record.bytes);
+        try allocation.payload.relocations.append(self.allocator(), .{
+            .offset = @intCast(state_offset + step_offset),
+            .target = .{ .allocation = allocation.id },
+        });
+        return self.pointerValue(target_layout, allocation.id, 0);
+    }
+
     fn evalPackedErasedFn(
         self: *StaticInitializerMachine,
         locals: []const ?*SymbolicValue,
@@ -1430,7 +1663,11 @@ const StaticInitializerMachine = struct {
             try self.cloneValueAs(local(locals, capture_local), assign.capture_layout orelse staticDataInvariant("static callable capture has no layout"))
         else
             null;
-        return self.freezeCallable(assign.proc, capture, assign.on_drop, target_layout);
+        var on_drop = assign.on_drop;
+        if (assign.frozen_capture_layout) |frozen_layout| {
+            if (on_drop == .rc_helper) on_drop.rc_helper.layout_idx = frozen_layout;
+        }
+        return self.freezeCallable(assign.proc, capture, on_drop, target_layout);
     }
 
     fn freezeCallable(self: *StaticInitializerMachine, proc: lir.LIR.LirProcSpecId, capture: ?*SymbolicValue, on_drop: lir.LIR.ErasedCallableOnDrop, target_layout: layout.Idx) MaterializationError!*SymbolicValue {
@@ -1439,10 +1676,10 @@ const StaticInitializerMachine = struct {
         // their captures, as the code packing one does; the prefix stays
         // zeroed, since a static value is never dropped and nothing reads it.
         const prefix: u32 = self.lowered.lir_result.erased_capture_prefix;
-        const capture_offset: u32 = builtins.erased_callable.capture_offset + prefix;
+        const capture_offset: u32 = builtins.erased_callable.captureOffset(self.word_size) + prefix;
         const allocation = try self.addAllocation(
             target_layout,
-            builtins.erased_callable.payloadSize(prefix + capture_size),
+            builtins.erased_callable.payloadSizeFor(self.word_size, prefix + capture_size),
             builtins.erased_callable.payload_alignment,
             builtins.erased_callable.allocation_has_refcounted_children,
             null,
@@ -1464,10 +1701,50 @@ const StaticInitializerMachine = struct {
                     .target = .{ .rc_helper = helper },
                     .kind = .function_pointer,
                 });
+                try allocation.payload.relocations.append(self.allocator(), .{
+                    .offset = 2 * self.word_size,
+                    .target = .{ .rc_helper = .{ .op = .incref, .layout_idx = helper.layout_idx } },
+                    .kind = .function_pointer,
+                });
             },
         }
+        self.writeTargetWord(allocation.payload.bytes, 3 * self.word_size, prefix + capture_size);
         if (capture) |value| try self.copyInto(allocation.payload, capture_offset, value, @intCast(capture_size));
         return try self.pointerValue(target_layout, allocation.id, 0);
+    }
+
+    /// Where an erased callable's capture bytes start in its payload.
+    fn erasedCaptureOffset(self: *const StaticInitializerMachine) u32 {
+        return builtins.erased_callable.capture_offset + self.lowered.lir_result.erased_capture_prefix;
+    }
+
+    /// The allocation of an erased callable of `procedure` with `capture_size`
+    /// capture bytes: its function pointer written, its `on_drop` and capture
+    /// bytes left zeroed.
+    fn erasedCallableAllocation(
+        self: *StaticInitializerMachine,
+        target_layout: layout.Idx,
+        procedure: lir.LIR.LirProcSpecId,
+        capture_size: usize,
+    ) Allocator.Error!NewAllocation {
+        // The program's erased callables reserve its capture prefix before
+        // their captures, as the code packing one does; the prefix stays
+        // zeroed, since a static value is never dropped and nothing reads it.
+        const prefix: u32 = self.lowered.lir_result.erased_capture_prefix;
+        const allocation = try self.addAllocation(
+            target_layout,
+            builtins.erased_callable.payloadSize(prefix + capture_size),
+            builtins.erased_callable.payload_alignment,
+            builtins.erased_callable.allocation_has_refcounted_children,
+            null,
+        );
+        try allocation.payload.relocations.append(self.allocator(), .{
+            .offset = 0,
+            .target = .{ .procedure = procedure },
+            .kind = .function_pointer,
+            .callable_capture_offset = self.erasedCaptureOffset(),
+        });
+        return allocation;
     }
 };
 
@@ -1592,7 +1869,7 @@ fn deinitRelocationSlice(allocator: Allocator, relocations: []const StaticDataRe
 }
 
 /// Merges the identical nodes of a frozen image. Two non-root symbols with
-/// the same bytes, alignment, symbol offset, empty-list capacities and
+/// the same bytes, alignment, symbol offset and
 /// relocations, relocation targets compared as the nodes they resolve to,
 /// become one, and every relocation that named the dropped node names the
 /// kept one; merging nodes can make their parents identical, so the merge
@@ -1899,7 +2176,7 @@ const StaticDataBuilder = struct {
 
     fn buildRequestedExports(self: *StaticDataBuilder) MaterializationError!void {
         for (self.lowered.lir_result.requested_layouts.items, 0..) |request, index| {
-            const initializer = request.initializer orelse continue;
+            const initializer = request.initializer.get() orelse continue;
             if (request.const_locator == null) continue;
 
             self.beginOwner(requestedOwner(self.lowered, index));
@@ -1932,7 +2209,7 @@ const StaticDataBuilder = struct {
             self.beginOwner(self.providedOwner(provided_index));
 
             const request = self.requestedLayout(data.const_ref);
-            const initializer = request.initializer orelse
+            const initializer = request.initializer.get() orelse
                 staticDataInvariant("provided static data export had no closed LIR initializer");
             const entrypoint_name = self.root.module.canonical_names.externalSymbolNameText(data.ffi_symbol);
             const symbol_name = try self.allocator.dupe(u8, entrypoint_name);
@@ -1958,7 +2235,7 @@ const StaticDataBuilder = struct {
 
     fn buildInternalStaticValues(self: *StaticDataBuilder) MaterializationError!void {
         for (0..self.lowered.lir_result.static_data_values.items.len) |index| {
-            if (self.initializer_machine.frozen_roots[index] != null) continue;
+            if (self.initializer_machine.frozen_roots.isPresent(index)) continue;
             const static_data_id: lir.LIR.StaticDataId = @fromBackingInt(@intCast(@as(u32, @intCast(index))));
             const symbol_name = try lir.Program.staticDataSymbolName(self.allocator, static_data_id);
             errdefer self.allocator.free(symbol_name);
@@ -2012,7 +2289,7 @@ const StaticDataBuilder = struct {
     fn requestedLayout(self: *StaticDataBuilder, const_locator: CheckedModule.ConstLocator) lir.Program.RequestedLayout {
         for (self.lowered.lir_result.requested_layouts.items) |request| {
             const request_locator = request.const_locator orelse continue;
-            if (std.meta.eql(request_locator, const_locator) and request.initializer != null) return request;
+            if (std.meta.eql(request_locator, const_locator) and request.initializer != .none) return request;
         }
         staticDataInvariant("provided data export had no initialized LIR layout request");
     }
@@ -2113,7 +2390,7 @@ const StaticDataBuilder = struct {
                     .target = .{ .data_symbol = symbol },
                     .addend = source.addend,
                     .kind = source.kind,
-                    .callable_capture_offset = source.callable_capture_offset,
+                    .callable_capture_offset = .of(source.callable_capture_offset),
                 };
                 return null;
             },
@@ -2129,7 +2406,7 @@ const StaticDataBuilder = struct {
                     .target = .{ .data_symbol = target.symbol },
                     .addend = target.addend + source.addend,
                     .kind = source.kind,
-                    .callable_capture_offset = source.callable_capture_offset,
+                    .callable_capture_offset = .of(source.callable_capture_offset),
                 };
                 return reserved;
             },
@@ -2143,8 +2420,8 @@ const StaticDataBuilder = struct {
                     .target_symbol_name = name,
                     .addend = source.addend,
                     .kind = .function_pointer,
-                    .callable_capture_offset = source.callable_capture_offset,
-                    .procedure = proc_id,
+                    .callable_capture_offset = .of(source.callable_capture_offset),
+                    .procedure = .some(proc_id),
                     .owns_target_symbol_name = cached_name == null,
                 };
                 return null;
@@ -2159,7 +2436,7 @@ const StaticDataBuilder = struct {
                     .target_symbol_name = name,
                     .addend = source.addend,
                     .kind = .function_pointer,
-                    .callable_capture_offset = source.callable_capture_offset,
+                    .callable_capture_offset = .of(source.callable_capture_offset),
                     .rc_helper = helper,
                     .owns_target_symbol_name = cached_name == null,
                 };
@@ -2312,7 +2589,7 @@ fn addCompletedValueForTest(program: *lir.Program.Result, layout_idx: layout.Idx
     errdefer allocator.free(owned);
     const id: lir.LIR.StaticDataId = @fromBackingInt(@intCast(program.static_data_values.items.len));
     try program.static_data_values.append(allocator, .{
-        .initializer = null,
+        .initializer = .none,
         .layout_idx = layout_idx,
         .parts = .{ .kind = kind, .children = owned },
     });
@@ -2343,14 +2620,15 @@ test "completed value parts encode shared nested lists and callables at both tar
             .args = .empty(),
             .frame_locals = try program.store.addLocalSpan(&.{local_id}),
             .join_points = .empty(),
-            .body = ret,
+            .body = .some(ret),
             .ret_layout = .zst,
             .abi = .roc,
         }, .none);
         const word_id = try addCompletedValueForTest(program, .opaque_ptr, .{ .word = 7 }, &.{});
-        const inner_id = try addCompletedValueForTest(program, item_layout, .list, &.{word_id});
-        const outer_id = try addCompletedValueForTest(program, outer_layout, .list, &.{ inner_id, inner_id });
-        const callable_id = try addCompletedValueForTest(program, callable_layout, .{ .callable = proc }, &.{outer_id});
+        const inner_id = try addCompletedValueForTest(program, item_layout, .{ .list = 1 }, &.{word_id});
+        const outer_id = try addCompletedValueForTest(program, outer_layout, .{ .list = 2 }, &.{ inner_id, inner_id });
+        const on_drop: lir.LIR.ErasedCallableOnDrop = .{ .rc_helper = .{ .op = .host_drop, .layout_idx = outer_layout } };
+        const callable_id = try addCompletedValueForTest(program, callable_layout, .{ .callable = .{ .proc = proc, .on_drop = on_drop } }, &.{outer_id});
         var machine = try StaticInitializerMachine.init(allocator, &lowered, .{}, width);
         defer machine.deinit();
         const callable = try machine.evaluateStatic(callable_id);
@@ -2363,7 +2641,11 @@ test "completed value parts encode shared nested lists and callables at both tar
         try std.testing.expectEqual(outer_backing.relocations.items[0].target.allocation, outer_backing.relocations.items[1].target.allocation);
         const captured = machine.allocations.items[@backingInt(callable.relocations.items[0].target.allocation)].payload;
         try std.testing.expectEqual(proc, captured.relocations.items[0].target.procedure);
-        try std.testing.expectEqual(builtins.erased_callable.capture_offset, captured.relocations.items[1].offset);
+        try std.testing.expectEqual(on_drop.rc_helper, captured.relocations.items[1].target.rc_helper);
+        try std.testing.expectEqual(@as(u32, width.size()), captured.relocations.items[1].offset);
+        try std.testing.expectEqual(layout.RcHelperKey{ .op = .incref, .layout_idx = outer_layout }, captured.relocations.items[2].target.rc_helper);
+        try std.testing.expectEqual(@as(u32, 2 * width.size()), captured.relocations.items[2].offset);
+        try std.testing.expectEqual(builtins.erased_callable.captureOffset(width.size()), captured.relocations.items[3].offset);
         try std.testing.expectEqual(callable, try machine.evaluateStatic(callable_id));
         try std.testing.expectEqual(@as(usize, 3), machine.allocations.items.len);
     }

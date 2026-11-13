@@ -2,6 +2,41 @@
 
 const TestCase = @import("parallel_runner.zig").TestCase;
 
+/// A closed erased forwarder defers two scalar tuples. The corresponding LIR
+/// producer test pins their complete packet widths at both target word sizes.
+fn pendingPacketBoundarySource(comptime fields: usize, comptime scalar: enum { u16, u32 }) []const u8 {
+    const name = switch (scalar) {
+        .u16 => "U16",
+        .u32 => "U32",
+    };
+    const conversion = switch (scalar) {
+        .u16 => "to_u16_wrap",
+        .u32 => "to_u32_wrap",
+    };
+    const tuples = comptime blk: {
+        var ty: []const u8 = "(";
+        var value: []const u8 = "(";
+        var different: []const u8 = "(";
+        for (0..fields) |index| {
+            const separator = if (index == 0) "" else ", ";
+            ty = ty ++ separator ++ name;
+            value = value ++ separator ++ "value";
+            different = different ++ separator ++ if (index + 1 == fields) "value.plus_wrap(1)" else "value";
+        }
+        break :blk .{ .ty = ty ++ ")", .value = value ++ ")", .different = different ++ ")" };
+    };
+    return "{\n" ++
+        "Packet : " ++ tuples.ty ++ "\n" ++
+        "equal : Packet, Packet -> Bool\nequal = |a, b| a == b\n" ++
+        "forward : Box((Packet, Packet -> Bool)), Packet, Packet -> Bool\n" ++
+        "forward = |boxed, a, b| Box.unbox(boxed)(a, b)\n" ++
+        "units = List.repeat(65.U16, 64)\n" ++
+        "value = List.len(units)." ++ conversion ++ "()\n" ++
+        "first = " ++ tuples.value ++ "\nsecond = " ++ tuples.value ++ "\n" ++
+        "different = " ++ tuples.different ++ "\nboxed = Box.box(equal)\n" ++
+        "(forward(boxed, first, second), forward(boxed, first, different), units.get(0))\n}";
+}
+
 const wide_utf_le_test_prefix =
     \\{
     \\utf16_bytes : List(U16) -> List(U8)
@@ -1907,7 +1942,7 @@ pub const tests = [_]TestCase{
         .skip = .{ .interpreter = true, .dev = true, .llvm = true },
     },
     .{
-        .name = "low_level - List.capacity of zero-sized items stays zero on every backend",
+        .name = "low_level - List.capacity of zero-sized items is at least their count on every backend",
         .source =
         \\{
         \\x : List({})
@@ -1915,10 +1950,10 @@ pub const tests = [_]TestCase{
         \\(List.len(x), List.capacity(x))
         \\}
         ,
-        .expected = .{ .inspect_str = "(3, 0)" },
+        .expected = .{ .inspect_str = "(3, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list concat reports zero capacity",
+        .name = "low_level - zero-sized list concat has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -1927,10 +1962,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(5, 0)" },
+        .expected = .{ .inspect_str = "(5, 5)" },
     },
     .{
-        .name = "low_level - zero-sized list rev reports zero capacity",
+        .name = "low_level - zero-sized list rev keeps its capacity",
         .source =
         \\{
         \\x : List({})
@@ -1939,10 +1974,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(3, 0)" },
+        .expected = .{ .inspect_str = "(3, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list sublist reports zero capacity",
+        .name = "low_level - zero-sized list sublist has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -1951,10 +1986,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(2, 0)" },
+        .expected = .{ .inspect_str = "(2, 2)" },
     },
     .{
-        .name = "low_level - zero-sized list drop_at reports zero capacity",
+        .name = "low_level - zero-sized list drop_at keeps its capacity",
         .source =
         \\{
         \\x : List({})
@@ -1963,10 +1998,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(2, 0)" },
+        .expected = .{ .inspect_str = "(2, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list drop_swap reports zero capacity",
+        .name = "low_level - zero-sized list drop_swap has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -1975,10 +2010,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(2, 0)" },
+        .expected = .{ .inspect_str = "(2, 2)" },
     },
     .{
-        .name = "low_level - zero-sized list prepend reports zero capacity",
+        .name = "low_level - zero-sized list prepend grows its capacity to its length",
         .source =
         \\{
         \\x : List({})
@@ -1987,7 +2022,7 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(4, 0)" },
+        .expected = .{ .inspect_str = "(4, 4)" },
     },
     .{
         .name = "low_level - prepend after drop_first pops and pushes at the front",
@@ -2035,7 +2070,7 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "([\"first string long enough to live on the heap a\", \"second string long enough to live on the heap b\"], [\"second string long enough to live on the heap b\"], [\"pushed string long enough to live on the heap z\", \"second string long enough to live on the heap b\"])" },
     },
     .{
-        .name = "low_level - zero-sized list append reports zero capacity",
+        .name = "low_level - zero-sized list append grows its capacity to its length",
         .source =
         \\{
         \\x : List({})
@@ -2044,10 +2079,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(4, 0)" },
+        .expected = .{ .inspect_str = "(4, 4)" },
     },
     .{
-        .name = "low_level - zero-sized list insert reports zero capacity",
+        .name = "low_level - zero-sized list insert grows its capacity to its length",
         .source =
         \\{
         \\x : List({})
@@ -2056,10 +2091,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(4, 0)" },
+        .expected = .{ .inspect_str = "(4, 4)" },
     },
     .{
-        .name = "low_level - zero-sized list set reports zero capacity",
+        .name = "low_level - zero-sized list set keeps its capacity",
         .source =
         \\{
         \\x : List({})
@@ -2068,10 +2103,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(3, 0)" },
+        .expected = .{ .inspect_str = "(3, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list swap reports zero capacity",
+        .name = "low_level - zero-sized list swap keeps its capacity",
         .source =
         \\{
         \\x : List({})
@@ -2080,10 +2115,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(3, 0)" },
+        .expected = .{ .inspect_str = "(3, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list take_first reports zero capacity",
+        .name = "low_level - zero-sized list take_first has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2092,10 +2127,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(2, 0)" },
+        .expected = .{ .inspect_str = "(2, 2)" },
     },
     .{
-        .name = "low_level - zero-sized list take_last reports zero capacity",
+        .name = "low_level - zero-sized list take_last has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2104,10 +2139,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(2, 0)" },
+        .expected = .{ .inspect_str = "(2, 2)" },
     },
     .{
-        .name = "low_level - zero-sized list drop_first reports zero capacity",
+        .name = "low_level - zero-sized list drop_first has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2116,10 +2151,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(2, 0)" },
+        .expected = .{ .inspect_str = "(2, 2)" },
     },
     .{
-        .name = "low_level - zero-sized list drop_last reports zero capacity",
+        .name = "low_level - zero-sized list drop_last has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2128,7 +2163,7 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(2, 0)" },
+        .expected = .{ .inspect_str = "(2, 2)" },
     },
     .{
         // The emptied list keeps its allocation: a uniquely owned list of
@@ -2147,7 +2182,7 @@ pub const tests = [_]TestCase{
         .skip = .{ .wasm = true },
     },
     .{
-        .name = "low_level - zero-sized list clear reports zero capacity",
+        .name = "low_level - zero-sized list clear keeps its capacity",
         .source =
         \\{
         \\x : List({})
@@ -2156,10 +2191,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(0, 0)" },
+        .expected = .{ .inspect_str = "(0, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list release_excess_capacity reports zero capacity",
+        .name = "low_level - zero-sized list release_excess_capacity has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2168,10 +2203,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(3, 0)" },
+        .expected = .{ .inspect_str = "(3, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list reserve reports zero capacity",
+        .name = "low_level - zero-sized list reserve records the reservation",
         .source =
         \\{
         \\x : List({})
@@ -2180,10 +2215,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(3, 0)" },
+        .expected = .{ .inspect_str = "(3, 7)" },
     },
     .{
-        .name = "low_level - zero-sized list repeat reports zero capacity",
+        .name = "low_level - zero-sized list repeat has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2192,10 +2227,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(3, 0)" },
+        .expected = .{ .inspect_str = "(3, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list split_at reports zero capacity",
+        .name = "low_level - zero-sized list split_at has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2204,10 +2239,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(2, 0)" },
+        .expected = .{ .inspect_str = "(2, 2)" },
     },
     .{
-        .name = "low_level - zero-sized list join reports zero capacity",
+        .name = "low_level - zero-sized list join has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2216,10 +2251,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(6, 0)" },
+        .expected = .{ .inspect_str = "(6, 6)" },
     },
     .{
-        .name = "low_level - zero-sized list map reports zero capacity",
+        .name = "low_level - zero-sized list map has no spare capacity",
         .source =
         \\{
         \\x : List({})
@@ -2228,10 +2263,10 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(3, 0)" },
+        .expected = .{ .inspect_str = "(3, 3)" },
     },
     .{
-        .name = "low_level - zero-sized list with_capacity reports zero capacity",
+        .name = "low_level - zero-sized list with_capacity records the reservation",
         .source =
         \\{
         \\r : List({})
@@ -2239,7 +2274,31 @@ pub const tests = [_]TestCase{
         \\(List.len(r), List.capacity(r))
         \\}
         ,
-        .expected = .{ .inspect_str = "(0, 0)" },
+        .expected = .{ .inspect_str = "(0, 5)" },
+    },
+    .{
+        .name = "low_level - zero-sized list keeps its reservation as it fills and clears",
+        .source =
+        \\{
+        \\r : List({})
+        \\r = List.with_capacity(5).append({}).append({})
+        \\c = List.clear(r)
+        \\(List.len(r), List.capacity(r), List.len(c), List.capacity(c))
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(2, 5, 0, 5)" },
+    },
+    .{
+        .name = "low_level - zero-sized list reserve below its capacity changes nothing",
+        .source =
+        \\{
+        \\x : List({})
+        \\x = [{}, {}, {}]
+        \\r = List.reserve(List.reserve(x, 10), 2)
+        \\(List.len(r), List.capacity(r))
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(3, 13)" },
     },
     .{
         .name = "low_level - List.append on non-empty list",
@@ -4722,6 +4781,54 @@ pub const tests = [_]TestCase{
             \\}
         ++ "\n}",
         .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        // Boxy's Try equality defers a pair of heap strings. On wasm32 the
+        // pending cell must include the target's complete inline storage and
+        // header, including the fields that retain spare heap packets.
+        .name = "pending calls - inline packet preserves unrelated live list",
+        .source =
+        \\{
+        \\    units = List.repeat(65.U16, 64)
+        \\    first : Try(Str, U64)
+        \\    first = Ok(Str.repeat("A", 64))
+        \\    second : Try(Str, U64)
+        \\    second = Ok(Str.repeat("A", 64))
+        \\    equal = first == second
+        \\    (equal, units.get(0))
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(True, Ok(65))" },
+    },
+    .{
+        .name = "pending calls - target-width boundary 60 bytes",
+        .source = pendingPacketBoundarySource(15, .u16),
+        .expected = .{ .inspect_str = "(True, False, Ok(65))" },
+    },
+    .{
+        .name = "pending calls - target-width boundary 64 bytes",
+        .source = pendingPacketBoundarySource(16, .u16),
+        .expected = .{ .inspect_str = "(True, False, Ok(65))" },
+    },
+    .{
+        .name = "pending calls - target-width boundary 68 bytes",
+        .source = pendingPacketBoundarySource(17, .u16),
+        .expected = .{ .inspect_str = "(True, False, Ok(65))" },
+    },
+    .{
+        .name = "pending calls - target-width boundary 120 bytes",
+        .source = pendingPacketBoundarySource(15, .u32),
+        .expected = .{ .inspect_str = "(True, False, Ok(65))" },
+    },
+    .{
+        .name = "pending calls - target-width boundary 128 bytes",
+        .source = pendingPacketBoundarySource(16, .u32),
+        .expected = .{ .inspect_str = "(True, False, Ok(65))" },
+    },
+    .{
+        .name = "pending calls - target-width boundary 136 bytes",
+        .source = pendingPacketBoundarySource(17, .u32),
+        .expected = .{ .inspect_str = "(True, False, Ok(65))" },
     },
     .{
         .name = "wide UTF decoding - UTF-16 sliced input LE",

@@ -108,10 +108,7 @@ pub const StaticDataRequest = postcheck.Common.StaticDataRequest;
 pub const SpecializationStrategy = base.SpecializationStrategy;
 
 /// Root checked module plus the checked imports visible to post-check lowering.
-pub const CheckedModuleSet = struct {
-    root: checked.LoweringModuleView,
-    imports: []const checked.ImportedModuleView = &.{},
-};
+pub const CheckedModuleSet = postcheck.Common.CheckedModules;
 
 /// Root requests that determine which checked definitions become LIR roots.
 pub const RootRequestSet = struct {
@@ -203,6 +200,10 @@ pub const TargetConfig = struct {
     /// checks, so optimized consumers enable them and the rest keep the
     /// checks and skip the analysis.
     prove_uniqueness: bool = false,
+    /// Drop the retains and releases of string literals, which are image
+    /// data. They only ever decide to do nothing at runtime, so optimized
+    /// consumers drop them and the rest keep them and skip the analysis.
+    immortal_string_literals: bool = false,
     /// Direct-call inlining scope for SpecConstr's value-aware clones.
     /// Optimized builds use `.all_calls`; dev builds use `.iterator_fusion`
     /// so post-check time and emitted program size stay bounded. Consulted
@@ -1077,6 +1078,7 @@ pub const SolvedPolicy = struct {
 pub const LirPolicy = struct {
     specialize_arc_modes: bool,
     prove_uniqueness: bool,
+    immortal_string_literals: bool,
     consume_dead_boxes: bool,
     zero_dict_seed: bool,
     list_in_place_map: bool,
@@ -1223,9 +1225,9 @@ pub fn adoptReachableCompletedComptimeValues(lowered: *LoweredProgram) Allocator
     if (lowered.frozen_static_data == null) checkedPipelineInvariant("runtime consumer has no completed compile-time values to adopt");
     const result = &lowered.lir_result;
     result.comptime_value_guards.clearRetainingCapacity();
-    for (result.static_data_values.items) |*value| value.first_comptime_guard = null;
+    for (result.static_data_values.items) |*value| value.first_comptime_guard = .none;
     for (lowered.frozen_static_data.?.exports) |item| {
-        if (item.value_id) |id| result.static_data_values.items[@backingInt(id)].initializer = null;
+        if (item.value_id) |id| result.static_data_values.items[@backingInt(id)].initializer = .none;
     }
     for (result.static_data_values.items) |*value| value.compile_time_root = null;
 }
@@ -1238,10 +1240,10 @@ pub fn adoptReachableCompletedComptimeValues(lowered: *LoweredProgram) Allocator
 fn completeComptimeValueSlots(lowered: *LoweredProgram) Allocator.Error!void {
     const result = &lowered.lir_result;
     result.comptime_value_guards.clearRetainingCapacity();
-    for (result.static_data_values.items) |*value| value.first_comptime_guard = null;
+    for (result.static_data_values.items) |*value| value.first_comptime_guard = .none;
     if (lowered.frozen_static_data) |*frozen| {
         for (frozen.exports) |item| {
-            if (item.value_id) |id| result.static_data_values.items[@backingInt(id)].initializer = null;
+            if (item.value_id) |id| result.static_data_values.items[@backingInt(id)].initializer = .none;
         }
         for (result.static_data_values.items) |*value| value.compile_time_root = null;
         try ReachableProcs.runWithFrozen(result, frozen);
@@ -1410,6 +1412,7 @@ pub fn prepareCheckedModulesMonotype(
     target: TargetConfig,
 ) LowerResourceError!PreparedMonotype {
     if (target.specialization_strategy != .lss) checkedPipelineInvariant("Monotype preparation requires LSS");
+    try modules.demandBodyIndexes();
     try verifyCheckedBoundary(modules, target);
     try requireHostedProceduresBound(modules, target);
 
@@ -1454,10 +1457,10 @@ pub fn prepareCheckedModulesMonotype(
         if (target.work_metrics) |metrics| metrics.monotype_runs += 1;
         break :monotype try postcheck.Monotype.Lower.run(
             allocator,
-            checkedModules(modules),
+            modules,
             rootRequests(roots, layout_requests, static_data_requests),
             .{
-                .proc_debug_names = target.proc_debug_names or LirDump.filter() != null or SpecCensus.enabled(),
+                .proc_debug_names = target.proc_debug_names or LirDump.filter() != null or SpecCensus.enabled() or ProcCensus.enabled(),
                 .post_check_executor = target.post_check_executor,
                 .comptime_value_reads = target.comptime_value_reads,
                 .demand_driven_comptime_roots = target.demand_driven_comptime_roots,
@@ -1618,7 +1621,7 @@ pub const PreparedSolved = struct {
         for (roots[0..root_count], producers[0..root_count]) |root, *producer| producer.* = .{
             .fn_id = root.fn_id,
             .module = lowering_modules[@backingInt(root.owner)],
-            .root = .{ .checked = root.request.compile_time_root orelse checkedPipelineInvariant("compile-time root reached producer ordering without its checked root identity") },
+            .root = .{ .checked = root.request.compile_time_root.get() orelse checkedPipelineInvariant("compile-time root reached producer ordering without its checked root identity") },
         };
         for (literal_roots, producers[root_count..], 0..) |root, *producer, index| producer.* = .{
             .fn_id = root.fn_id,
@@ -1747,13 +1750,14 @@ fn generateConsumerLir(prepared: *PreparedSolved, consumer: Consumer) LowerResou
         .inline_expects = target.inline_expects,
         .list_in_place_map = target.list_in_place_map,
         .dict_seed_mode = if (target.zero_dict_seed) .comptime_zero else .runtime,
-        .proc_debug_names = target.proc_debug_names or LirDump.filter() != null or SpecCensus.enabled(),
+        .proc_debug_names = target.proc_debug_names or LirDump.filter() != null or SpecCensus.enabled() or ProcCensus.enabled(),
         .host_boundary_digests = target.host_boundary_digests,
         .layout_request_const_plans = target.layout_request_const_plans,
         .test_plan_metadata = prepared.test_plan_metadata,
         .parallel_metrics = parallel_metrics,
         .completed_scalar_values = target.completed_scalar_values,
         .completed_erased_members = consumer.completed_erased_members,
+        .erased_capture_prefix = target.erased_capture_prefix,
     });
     if (target.timing) |timing| timing.addSolvedLirParallel(parallel_metrics.?.*);
     lir_gen_timing_scope.end();
@@ -1901,7 +1905,7 @@ fn finishLoweredOutput(
         @memset(seen, false);
         for (arc_roots.items) |proc| seen[@backingInt(proc)] = true;
         for (data.exports) |export_| for (export_.relocations) |relocation| {
-            const proc = relocation.procedure orelse continue;
+            const proc = relocation.procedure.get() orelse continue;
             try entered_from_outside.append(allocator, proc);
             if (seen[@backingInt(proc)]) continue;
             seen[@backingInt(proc)] = true;
@@ -1931,12 +1935,13 @@ fn finishLoweredOutput(
 
     // After the certifier has checked ARC's ledger, so that what it verified
     // is the placement ARC produced.
-    _ = try ImmortalLocals.elide(allocator, &lowered.lir_result.store);
+    _ = try ImmortalLocals.elide(allocator, &lowered.lir_result.store, if (target.immortal_string_literals) .static_data_and_strings else .static_data);
 
     try @import("comptime_value_guards.zig").insert(allocator, &lowered.lir_result, if (frozen.*) |*data| data else null);
 
     try LirDump.run(&lowered.lir_result);
     if (SpecCensus.enabled()) try SpecCensus.runLir(allocator, &lowered.lir_result);
+    ProcCensus.run(&lowered.lir_result, target.specialization_strategy);
 
     if (root_count != 0 and lowered.lir_result.root_procs.items.len == 0) {
         checkedPipelineInvariant("explicit root set produced no LIR roots");
@@ -1984,14 +1989,14 @@ pub const PreparedBoxy = struct {
         const allocator = self.allocator;
         var boxy_timing_scope = PipelineStageScope.begin(target.timing, .boxy_lowering);
         var output = try postcheck.Boxy.run(allocator, .{
-            .modules = checkedModules(self.modules),
+            .modules = self.modules,
             .roots = rootRequests(self.roots, self.layout_requests, self.static_data_requests),
             .target_usize = target.target_usize,
             .inline_expects = switch (target.inline_expects) {
                 .run => .run,
                 .omit => .omit,
             },
-            .proc_debug_names = target.proc_debug_names or LirDump.filter() != null or SpecCensus.enabled(),
+            .proc_debug_names = target.proc_debug_names or LirDump.filter() != null or SpecCensus.enabled() or ProcCensus.enabled(),
             .list_in_place_map = target.list_in_place_map,
             .host_boundary_digests = target.host_boundary_digests,
             .compile_time = target.boxy_compile_time,
@@ -2006,7 +2011,7 @@ pub const PreparedBoxy = struct {
             runtime_schemas: postcheck.SolvedLirLower.RuntimeSchemaStore,
         } = .{
             .lir_result = output.lir_result,
-            .runtime_schemas = postcheck.SolvedLirLower.RuntimeSchemaStore.init(allocator),
+            .runtime_schemas = output.runtime_schemas,
         };
         defer lowered.runtime_schemas.deinit();
         var frozen: ?LirProgram.FrozenStaticData = .{ .allocator = allocator, .exports = output.static_data };
@@ -2133,13 +2138,6 @@ fn hostedProceduresBound(
         if (!bound) return false;
     }
     return true;
-}
-
-fn checkedModules(modules: CheckedModuleSet) postcheck.Common.CheckedModules {
-    return .{
-        .root = modules.root,
-        .imports = modules.imports,
-    };
 }
 
 fn rootRequests(
@@ -2303,7 +2301,7 @@ test "runtime extraction consumes producer root positions and preserves their or
             .name = lowered.lir_result.store.freshSyntheticSymbol(),
             .identity = LIR.ProcIdentity.forTest(1),
             .args = .empty(),
-            .body = ret,
+            .body = .some(ret),
             .ret_layout = .zst,
         }, .none);
         try lowered.lir_result.root_procs.append(allocator, proc);
@@ -2340,7 +2338,7 @@ test "adopting completed compile-time values drops their initializers and identi
             .name = lowered.lir_result.store.freshSyntheticSymbol(),
             .identity = LIR.ProcIdentity.forTest(@intCast(index + 1)),
             .args = .empty(),
-            .body = ret,
+            .body = .some(ret),
             .ret_layout = .zst,
         }, .none);
     }
@@ -2355,7 +2353,7 @@ test "adopting completed compile-time values drops their initializers and identi
     });
     const completed_slot: LIR.StaticDataId = @fromBackingInt(@intCast(lowered.lir_result.static_data_values.items.len));
     try lowered.lir_result.static_data_values.append(allocator, .{
-        .initializer = procs[1],
+        .initializer = .some(procs[1]),
         .layout_idx = .zst,
         .compile_time_root = .{
             .module = .{ .bytes = @splat(0) },
@@ -2377,7 +2375,7 @@ test "adopting completed compile-time values drops their initializers and identi
     try completeComptimeValueSlots(&lowered);
 
     const slot = lowered.lir_result.static_data_values.items[0];
-    try std.testing.expectEqual(@as(?LIR.LirProcSpecId, null), slot.initializer);
+    try std.testing.expectEqual(@as(?LIR.LirProcSpecId, null), slot.initializer.get());
     try std.testing.expect(slot.compile_time_root == null);
     try std.testing.expectEqual(@as(usize, 1), lowered.lir_result.store.procSpecCount());
     try std.testing.expectEqual(@as(usize, 1), lowered.lir_result.root_procs.items.len);
@@ -2394,6 +2392,42 @@ test "adopting completed compile-time values drops their initializers and identi
 /// function type or an erased callable, and the request and solved type
 /// digests. Never enabled by default; it only reads the finished stores, and a
 /// compiler built without developer diagnostics carries none of it.
+/// Print the procedures of every lowered LIR program (`ROC_PROC_CENSUS`):
+/// one `proc-census: program` line per program, numbered in lowering order,
+/// then one `proc-census:   proc` line per procedure with its debug name, so
+/// procedures one compilation compiles in more than one program can be
+/// counted. Selected at compile time, so a compiler that does not read
+/// developer diagnostics carries none of it.
+const ProcCensus = if (!base.dev_diagnostics.available) struct {
+    fn enabled() bool {
+        return false;
+    }
+
+    fn run(_: *const LirProgram.Result, _: SpecializationStrategy) void {}
+} else struct {
+    var programs: std.atomic.Value(u32) = .init(0);
+
+    fn enabled() bool {
+        return base.dev_diagnostics.isSet(.proc_census);
+    }
+
+    fn run(result: *const LirProgram.Result, strategy: SpecializationStrategy) void {
+        if (!enabled()) return;
+        const store = &result.store;
+        const program = programs.fetchAdd(1, .monotonic);
+        var with_body: usize = 0;
+        for (0..store.procSpecCount()) |index| {
+            if (store.getProcSpecImmediate(@fromBackingInt(@intCast(index))).body != .none) with_body += 1;
+        }
+        std.debug.print("proc-census: program {d} ({s}): {d} procedures, {d} roots\n", .{ program, @tagName(strategy), with_body, result.root_procs.items.len });
+        for (0..store.procSpecCount()) |index| {
+            const proc_id: LIR.LirProcSpecId = @fromBackingInt(@intCast(index));
+            if (store.getProcSpecImmediate(proc_id).body == .none) continue;
+            std.debug.print("proc-census:   {d} {s}\n", .{ program, store.procDebugName(proc_id) orelse "?" });
+        }
+    }
+};
+
 const SpecCensus = if (!base.dev_diagnostics.available) struct {
     fn enabled() bool {
         return false;
@@ -2438,8 +2472,8 @@ const SpecCensus = if (!base.dev_diagnostics.available) struct {
 
     fn defName(info: *const ModuleInfo, proc_base: u32) []const u8 {
         const key = info.names.procBase(@fromBackingInt(@intCast(proc_base)));
-        if (key.export_name) |export_name| return info.names.exportNameText(export_name);
-        const def_idx = key.source_def_idx orelse return "?";
+        if (key.export_name.get()) |export_name| return info.names.exportNameText(export_name);
+        const def_idx = key.source_def_idx.get() orelse return "?";
         const def = info.env.store.getDef(@fromBackingInt(@intCast(def_idx)));
         return switch (info.env.store.getPattern(def.pattern)) {
             inline .assign, .var_assign => |assign| info.env.getIdent(assign.ident),
@@ -2589,7 +2623,7 @@ const SpecCensus = if (!base.dev_diagnostics.available) struct {
                 .erased, .func => return true,
                 .named => |named| {
                     try stack.appendSlice(allocator, types.span(named.args));
-                    if (named.backing) |backing| try stack.append(allocator, backing.ty);
+                    if (named.backing.get()) |backing| try stack.append(allocator, backing.ty);
                 },
                 .record => |span| for (types.fieldSpan(span)) |field| try stack.append(allocator, field.ty),
                 .tuple => |span| try stack.appendSlice(allocator, types.span(span)),
@@ -2660,7 +2694,7 @@ const SpecCensus = if (!base.dev_diagnostics.available) struct {
                 },
                 .named => |named| {
                     try stack.appendSlice(allocator, types.span(named.args));
-                    if (named.backing) |backing| try stack.append(allocator, backing.ty);
+                    if (named.backing.get()) |backing| try stack.append(allocator, backing.ty);
                 },
                 .record => |span| for (types.fieldSpan(span)) |field| try stack.append(allocator, field.ty),
                 .tuple => |span| try stack.appendSlice(allocator, types.span(span)),
@@ -2695,7 +2729,7 @@ const SpecCensus = if (!base.dev_diagnostics.available) struct {
             },
             .named => |named| {
                 try w.print("{s}#{x}", .{ mono.names.typeNameText(named.def.type_name), mono.names.moduleIdentityBytes(named.def.module)[0..3] });
-                if (named.def.source_decl) |decl| try w.print("@{d}", .{decl});
+                if (named.def.source_decl.get()) |decl| try w.print("@{d}", .{decl});
                 try w.print("/{s}", .{@tagName(named.kind)});
                 const args = types.span(named.args);
                 if (args.len != 0) {
@@ -2706,7 +2740,7 @@ const SpecCensus = if (!base.dev_diagnostics.available) struct {
                     }
                     try w.writeAll(">");
                 }
-                if (named.backing) |backing| {
+                if (named.backing.get()) |backing| {
                     try w.writeAll("{");
                     try renderType(w, allocator, mono, types, backing.ty, depth + 1);
                     try w.writeAll("}");
@@ -2798,8 +2832,8 @@ const SpecCensus = if (!base.dev_diagnostics.available) struct {
                     module_kind = info.kind;
                     module_name = info.name;
                     callable_name = defName(info, proc_base);
-                    if (callable_kind_is_template and sub < info.templates.templates.items.len) {
-                        const source_fn_ty = info.templates.templates.items[sub].checked_fn_root;
+                    if (callable_kind_is_template and sub < info.templates.templates.items().len) {
+                        const source_fn_ty = info.templates.templates.items()[sub].checked_fn_root;
                         if (info.types.containsId(source_fn_ty)) {
                             poly = if (try checkedTypeHasVariable(allocator, info.types, source_fn_ty)) 1 else 0;
                         }
@@ -2839,7 +2873,7 @@ const SpecCensus = if (!base.dev_diagnostics.available) struct {
             const proc_id: LIR.LirProcSpecId = @fromBackingInt(@intCast(@as(u32, @intCast(index))));
             const spec = store.getProcSpecImmediate(proc_id);
             const name = store.procDebugName(proc_id) orelse "?";
-            if (spec.body == null) {
+            if (spec.body == .none) {
                 std.debug.print("CENSUS_PROC\t{d}\t{s}\t0\t0\t{s}\n", .{ index, name, if (spec.is_static_initializer) "nobody-init" else "nobody" });
                 continue;
             }

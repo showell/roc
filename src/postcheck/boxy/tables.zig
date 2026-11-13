@@ -20,6 +20,7 @@
 //! workers named by their checked identities.
 
 const std = @import("std");
+const collections = @import("collections");
 const lir_core = @import("lir_core");
 
 const types = @import("types.zig");
@@ -51,7 +52,12 @@ pub const Recipe = union(enum) {
     /// mentions one of them. `scoped` holds the override callables of the
     /// nominal types in its reach whose overrides only this worker's body
     /// can build (`ScopedOverride`).
-    desc: struct { ty: TypeId, scoped: []const ScopedOverride = &.{} },
+    desc: struct {
+        ty: TypeId,
+        scoped: []const ScopedOverride = &.{},
+        /// Stored descriptors already belong to their producer's scope.
+        substitute_inputs: bool = true,
+    },
     /// The descriptor of an erased call's packed argument record: `leading`
     /// pointer-sized words, then values of the types whose descriptors
     /// `elems` are, in declared order. Capture-record purpose is explicit:
@@ -221,10 +227,8 @@ pub const Recipes = struct {
     /// numbered in the order a walk from the slots first reaches them, so
     /// equal lists are equal data.
     pub fn needs(self: *const Recipes, allocator: Allocator, scratch: Allocator, input_count: u32, desc_count: u32, slots: []const RecipeId) Allocator.Error!Needs {
-        const unnumbered = std.math.maxInt(u32);
-        const numbers = try scratch.alloc(u32, self.items.items.len);
-        defer scratch.free(numbers);
-        @memset(numbers, unnumbered);
+        var numbers = try collections.OptionalIndexColumn(RecipeId).initFilled(scratch, self.items.items.len);
+        defer numbers.deinit(scratch);
         var order: std.ArrayList(RecipeId) = .empty;
         defer order.deinit(scratch);
         var pending: std.ArrayList(RecipeId) = .empty;
@@ -235,8 +239,8 @@ pub const Recipes = struct {
         for (slots) |slot| {
             try pending.append(scratch, self.resolve(slot));
             while (pending.pop()) |id| {
-                if (numbers[@backingInt(id)] != unnumbered) continue;
-                numbers[@backingInt(id)] = @intCast(order.items.len);
+                if (numbers.isPresent(@backingInt(id))) continue;
+                numbers.set(@backingInt(id), @fromBackingInt(@as(u32, @intCast(order.items.len))));
                 try order.append(scratch, id);
                 operands.clearRetainingCapacity();
                 try appendOperands(scratch, &operands, self.get(id));
@@ -246,21 +250,23 @@ pub const Recipes = struct {
                     switch (operands.items[index]) {
                         .recipe => |next| {
                             const resolved = self.resolve(next);
-                            if (numbers[@backingInt(resolved)] == unnumbered) try pending.append(scratch, resolved);
+                            if (!numbers.isPresent(@backingInt(resolved))) try pending.append(scratch, resolved);
                         },
                         .static => {},
                     }
                 }
             }
         }
+        const Numbering = collections.OptionalIndexColumn(RecipeId).View;
+        const numbered_view = numbers.view();
         const renumber = struct {
-            fn operand(recipes: *const Recipes, numbered: []const u32, value: Operand) Operand {
+            fn operand(recipes: *const Recipes, numbered: Numbering, value: Operand) Operand {
                 return switch (value) {
-                    .recipe => |id| .{ .recipe = @fromBackingInt(numbered[@backingInt(recipes.resolve(id))]) },
+                    .recipe => |id| .{ .recipe = numbered.get(@backingInt(recipes.resolve(id))).? },
                     .static => value,
                 };
             }
-            fn all(alloc: Allocator, recipes: *const Recipes, numbered: []const u32, values: []const Operand) Allocator.Error![]const Operand {
+            fn all(alloc: Allocator, recipes: *const Recipes, numbered: Numbering, values: []const Operand) Allocator.Error![]const Operand {
                 const out = try alloc.alloc(Operand, values.len);
                 for (out, values) |*slot, value| slot.* = operand(recipes, numbered, value);
                 return out;
@@ -273,21 +279,21 @@ pub const Recipes = struct {
                 const scoped = try allocator.alloc(ScopedOverride, desc.scoped.len);
                 for (scoped, desc.scoped) |*out, override| {
                     out.* = .{ .nominal = override.nominal, .methods = undefined };
-                    for (&out.methods, override.methods) |*method, maybe| method.* = if (maybe) |value| renumber.operand(self, numbers, value) else null;
+                    for (&out.methods, override.methods) |*method, maybe| method.* = if (maybe) |value| renumber.operand(self, numbered_view, value) else null;
                 }
-                break :blk .{ .desc = .{ .ty = desc.ty, .scoped = scoped } };
+                break :blk .{ .desc = .{ .ty = desc.ty, .scoped = scoped, .substitute_inputs = desc.substitute_inputs } };
             },
-            .args_desc => |args| .{ .args_desc = .{ .leading = args.leading, .elems = try renumber.all(allocator, self, numbers, args.elems), .capture_record = args.capture_record } },
-            .callable => |callable| .{ .callable = .{ .entry = callable.entry, .captures = try renumber.all(allocator, self, numbers, callable.captures) } },
-            .table => |table| .{ .table = .{ .worker = table.worker, .inputs = try renumber.all(allocator, self, numbers, table.inputs) } },
-            .tag_index => |tag| .{ .tag_index = .{ .desc = renumber.operand(self, numbers, tag.desc), .name = tag.name } },
-            .field_index => |field| .{ .field_index = .{ .desc = renumber.operand(self, numbers, field.desc), .name = field.name } },
-            .update_plan => |update| .{ .update_plan = .{ .base = renumber.operand(self, numbers, update.base), .result = renumber.operand(self, numbers, update.result), .names = try allocator.dupe(NameId, update.names) } },
-            .adapt_plan => |plan| .{ .adapt_plan = .{ .from = renumber.operand(self, numbers, plan.from), .to = renumber.operand(self, numbers, plan.to) } },
-            .names_block => |block| .{ .names_block = .{ .desc = renumber.operand(self, numbers, block.desc) } },
+            .args_desc => |args| .{ .args_desc = .{ .leading = args.leading, .elems = try renumber.all(allocator, self, numbered_view, args.elems), .capture_record = args.capture_record } },
+            .callable => |callable| .{ .callable = .{ .entry = callable.entry, .captures = try renumber.all(allocator, self, numbered_view, callable.captures) } },
+            .table => |table| .{ .table = .{ .worker = table.worker, .inputs = try renumber.all(allocator, self, numbered_view, table.inputs) } },
+            .tag_index => |tag| .{ .tag_index = .{ .desc = renumber.operand(self, numbered_view, tag.desc), .name = tag.name } },
+            .field_index => |field| .{ .field_index = .{ .desc = renumber.operand(self, numbered_view, field.desc), .name = field.name } },
+            .update_plan => |update| .{ .update_plan = .{ .base = renumber.operand(self, numbered_view, update.base), .result = renumber.operand(self, numbered_view, update.result), .names = try allocator.dupe(NameId, update.names) } },
+            .adapt_plan => |plan| .{ .adapt_plan = .{ .from = renumber.operand(self, numbered_view, plan.from), .to = renumber.operand(self, numbered_view, plan.to) } },
+            .names_block => |block| .{ .names_block = .{ .desc = renumber.operand(self, numbered_view, block.desc) } },
         };
         const numbered_slots = try allocator.alloc(RecipeId, slots.len);
-        for (numbered_slots, slots) |*out, slot| out.* = @fromBackingInt(numbers[@backingInt(self.resolve(slot))]);
+        for (numbered_slots, slots) |*out, slot| out.* = numbers.get(@backingInt(self.resolve(slot))).?;
         return .{ .input_count = input_count, .desc_count = desc_count, .recipes = recipes, .slots = numbered_slots };
     }
 
@@ -296,7 +302,7 @@ pub const Recipes = struct {
         const arena = self.arena.allocator();
         return switch (recipe) {
             .input => recipe,
-            .desc => |desc| .{ .desc = .{ .ty = desc.ty, .scoped = try arena.dupe(ScopedOverride, desc.scoped) } },
+            .desc => |desc| .{ .desc = .{ .ty = desc.ty, .scoped = try arena.dupe(ScopedOverride, desc.scoped), .substitute_inputs = desc.substitute_inputs } },
             .args_desc => |args| .{ .args_desc = .{ .leading = args.leading, .elems = try arena.dupe(Operand, args.elems), .capture_record = args.capture_record } },
             .callable => |callable| .{ .callable = .{ .entry = callable.entry, .captures = try arena.dupe(Operand, callable.captures) } },
             .table => |table| .{ .table = .{ .worker = table.worker, .inputs = try arena.dupe(Operand, table.inputs) } },
@@ -384,9 +390,11 @@ pub const Evaluation = struct {
     low: std.ArrayList(u32) = .empty,
     on_stack: std.ArrayList(bool) = .empty,
     stack: std.ArrayList(RecipeId) = .empty,
-    visited: u32 = 0,
+    /// The next visit order. Orders are issued from one, so zero marks an
+    /// unvisited recipe.
+    visited: u32 = 1,
 
-    const unvisited = std.math.maxInt(u32);
+    const unvisited: u32 = 0;
 
     pub fn init(program: *lower.Program, source: Source, inputs: []const StaticDescs.CaptureWord, desc_count: u32) Evaluation {
         return .{ .program = program, .allocator = program.allocator, .source = source, .inputs = inputs, .desc_count = desc_count };
@@ -517,7 +525,7 @@ pub const Evaluation = struct {
         const program = self.program;
         return switch (recipe) {
             .input => |index| if (index < self.inputs.len) self.inputs[index] else invariant("a table recipe reads an input its instantiation lacks"),
-            .desc => |desc| try self.descWord(desc.ty, desc.scoped),
+            .desc => |desc| try self.descWord(desc.ty, desc.scoped, desc.substitute_inputs),
             .args_desc => |args| blk: {
                 const elems = try self.allocator.alloc(TypeId, args.elems.len);
                 defer self.allocator.free(elems);
@@ -572,30 +580,31 @@ pub const Evaluation = struct {
             .desc => return,
             .callable, .table, .node, .zero, .int => invariant("a type table's descriptor word is not a descriptor"),
         };
-        for (self.program.static_descs.scopeEntries(scope)) |entry| try mergeEntry(self.allocator, entries, entry);
+        for (self.program.static_descs.scopeEntries(scope)) |entry| try mergeEntry(self.allocator, &self.program.static_descs, entries, entry);
     }
 
     /// The descriptor word of the type `ty` over the worker's variables at
     /// this instantiation: the type with each variable at the type its
     /// descriptor input describes, in the override scope of those inputs and
     /// of `scoped`.
-    fn descWord(self: *Evaluation, ty: TypeId, scoped: []const ScopedOverride) Allocator.Error!StaticDescs.CaptureWord {
+    fn descWord(self: *Evaluation, ty: TypeId, scoped: []const ScopedOverride, substitute_inputs: bool) Allocator.Error!StaticDescs.CaptureWord {
         const program = self.program;
         if (self.desc_count > self.inputs.len) invariant("a table's instantiation lacks a variable's descriptor");
-        const bound = try self.allocator.alloc(TypeId, self.desc_count);
+        const desc_count = if (substitute_inputs) self.desc_count else 0;
+        const bound = try self.allocator.alloc(TypeId, desc_count);
         defer self.allocator.free(bound);
         var entries: std.ArrayList(StaticDescs.ScopedMethods) = .empty;
         defer entries.deinit(self.allocator);
-        for (bound, self.inputs[0..self.desc_count]) |*slot, input| {
+        for (bound, self.inputs[0..desc_count]) |*slot, input| {
             slot.* = describedType(input);
             try self.appendScope(&entries, input);
         }
-        const closed = try program.substitute(self.allocator, ty, bound);
-        if (!program.store.isClosed(closed)) invariant("a table's descriptor recipe is open at its instantiation");
+        const closed = if (substitute_inputs) try program.substituteRepresentation(self.allocator, ty, bound) else ty;
+        if (!try program.converter().representationClosed(closed)) invariant("a table's descriptor recipe is open at its instantiation");
         for (scoped) |override| {
             var methods: [3]?StaticDescs.CaptureWord = .{ null, null, null };
             for (&methods, override.methods) |*method, maybe| method.* = if (maybe) |operand| self.operandWord(operand) else null;
-            try mergeEntry(self.allocator, &entries, .{ .nominal = try program.substitute(self.allocator, override.nominal, bound), .methods = methods });
+            try mergeEntry(self.allocator, &program.static_descs, &entries, .{ .nominal = if (substitute_inputs) try program.substituteRepresentation(self.allocator, override.nominal, bound) else override.nominal, .methods = methods });
         }
         const scope = try program.static_descs.restrictScope(try program.static_descs.internScope(entries.items), closed);
         if (scope == .none) return .{ .desc = closed };
@@ -636,12 +645,12 @@ pub const Evaluation = struct {
             return;
         }
         for (order) |member| switch (self.source.get(member)) {
-            .callable => |callable| self.words.items[@backingInt(member)] = .{ .callable = try static_descs.reserveCallable(@intCast(callable.captures.len)) },
+            .callable => |callable| self.words.items[@backingInt(member)] = .{ .callable = try static_descs.reserveCallable(program.worker(callable.entry).proc, @intCast(callable.captures.len)) },
             .desc, .table => {},
             .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block => invariant("only callables, descriptors, and tables lead back to themselves"),
         };
         for (order) |member| switch (self.source.get(member)) {
-            .desc => |desc| self.words.items[@backingInt(member)] = try self.descWord(desc.ty, desc.scoped),
+            .desc => |desc| self.words.items[@backingInt(member)] = try self.descWord(desc.ty, desc.scoped, desc.substitute_inputs),
             .callable, .table, .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block => {},
         };
         for (order) |member| switch (self.source.get(member)) {
@@ -705,12 +714,15 @@ pub const Evaluation = struct {
             try key.append(allocator, @backingInt(std.meta.activeTag(recipe)));
             switch (recipe) {
                 .desc => |desc| {
-                    try static_descs_file.appendKeyWord(allocator, key, @backingInt(try program.substitute(allocator, desc.ty, bound)));
+                    try static_descs_file.appendKeyWord(allocator, key, @backingInt(if (desc.substitute_inputs) try program.substitute(allocator, desc.ty, bound) else desc.ty));
                     // The variables' scopes are part of the descriptor.
-                    for (self.inputs[0..self.desc_count]) |input| try static_descs_file.appendCaptureWordKey(allocator, key, input);
+                    try static_descs_file.appendKeyWord(allocator, key, if (desc.substitute_inputs) self.desc_count else 0);
+                    if (desc.substitute_inputs) {
+                        for (self.inputs[0..self.desc_count]) |input| try static_descs_file.appendCaptureWordKey(allocator, key, input);
+                    }
                     try static_descs_file.appendKeyWord(allocator, key, @intCast(desc.scoped.len));
                     for (desc.scoped) |override| {
-                        try static_descs_file.appendKeyWord(allocator, key, @backingInt(try program.substitute(allocator, override.nominal, bound)));
+                        try static_descs_file.appendKeyWord(allocator, key, @backingInt(if (desc.substitute_inputs) try program.substitute(allocator, override.nominal, bound) else override.nominal));
                         for (override.methods) |method| {
                             if (method) |operand| try self.operandKey(order, operand, key) else try key.append(allocator, 2);
                         }
@@ -746,17 +758,31 @@ pub const Evaluation = struct {
 
 /// Add `entry` to the scope entries `entries`, which hold each nominal type
 /// once: an entry for a nominal type already there gives it the same
-/// overrides.
-fn mergeEntry(allocator: Allocator, entries: *std.ArrayList(StaticDescs.ScopedMethods), entry: StaticDescs.ScopedMethods) Allocator.Error!void {
+/// overrides. Two scopes can build one override as distinct static
+/// callables, as they can describe one type by distinct descriptors
+/// (design.md "Names Blocks"), so overrides agree when each method
+/// enters the same procedure, and the entry already there is kept.
+fn mergeEntry(allocator: Allocator, static_descs: *const StaticDescs, entries: *std.ArrayList(StaticDescs.ScopedMethods), entry: StaticDescs.ScopedMethods) Allocator.Error!void {
     for (entries.items) |existing| {
         if (existing.nominal != entry.nominal) continue;
-        for (existing.methods, entry.methods) |a, b| {
+        if (std.debug.runtime_safety) for (existing.methods, entry.methods) |a, b| {
             if ((a == null) != (b == null)) invariant("two override scopes give one nominal type different overrides");
-            if (a) |word_| if (!StaticDescs.captureWordsEqual(word_, b.?)) invariant("two override scopes give one nominal type different overrides");
-        }
+            if (a) |word_| if (!overridesAgree(static_descs, word_, b.?)) invariant("two override scopes give one nominal type different overrides");
+        };
         return;
     }
     try entries.append(allocator, entry);
+}
+
+fn overridesAgree(static_descs: *const StaticDescs, a: StaticDescs.CaptureWord, b: StaticDescs.CaptureWord) bool {
+    if (StaticDescs.captureWordsEqual(a, b)) return true;
+    return switch (a) {
+        .callable => |a_node| switch (b) {
+            .callable => |b_node| static_descs.callableProc(a_node) == static_descs.callableProc(b_node),
+            .desc, .scoped_desc, .table, .node, .zero, .int => false,
+        },
+        .desc, .scoped_desc, .table, .node, .zero, .int => false,
+    };
 }
 
 fn hashWord(hasher: *std.hash.Wyhash, value: u32) void {
@@ -769,6 +795,7 @@ fn hashRecipe(hasher: *std.hash.Wyhash, recipe: Recipe) void {
         .input => |index| hashWord(hasher, index),
         .desc => |desc| {
             hashWord(hasher, @backingInt(desc.ty));
+            hashWord(hasher, @intFromBool(desc.substitute_inputs));
             hashWord(hasher, @intCast(desc.scoped.len));
             for (desc.scoped) |override| {
                 hashWord(hasher, @backingInt(override.nominal));
@@ -834,7 +861,7 @@ fn recipesEqual(a: Recipe, b: Recipe) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .input => |index| index == b.input,
-        .desc => |desc| desc.ty == b.desc.ty and scopedEqual(desc.scoped, b.desc.scoped),
+        .desc => |desc| desc.ty == b.desc.ty and desc.substitute_inputs == b.desc.substitute_inputs and scopedEqual(desc.scoped, b.desc.scoped),
         .args_desc => |args| args.leading == b.args_desc.leading and args.capture_record == b.args_desc.capture_record and operandsEqual(args.elems, b.args_desc.elems),
         .callable => |callable| callable.entry == b.callable.entry and operandsEqual(callable.captures, b.callable.captures),
         .table => |table| table.worker == b.table.worker and operandsEqual(table.inputs, b.table.inputs),
@@ -877,6 +904,9 @@ test "recipes are interned by content, reserved ones included" {
     const ty: TypeId = @fromBackingInt(7);
     const desc = try recipes.intern(.{ .desc = .{ .ty = ty } });
     try std.testing.expectEqual(desc, try recipes.intern(.{ .desc = .{ .ty = ty } }));
+    const stored = try recipes.intern(.{ .desc = .{ .ty = ty, .substitute_inputs = false } });
+    try std.testing.expect(stored != desc);
+    try std.testing.expectEqual(stored, try recipes.intern(.{ .desc = .{ .ty = ty, .substitute_inputs = false } }));
     const input = try recipes.intern(.{ .input = 0 });
     const worker: WorkerId = @fromBackingInt(3);
     const table = try recipes.intern(.{ .table = .{ .worker = worker, .inputs = &.{ .{ .recipe = input }, .{ .recipe = desc } } } });
@@ -949,7 +979,7 @@ test "a cyclic group has the same words whichever member its evaluation enters b
     const store = &program.result.store;
     const target = try store.addLocal(.{ .layout_idx = .u8 });
     const ret = try store.addCFStmt(.{ .ret = .{ .value = target } }, .test_fixture);
-    const proc = try store.addProcSpec(.{ .name = .fromRaw(0), .identity = LIR.ProcIdentity.forTest(1), .args = .empty(), .frame_locals = try store.addLocalSpan(&.{target}), .body = ret, .ret_layout = .u8 }, .none);
+    const proc = try store.addProcSpec(.{ .name = .fromRaw(0), .identity = LIR.ProcIdentity.forTest(1), .args = .empty(), .frame_locals = try store.addLocalSpan(&.{target}), .body = .some(ret), .ret_layout = .u8 }, .none);
     // The evaluation reads a callable's worker for its procedure alone.
     var entry: lower.Worker = undefined;
     entry.proc = proc;

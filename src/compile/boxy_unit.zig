@@ -127,6 +127,8 @@ pub const Built = struct {
     hosted_symbols: []const []const u8,
     /// The ownership signatures the object exports. Owned by the unit's `gpa`.
     exports: []const object_cache.ExportRecord,
+    /// `object_cache.exportRecordsDigest(exports)`.
+    exports_digest: [32]u8,
     /// A test unit's expect-site table and test-root table. Owned by the
     /// unit's `gpa`.
     expect_sites: []const object_cache.ExpectSiteRecord = &.{},
@@ -144,6 +146,7 @@ pub const Built = struct {
             .pieces = pieces,
             .image = image,
             .exports = entry.exports,
+            .exports_digest = entry.exports_digest,
             .hosted_symbols = entry.hosted_symbols,
             .expect_sites = entry.expect_sites,
             .test_roots = entry.test_roots,
@@ -227,15 +230,17 @@ pub fn restore(gpa: Allocator, cache_manager: ?*CacheManager, key: object_cache.
         if (dev_diagnostics.isSet(.trace_boxy_work)) std.debug.print("boxy-work: no cache manager to restore key {s}\n", .{&std.fmt.bytesToHex(key.bytes[0..8], .lower)});
         return null;
     };
-    const bytes = manager.loadFamilyBytes(.boxy_object, key.bytes, object_cache.scope) orelse {
+    const loaded = manager.loadFamilyBytes(.boxy_object, key.bytes, object_cache.scope) orelse {
         if (dev_diagnostics.isSet(.trace_boxy_work)) std.debug.print("boxy-work: no object cache entry for key {s}\n", .{&std.fmt.bytesToHex(key.bytes[0..8], .lower)});
         return null;
     };
-    defer gpa.free(bytes);
+    const bytes = loaded.bytes;
+    defer manager.allocator.free(bytes);
     const entry = object_cache.decode(gpa, bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidEntry => {
             if (dev_diagnostics.isSet(.trace_boxy_work)) std.debug.print("boxy-work: object cache entry for key {s} is not an entry ({d} bytes)\n", .{ &std.fmt.bytesToHex(key.bytes[0..8], .lower), bytes.len });
+            manager.rejectEntry(.checked, .boxy_object, key.bytes, object_cache.scope, loaded.stamp, "it does not decode as a Boxy object", .{});
             return null;
         },
     };
@@ -304,6 +309,7 @@ fn restoreMapped(gpa: Allocator, cache_manager: ?*CacheManager, key: object_cach
             return error.OutOfMemory;
         },
         error.InvalidEntry => {
+            manager.rejectEntry(.checked, .boxy_object, key.bytes, object_cache.scope, data.stamp, "it does not decode as a Boxy object", .{});
             data.deinit(gpa);
             return null;
         },
@@ -379,7 +385,7 @@ pub fn hostedSymbols(arena: Allocator, store_: *const lir.LirStore) Allocator.Er
     var seen = std.StringHashMap(void).init(arena);
     var symbols = std.ArrayList([]const u8).empty;
     for (store_.getProcSpecs()) |spec| {
-        const hosted = spec.hosted orelse continue;
+        const hosted = spec.hosted.get() orelse continue;
         const text = store_.getString(hosted.symbol);
         const gop = try seen.getOrPut(text);
         if (!gop.found_existing) try symbols.append(arena, try arena.dupe(u8, text));
@@ -437,6 +443,9 @@ pub fn restoreOrBuild(unit: Unit) BuildError!Built {
                     base.invariant("the cached pieces of module {s} differ from a fresh build of them: its key misses an input", .{module_name});
                 }
             }
+            if (!std.mem.eql(u8, &fresh.exports_digest, &entry.exports_digest)) {
+                base.invariant("the cached exports of module {s} differ from a fresh build of them: its key misses an input", .{module_name});
+            }
             if (!std.mem.eql(u8, fresh.function_metadata, entry.function_metadata)) {
                 base.invariant("the cached function metadata of module {s} differs from a fresh build: its key misses an input", .{module_name});
             }
@@ -476,6 +485,7 @@ pub fn restoreOrBuild(unit: Unit) BuildError!Built {
     defer gpa.free(encoded);
     try store(gpa, unit.cache_manager, unit.key, .{
         .exports = built.exports,
+        .exports_digest = built.exports_digest,
         .hosted_symbols = built.hosted_symbols,
         .pieces = encoded,
         .function_metadata = built.function_metadata,
@@ -551,6 +561,7 @@ fn build(unit: Unit, module_name: []const u8) BuildError!Built {
         codegen_scope.end();
         const records = try exportRecords(gpa, &lowered, unit.interfaces);
         defer gpa.free(records);
+        const exports_digest = try object_cache.exportRecordsDigest(gpa, records);
         var hosted_arena = std.heap.ArenaAllocator.init(gpa);
         defer hosted_arena.deinit();
         const hosted_symbols = try dupeSymbols(gpa, try hostedSymbols(hosted_arena.allocator(), &lowered.lir_result.store));
@@ -562,6 +573,7 @@ fn build(unit: Unit, module_name: []const u8) BuildError!Built {
             .image = .{ .bytes = bytes, .code_locations = &.{}, .owner = .owned },
             .hosted_symbols = hosted_symbols,
             .exports = try dupeRecords(gpa, records),
+            .exports_digest = exports_digest,
         };
     }
     var object_compiler = backend.ObjectFileCompiler.init(gpa);
@@ -642,6 +654,7 @@ fn build(unit: Unit, module_name: []const u8) BuildError!Built {
     errdefer gpa.free(function_metadata);
     const records = try exportRecords(gpa, &lowered, unit.interfaces);
     defer gpa.free(records);
+    const exports_digest = try object_cache.exportRecordsDigest(gpa, records);
     var hosted_arena = std.heap.ArenaAllocator.init(gpa);
     defer hosted_arena.deinit();
     const hosted = try hostedSymbols(hosted_arena.allocator(), &lowered.lir_result.store);
@@ -661,6 +674,7 @@ fn build(unit: Unit, module_name: []const u8) BuildError!Built {
         .image = image,
         .hosted_symbols = hosted_symbols,
         .exports = try dupeRecords(gpa, records),
+        .exports_digest = exports_digest,
         .expect_sites = expect_sites,
         .test_roots = test_roots,
     };
@@ -789,9 +803,10 @@ test "Boxy object restoration transfers owned metadata and survives allocation f
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testRestoredMetadata, .{});
 }
 
-fn testRestoredMetadata(gpa: Allocator) !void {
+fn testRestoredMetadata(gpa: Allocator) (object_cache.DecodeError || error{ TestExpectedEqual, TestUnexpectedResult })!void {
     const built = restored: {
-        const bytes = try object_cache.encode(gpa, .{
+        var input_entry: object_cache.Entry = .{
+            .exports_digest = undefined,
             .exports = &.{.{
                 .identity = @splat(3),
                 .rc_borrowed_params = 1,
@@ -810,7 +825,9 @@ fn testRestoredMetadata(gpa: Allocator) !void {
             .test_roots = &.{.{ .module = @splat(4), .root_index = 2, .symbol = 6 }},
             .pieces = &.{},
             .function_metadata = "function metadata",
-        });
+        };
+        input_entry.exports_digest = try object_cache.exportRecordsDigest(gpa, input_entry.exports);
+        const bytes = try object_cache.encode(gpa, input_entry);
         defer gpa.free(bytes);
         var entry = try object_cache.decodeView(gpa, bytes);
         defer object_cache.deinitEntryView(gpa, entry);

@@ -49,6 +49,11 @@ Builtin :: [].{
 	# parse_dict_after_key between a key and its value, and
 	# parse_dict_after_entry.
 	#
+	# Every fallible operation, including custom nested parsers and tag
+	# payload callbacks, uses the same format-owned err type. A required
+	# field that was not read calls missing_field : encoding, Str -> err.
+	# Optional and defaulted fields retain their absent-field values.
+	#
 	# A dict key that the format renders as a key string—a Str, a Bool, a
 	# number, or a tag union whose tags all lack payloads—is read and written
 	# by the parse_key_* and encode_key_* methods. Any other key is read and
@@ -76,13 +81,13 @@ Builtin :: [].{
 			name : FieldName(_shape) -> Str
 		}
 
-		ParseTagUnionSpec(_shape) :: {}.{
+		ParseTagUnionSpec(_shape, _encoding, _state, _err) :: {}.{
 
 			## After a format reads the tag name, the generated parser calls
 			## start_payloads once, next_payload before each payload after the
 			## first (with its zero-based index and the total count), and
 			## finish_payloads once after the final payload.
-			parse : ParseTagUnionSpec(_shape),
+			parse : ParseTagUnionSpec(_shape, _encoding, _state, _err),
 			{
 				tag : Str,
 				encoding : _encoding,
@@ -267,8 +272,8 @@ Builtin :: [].{
 				Ok(Str.from_utf8_lossy(encoded.output))
 			}
 
-			parse : Str -> Try(a, [InvalidJson(Str), ..errs])
-				where [a.Parseable([InvalidJson(Str), ..errs])]
+			parse : Str -> Try(a, [InvalidJson(Str)])
+				where [a.Parseable([InvalidJson(Str)])]
 			parse = |json| {
 				Shape : a
 				parse_shape = Shape.parser_for(JsonEncoding.Default)
@@ -284,8 +289,8 @@ Builtin :: [].{
 				}
 			}
 
-			parse_trailing_commas : Str -> Try(a, [InvalidJson(Str), ..errs])
-				where [a.Parseable([InvalidJson(Str), ..errs])]
+			parse_trailing_commas : Str -> Try(a, [InvalidJson(Str)])
+				where [a.Parseable([InvalidJson(Str)])]
 			parse_trailing_commas = |json| {
 				Shape : a
 				parse_shape = Shape.parser_for(JsonEncoding.TrailingCommas)
@@ -301,8 +306,8 @@ Builtin :: [].{
 				}
 			}
 
-			parser_camel : () -> (Str -> Try(a, [InvalidJson(Str), ..errs]))
-				where [a.Parseable([InvalidJson(Str), ..errs])]
+			parser_camel : () -> (Str -> Try(a, [InvalidJson(Str)]))
+				where [a.Parseable([InvalidJson(Str)])]
 			parser_camel = || {
 				Shape : a
 				parse_shape = Shape.parser_for(JsonEncoding.CamelCase)
@@ -1073,7 +1078,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_tag_union_from_json : Str, JsonEncoding, ParseTagUnionSpec(a) -> Try({ value : a, rest : JsonState }, [InvalidJson(Str)])
+			parse_tag_union_from_json : Str, JsonEncoding, ParseTagUnionSpec(a, JsonEncoding, JsonState, [InvalidJson(Str)]) -> Try({ value : a, rest : JsonState }, [InvalidJson(Str)])
 			parse_tag_union_from_json = |raw, encoding, spec| {
 				remaining = json_trim_start(raw)
 
@@ -1725,7 +1730,10 @@ Builtin :: [].{
 			invalid_value : JsonEncoding, JsonState -> [InvalidJson(Str)]
 			invalid_value = |_, _| Json.invalid_json({})
 
-			parse_tag_union : JsonEncoding, ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, [InvalidJson(Str)])
+			missing_field : JsonEncoding, Str -> [InvalidJson(Str)]
+			missing_field = |_, name| InvalidJson("Missing field: ${name}")
+
+			parse_tag_union : JsonEncoding, ParseTagUnionSpec(a, JsonEncoding, JsonState, [InvalidJson(Str)]), JsonState -> Try({ value : a, rest : JsonState }, [InvalidJson(Str)])
 			parse_tag_union = |encoding, spec, state|
 				match state {
 					Input(value) => Json.parse_tag_union_from_json(value, encoding, spec)
@@ -2059,13 +2067,16 @@ Builtin :: [].{
 			rename_field : HttpHeaderEncoding, Str -> Str
 			rename_field = |_, name| HttpHeader.underscores_to_dashes(name)
 
-			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, [BadHeader])
+			missing_field : HttpHeaderEncoding, Str -> [BadHeader, MissingHeader(Str)]
+			missing_field = |_, name| MissingHeader(name)
+
+			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, [BadHeader, MissingHeader(Str)])
 			parse_str = |_, state| {
 				value_parts = HttpHeader.take_header_value(state.raw)?
 				Ok({ value: value_parts.value, rest: HttpHeaderState.{ raw: value_parts.after } })
 			}
 
-			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, [BadHeader])
+			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, [BadHeader, MissingHeader(Str)])
 			parse_u64 = |_, state| {
 				value_parts = HttpHeader.take_header_value(state.raw)?
 
@@ -2078,7 +2089,7 @@ Builtin :: [].{
 			## Header sequences have no opening delimiter and no way to declare a
 			## header count up front, so parsing always starts in Uncounted mode
 			## on the unchanged input.
-			parse_record_start : HttpHeaderEncoding, HttpHeaderState -> Try([Counted({ len : U64, rest : HttpHeaderState }), Uncounted(HttpHeaderState)], [BadHeader])
+			parse_record_start : HttpHeaderEncoding, HttpHeaderState -> Try([Counted({ len : U64, rest : HttpHeaderState }), Uncounted(HttpHeaderState)], [BadHeader, MissingHeader(Str)])
 			parse_record_start = |_, state| Ok(Uncounted(state))
 
 			parse_record_field : HttpHeaderEncoding,
@@ -2091,17 +2102,17 @@ Builtin :: [].{
 					Continue(HttpHeaderState),
 					Done(HttpHeaderState),
 				],
-				[BadHeader],
+				[BadHeader, MissingHeader(Str)],
 			)
 			parse_record_field = |_, fields, state|
 				HttpHeader.parse_record_field_from_headers(fields, state.raw)
 
 			## Each header value consumes its own CRLF terminator, so the cursor
 			## is already at the next entry boundary after every field.
-			parse_record_after_field : HttpHeaderEncoding, HttpHeaderState -> Try([Continue(HttpHeaderState), Done(HttpHeaderState)], [BadHeader])
+			parse_record_after_field : HttpHeaderEncoding, HttpHeaderState -> Try([Continue(HttpHeaderState), Done(HttpHeaderState)], [BadHeader, MissingHeader(Str)])
 			parse_record_after_field = |_, state| Ok(Continue(state))
 
-			skip_record_field : HttpHeaderEncoding, HttpHeaderState -> Try(HttpHeaderState, [BadHeader])
+			skip_record_field : HttpHeaderEncoding, HttpHeaderState -> Try(HttpHeaderState, [BadHeader, MissingHeader(Str)])
 			skip_record_field = |_, state| {
 				parts = HttpHeader.take_header_value(state.raw)?
 				Ok(HttpHeaderState.{ raw: parts.after })
@@ -2119,8 +2130,8 @@ Builtin :: [].{
 					output.parser_for : HttpHeaderEncoding -> (HttpHeaderState -> Try({ value : output, rest : HttpHeaderState }, errs)),
 				]
 
-			parser_for : () -> (Str -> Try(output, [BadHeader, ..errs]))
-				where [output.Parseable([BadHeader, ..errs])]
+			parser_for : () -> (Str -> Try(output, [BadHeader, MissingHeader(Str)]))
+				where [output.Parseable([BadHeader, MissingHeader(Str)])]
 			parser_for = || {
 				Output : output
 				parse_output = Output.parser_for(HttpHeaderEncoding.Caseless)
@@ -2131,8 +2142,8 @@ Builtin :: [].{
 				}
 			}
 
-			parse : Str -> Try(output, [BadHeader, ..errs])
-				where [output.Parseable([BadHeader, ..errs])]
+			parse : Str -> Try(output, [BadHeader, MissingHeader(Str)])
+				where [output.Parseable([BadHeader, MissingHeader(Str)])]
 			parse = |raw| {
 				Output : output
 
@@ -2142,10 +2153,10 @@ Builtin :: [].{
 				Ok(parsed.value)
 			}
 
-			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, [BadHeader])
+			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, [BadHeader, MissingHeader(Str)])
 			parse_str = |encoding, state| HttpHeaderEncoding.parse_str(encoding, state)
 
-			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, [BadHeader])
+			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, [BadHeader, MissingHeader(Str)])
 			parse_u64 = |encoding, state| HttpHeaderEncoding.parse_u64(encoding, state)
 
 			parse_record_field_from_headers : FieldName.FieldNames(_shape),
@@ -2223,24 +2234,9 @@ Builtin :: [].{
 		parser_for : _
 		encoder_for : _
 
-		Utf8Problem := [
-			InvalidStartByte,
-			UnexpectedEndOfSequence,
-			ExpectedContinuation,
-			OverlongEncoding,
-			CodepointTooLarge,
-			EncodesSurrogateHalf,
-		].{
-			is_eq : Utf8Problem, Utf8Problem -> Bool
-		}
-
-		Utf16Problem := [UnpairedHighSurrogate, UnpairedLowSurrogate, UnexpectedEndOfSequence].{
-			is_eq : Utf16Problem, Utf16Problem -> Bool
-		}
-
-		Utf32Problem := [CodePointTooLarge, SurrogateCodePoint, UnexpectedEndOfSequence].{
-			is_eq : Utf32Problem, Utf32Problem -> Bool
-		}
+		Utf8Problem : StrUtf8Problem
+		Utf16Problem : StrUtf16Problem
+		Utf32Problem : StrUtf32Problem
 
 		## Returns guidance about string length instead of a number.
 		##
@@ -3706,7 +3702,7 @@ Builtin :: [].{
 
 		## Transform each item of this stream with an effectful function.
 		map! : Stream(a), (a => b) => Stream(b)
-		map! = |stream, transform!| Stream.map(stream, transform!)
+		map! = |source, transform!| Stream.map(source, transform!)
 
 		## Returns a stream that pairs each item with its position among the items
 		## this stream yields. The first yielded item gets index `0`, and the index
@@ -3903,9 +3899,9 @@ Builtin :: [].{
 		len : List(_item) -> U64
 
 		## Returns the number of items the list can hold without triggering a memory allocation.
-		## The capacity is always greater than or equal to the [List.len], with one exception:
-		## a list of zero-sized items, such as `{}`, never allocates at all, so its capacity is
-		## always 0 no matter how many items it holds.
+		## The capacity is always greater than or equal to the [List.len]. A list of zero-sized
+		## items, such as `{}`, never allocates at all: its capacity is the number of items
+		## reserved for it, or its length when that is larger.
 		capacity : List(_item) -> U64
 
 		##  Check if the list is empty.
@@ -3921,12 +3917,12 @@ Builtin :: [].{
 		iter : List(item) -> Iter(item)
 		iter = |list| {
 			make = |index| {
-				len = List.len(list)
+				length = List.len(list)
 
 				iter_from_step(
-					Ok(len - index),
+					Ok(length - index),
 					||
-						if index == len {
+						if index == length {
 							Done
 						} else {
 							One({ item: list_get_unsafe(list, index), rest: make(index + 1) })
@@ -4060,14 +4056,14 @@ Builtin :: [].{
 		## ```
 		intersperse : List(a), a -> List(a)
 		intersperse = |list, separator| {
-			len = List.len(list)
+			length = List.len(list)
 
-			if len < 2 {
+			if length < 2 {
 				list
 			} else {
-				# `2 * len - 1` counts exactly the items appended below, so every
+				# `2 * length - 1` counts exactly the items appended below, so every
 				# unchecked append stays in bounds.
-				var $new_list = List.with_capacity(2 * len - 1)
+				var $new_list = List.with_capacity(2 * length - 1)
 				var $index = 0
 				for item in list {
 					if $index > 0 {
@@ -4326,13 +4322,13 @@ Builtin :: [].{
 		## ```
 		copy_range_within : List(a), U64, U64, U64 -> Try(List(a), [OutOfBounds])
 		copy_range_within = |list, dest_index, src_index, count| {
-			len = List.len(list)
+			length = List.len(list)
 			# Compare each start against a limit rather than subtracting from it;
 			# wrapping is safe because the first check has already ruled out
-			# `count > len`.
+			# `count > length`.
 			if count == 0 {
 				Ok(list)
-			} else if count > len or dest_index > len.minus_wrap(count) or src_index > len.minus_wrap(count) {
+			} else if count > length or dest_index > length.minus_wrap(count) or src_index > length.minus_wrap(count) {
 				Err(OutOfBounds)
 			} else {
 				Ok(list_copy_range_within(list, dest_index, src_index, count))
@@ -4457,11 +4453,11 @@ Builtin :: [].{
 		## ```
 		get_wrap : List(item), U64 -> Try(item, [ListWasEmpty])
 		get_wrap = |list, index| {
-			len = List.len(list)
-			if len == 0 {
+			length = List.len(list)
+			if length == 0 {
 				Try.Err(ListWasEmpty)
 			} else {
-				Try.Ok(list_get_unsafe(list, index % len))
+				Try.Ok(list_get_unsafe(list, index % length))
 			}
 		}
 
@@ -4523,8 +4519,8 @@ Builtin :: [].{
 		## ```
 		swap : List(a), U64, U64 -> Try(List(a), [OutOfBounds])
 		swap = |list, index_1, index_2| {
-			len = List.len(list)
-			if index_1 < len and index_2 < len {
+			length = List.len(list)
+			if index_1 < length and index_2 < length {
 				Ok(list_swap_unsafe(list, index_1, index_2))
 			} else {
 				Err(OutOfBounds)
@@ -4540,20 +4536,20 @@ Builtin :: [].{
 		## ```
 		insert : List(a), U64, a -> Try(List(a), [OutOfBounds])
 		insert = |list, index, item| {
-			len = List.len(list)
-			if index > len {
+			length = List.len(list)
+			if index > length {
 				Err(OutOfBounds)
 			} else {
-				# The two loops append exactly `index` then `len - index` items plus
-				# the inserted one, so every unchecked append stays within `len + 1`.
-				var $result = List.with_capacity(len + 1)
+				# The two loops append exactly `index` then `length - index` items plus
+				# the inserted one, so every unchecked append stays within `length + 1`.
+				var $result = List.with_capacity(length + 1)
 				var $i = 0
 				while $i < index {
 					$result = list_append_unsafe($result, list_get_unsafe(list, $i))
 					$i = $i + 1
 				}
 				$result = list_append_unsafe($result, item)
-				while $i < len {
+				while $i < length {
 					$result = list_append_unsafe($result, list_get_unsafe(list, $i))
 					$i = $i + 1
 				}
@@ -4590,10 +4586,10 @@ Builtin :: [].{
 			prepared_list = list_map_prepare_reuse(list)
 			match list_map_can_reuse(prepared_list, transform) {
 				1 => {
-					len = prepared_list.len()
+					length = prepared_list.len()
 					var $out = list_map_cast_unsafe(prepared_list)
 					var $index = 0
-					while $index < len {
+					while $index < length {
 						item = list_map_extract_unsafe($out, $index, transform)
 						$out = list_map_write_unsafe($out, $index, transform(item))
 						$index = $index + 1
@@ -4723,7 +4719,7 @@ Builtin :: [].{
 		keep_if : List(a), (a -> Bool) -> List(a)
 		keep_if = |list, predicate| {
 			prepared = list_map_prepare_reuse(list)
-			len = prepared.len()
+			length = prepared.len()
 			match list_owned_unique(prepared) {
 				1 => {
 					# Swap each kept item down to the end of the kept prefix, so the
@@ -4732,7 +4728,7 @@ Builtin :: [].{
 					var $out = prepared
 					var $kept = 0
 					var $index = 0
-					while $index < len {
+					while $index < length {
 						if predicate(list_get_unsafe($out, $index)) {
 							if $kept != $index {
 								$out = list_swap_unsafe($out, $kept, $index)
@@ -4741,22 +4737,22 @@ Builtin :: [].{
 						}
 						$index = $index + 1
 					}
-					List.drop_last($out, len - $kept)
+					List.drop_last($out, length - $kept)
 				}
 				_ => {
 					# A shared list is returned as it is when every item is kept.
 					var $first_dropped = 0
-					while $first_dropped < len and predicate(list_get_unsafe(prepared, $first_dropped)) {
+					while $first_dropped < length and predicate(list_get_unsafe(prepared, $first_dropped)) {
 						$first_dropped = $first_dropped + 1
 					}
-					if $first_dropped == len {
+					if $first_dropped == length {
 						prepared
 					} else {
 						# The items before $first_dropped were already tested and kept,
 						# so copy them in one step and test only the items after it.
-						var $new_list = list_append_sublist(List.with_capacity(len), prepared, 0, $first_dropped)
+						var $new_list = list_append_sublist(List.with_capacity(length), prepared, 0, $first_dropped)
 						var $index = $first_dropped + 1
-						while $index < len {
+						while $index < length {
 							item = list_get_unsafe(prepared, $index)
 							if predicate(item) {
 								$new_list = list_append_unsafe($new_list, item)
@@ -4935,15 +4931,59 @@ Builtin :: [].{
 		## ```roc
 		## expect [1.I64, 2, 3].keep_if_try(|n| Ok(n > 1)) == Ok([2, 3])
 		## ```
+		##
+		## If given a unique list, [List.keep_if_try] will mutate it in place, and will
+		## not allocate any new memory on the heap. If all items in a shared list end
+		## up being kept, Roc will return the original list unaltered. Otherwise, a
+		## shared list is copied into one new list with the original's length as its
+		## capacity.
 		keep_if_try : List(a), (a -> Try(Bool, err)) -> Try(List(a), err)
 		keep_if_try = |list, predicate| {
-			var $out = []
-			for item in list {
-				if predicate(item)? {
-					$out = List.concat($out, [item])
+			prepared = list_map_prepare_reuse(list)
+			prepared_len = prepared.len()
+			match list_owned_unique(prepared) {
+				1 => {
+					# Swap each kept item down to the end of the kept prefix. A swap
+					# leaves every slot holding an item, so stopping at an Err
+					# releases the whole list like any other list.
+					var $out = prepared
+					var $kept = 0
+					var $index = 0
+					while $index < prepared_len {
+						if predicate(list_get_unsafe($out, $index))? {
+							if $kept != $index {
+								$out = list_swap_unsafe($out, $kept, $index)
+							}
+							$kept = $kept + 1
+						}
+						$index = $index + 1
+					}
+					Ok(List.drop_last($out, prepared_len - $kept))
+				}
+				_ => {
+					# A shared list is returned as it is when every item is kept.
+					var $first_dropped = 0
+					while $first_dropped < prepared_len and predicate(list_get_unsafe(prepared, $first_dropped))? {
+						$first_dropped = $first_dropped + 1
+					}
+					if $first_dropped == prepared_len {
+						Ok(prepared)
+					} else {
+						# The items before $first_dropped were already tested and kept,
+						# so copy them in one step and test only the items after it.
+						var $new_list = list_append_sublist(List.with_capacity(prepared_len), prepared, 0, $first_dropped)
+						var $index = $first_dropped + 1
+						while $index < prepared_len {
+							item = list_get_unsafe(prepared, $index)
+							if predicate(item)? {
+								$new_list = list_append_unsafe($new_list, item)
+							}
+							$index = $index + 1
+						}
+						Ok($new_list)
+					}
 				}
 			}
-			Ok($out)
 		}
 
 		## Like [List.keep_if_try], but the predicate is effectful. It runs on each
@@ -4953,13 +4993,51 @@ Builtin :: [].{
 		## ```
 		keep_if_try! : List(a), (a => Try(Bool, err)) => Try(List(a), err)
 		keep_if_try! = |list, predicate!| {
-			var $out = []
-			for item in list {
-				if predicate!(item)? {
-					$out = List.concat($out, [item])
+			prepared = list_map_prepare_reuse(list)
+			prepared_len = prepared.len()
+			match list_owned_unique(prepared) {
+				1 => {
+					# Swap each kept item down to the end of the kept prefix. A swap
+					# leaves every slot holding an item, so stopping at an Err
+					# releases the whole list like any other list.
+					var $out = prepared
+					var $kept = 0
+					var $index = 0
+					while $index < prepared_len {
+						if predicate!(list_get_unsafe($out, $index))? {
+							if $kept != $index {
+								$out = list_swap_unsafe($out, $kept, $index)
+							}
+							$kept = $kept + 1
+						}
+						$index = $index + 1
+					}
+					Ok(List.drop_last($out, prepared_len - $kept))
+				}
+				_ => {
+					# A shared list is returned as it is when every item is kept.
+					var $first_dropped = 0
+					while $first_dropped < prepared_len and predicate!(list_get_unsafe(prepared, $first_dropped))? {
+						$first_dropped = $first_dropped + 1
+					}
+					if $first_dropped == prepared_len {
+						Ok(prepared)
+					} else {
+						# The items before $first_dropped were already tested and kept,
+						# so copy them in one step and test only the items after it.
+						var $new_list = list_append_sublist(List.with_capacity(prepared_len), prepared, 0, $first_dropped)
+						var $index = $first_dropped + 1
+						while $index < prepared_len {
+							item = list_get_unsafe(prepared, $index)
+							if predicate!(item)? {
+								$new_list = list_append_unsafe($new_list, item)
+							}
+							$index = $index + 1
+						}
+						Ok($new_list)
+					}
 				}
 			}
-			Ok($out)
 		}
 
 		## Like [List.fold], but the step function can fail. Threads `state` through
@@ -5232,9 +5310,9 @@ Builtin :: [].{
 		## ```
 		drop_swap : List(a), U64 -> List(a)
 		drop_swap = |list, index| {
-			len = List.len(list)
-			if index < len {
-				List.drop_last(list_swap_unsafe(list, index, len - 1), 1)
+			length = List.len(list)
+			if index < length {
+				List.drop_last(list_swap_unsafe(list, index, length - 1), 1)
 			} else {
 				list
 			}
@@ -5261,17 +5339,17 @@ Builtin :: [].{
 		## ```
 		chunks_of : List(a), U64 -> List(List(a))
 		chunks_of = |list, chunk_size| {
-			len = List.len(list)
+			length = List.len(list)
 
-			if chunk_size == 0 or len == 0 {
+			if chunk_size == 0 or length == 0 {
 				[]
 			} else {
-				# `(len - 1) / chunk_size + 1` is an overflow-safe ceil of `len / chunk_size`,
+				# `(length - 1) / chunk_size + 1` is an overflow-safe ceil of `length / chunk_size`,
 				# counting exactly the chunks appended below so every unchecked append stays
 				# in bounds.
-				var $chunks = List.with_capacity((len - 1) / chunk_size + 1)
+				var $chunks = List.with_capacity((length - 1) / chunk_size + 1)
 				var $start = 0
-				while ($start < len) {
+				while ($start < length) {
 					$chunks = list_append_unsafe($chunks, List.sublist(list, { start: $start, len: chunk_size }))
 					$start = $start + chunk_size
 				}
@@ -5314,9 +5392,9 @@ Builtin :: [].{
 		##
 		take_last : List(a), U64 -> List(a)
 		take_last = |list, n| {
-			len = List.len(list)
-			start = if (len <= n) 0 else len - n
-			List.sublist(list, { start: start, len: len })
+			length = List.len(list)
+			start = if (length <= n) 0 else length - n
+			List.sublist(list, { start: start, len: length })
 		}
 
 		## Drops n items from the beginning of the list. If `n` is larger than the
@@ -5328,8 +5406,8 @@ Builtin :: [].{
 		## ```
 		drop_first : List(a), U64 -> List(a)
 		drop_first = |list, n| {
-			len = List.len(list)
-			List.sublist(list, { start: n, len: len })
+			length = List.len(list)
+			List.sublist(list, { start: n, len: length })
 		}
 
 		## Drops n items from the end of the list. If `n` is larger than the
@@ -5341,8 +5419,8 @@ Builtin :: [].{
 		## ```
 		drop_last : List(a), U64 -> List(a)
 		drop_last = |list, n| {
-			len = List.len(list)
-			take_len = if (len <= n) 0 else len - n
+			length = List.len(list)
+			take_len = if (length <= n) 0 else length - n
 			List.sublist(list, { start: 0, len: take_len })
 		}
 
@@ -5411,11 +5489,11 @@ Builtin :: [].{
 		split_at : List(a), U64 -> { before : List(a), others : List(a) }
 		split_at = |list, idx| {
 			before = list.sublist({ start: 0, len: idx })
-			len = list.len()
-			others = if (idx > len)
+			length = list.len()
+			others = if (idx > length)
 				[]
 			else
-				list.sublist({ start: idx, len: len - idx })
+				list.sublist({ start: idx, len: length - idx })
 			{ before, others }
 		}
 
@@ -6135,8 +6213,8 @@ Builtin :: [].{
 			where [k.to_hash : k, Hasher -> Hasher]
 		reserve = |dict, additional| match dict {
 			HashMap(data) => {
-				len = List.len(data.entries)
-				desired = dict_add_capacity(len, additional)
+				length = List.len(data.entries)
+				desired = dict_add_capacity(length, additional)
 				prepared = dict_ensure_capacity(data, desired)
 				entries = List.reserve(prepared.entries, additional)
 				HashMap({ entries, buckets: prepared.buckets, max_entries_before_grow: prepared.max_entries_before_grow, shifts: prepared.shifts })
@@ -16252,8 +16330,8 @@ Builtin :: [].{
 			## expect !Dec.is_approx_eq(Dec.highest, Dec.lowest, { rel: 1.0, abs: 0.0 })
 			## ```
 			is_approx_eq : Dec, Dec, { rel : Dec, abs : Dec } -> Bool
-			is_approx_eq = |a, b, { rel, abs }| {
-				if !(rel >= 0.0 and rel <= 1.0 and abs >= 0.0) {
+			is_approx_eq = |a, b, { rel, abs: abs_tolerance }| {
+				if !(rel >= 0.0 and rel <= 1.0 and abs_tolerance >= 0.0) {
 					crash "Dec.is_approx_eq: rel must be in [0, 1] and abs non-negative"
 				}
 
@@ -16268,7 +16346,7 @@ Builtin :: [].{
 							} else {
 								Dec.max(Dec.abs(a), Dec.abs(b))
 							}
-							diff <= Dec.max(abs, rel * magnitude)
+							diff <= Dec.max(abs_tolerance, rel * magnitude)
 						}
 						Err(Overflow) => False
 					}
@@ -17479,15 +17557,15 @@ Builtin :: [].{
 			## expect !F32.is_approx_eq(F32.nan, F32.nan, { rel: 1.0, abs: 1.0 })
 			## ```
 			is_approx_eq : F32, F32, { rel : F32, abs : F32 } -> Bool
-			is_approx_eq = |a, b, { rel, abs }| {
-				if !(rel >= 0.0 and rel <= 1.0 and abs >= 0.0 and F32.is_finite(abs)) {
+			is_approx_eq = |a, b, { rel, abs: abs_tolerance }| {
+				if !(rel >= 0.0 and rel <= 1.0 and abs_tolerance >= 0.0 and F32.is_finite(abs_tolerance)) {
 					crash "F32.is_approx_eq: rel must be in [0, 1] and abs finite and non-negative"
 				}
 
 				if F32.is_float_eq(a, b) {
 					True
 				} else if F32.is_finite(a) and F32.is_finite(b) {
-					F32.abs(a - b) <= F32.max(abs, rel * F32.max(F32.abs(a), F32.abs(b)))
+					F32.abs(a - b) <= F32.max(abs_tolerance, rel * F32.max(F32.abs(a), F32.abs(b)))
 				} else {
 					False
 				}
@@ -18494,15 +18572,15 @@ Builtin :: [].{
 			## expect !F64.is_approx_eq(F64.nan, F64.nan, { rel: 1.0, abs: 1.0 })
 			## ```
 			is_approx_eq : F64, F64, { rel : F64, abs : F64 } -> Bool
-			is_approx_eq = |a, b, { rel, abs }| {
-				if !(rel >= 0.0 and rel <= 1.0 and abs >= 0.0 and F64.is_finite(abs)) {
+			is_approx_eq = |a, b, { rel, abs: abs_tolerance }| {
+				if !(rel >= 0.0 and rel <= 1.0 and abs_tolerance >= 0.0 and F64.is_finite(abs_tolerance)) {
 					crash "F64.is_approx_eq: rel must be in [0, 1] and abs finite and non-negative"
 				}
 
 				if F64.is_float_eq(a, b) {
 					True
 				} else if F64.is_finite(a) and F64.is_finite(b) {
-					F64.abs(a - b) <= F64.max(abs, rel * F64.max(F64.abs(a), F64.abs(b)))
+					F64.abs(a - b) <= F64.max(abs_tolerance, rel * F64.max(F64.abs(a), F64.abs(b)))
 				} else {
 					False
 				}
@@ -23687,7 +23765,25 @@ Builtin :: [].{
 
 		}
 	}
+}
 
+StrUtf8Problem := [
+	InvalidStartByte,
+	UnexpectedEndOfSequence,
+	ExpectedContinuation,
+	OverlongEncoding,
+	CodepointTooLarge,
+	EncodesSurrogateHalf,
+].{
+	is_eq : Str.Utf8Problem, Str.Utf8Problem -> Bool
+}
+
+StrUtf16Problem := [UnpairedHighSurrogate, UnpairedLowSurrogate, UnexpectedEndOfSequence].{
+	is_eq : Str.Utf16Problem, Str.Utf16Problem -> Bool
+}
+
+StrUtf32Problem := [CodePointTooLarge, SurrogateCodePoint, UnexpectedEndOfSequence].{
+	is_eq : Str.Utf32Problem, Str.Utf32Problem -> Bool
 }
 
 hasher_start : U64 -> Hasher

@@ -33,6 +33,20 @@ const bodies_mod = check.CheckedBodies;
 const PatternId = bodies_mod.PatternId;
 const BinderId = bodies_mod.BinderId;
 
+/// The checked site a failed pattern test of a compile-time root's own body
+/// reports (`Builder.comptimeFailure`).
+pub const ComptimeFailure = struct {
+    owner: LIR.LoweringModuleId,
+    checked_site: ?checked.CheckedExhaustivenessSiteId,
+
+    /// The terminal a failed test ends in: the empirical failure of its
+    /// checked site, or, with no comptime failure, a runtime error.
+    pub fn terminal(failure: ?ComptimeFailure) LIR.CFStmt {
+        const comptime_failure = failure orelse return .runtime_error;
+        return .{ .comptime_exhaustiveness_failed = .{ .owner = comptime_failure.owner, .checked_site = comptime_failure.checked_site } };
+    }
+};
+
 /// A match being lowered: its emitter, and what its branch requests need.
 pub const State = struct {
     arena: std.heap.ArenaAllocator,
@@ -46,6 +60,12 @@ pub const State = struct {
     merge: ?body_mod.MergeId,
     /// The hole the decision tree goes into.
     remainder: CFStmtId,
+    /// The checked site a match lowered in a compile-time root's own body
+    /// reports when no branch matches, as the empirical failure of its
+    /// exhaustiveness; null where no branch matching is a plain runtime
+    /// error.
+    comptime_failure: ?ComptimeFailure = null,
+
     /// The type of each occurrence local.
     occ_types: collections.DenseMapUnmanaged(LocalId, TypeId) = .empty,
     /// The local each pattern binder is bound to.
@@ -228,7 +248,7 @@ pub const Ctx = struct {
         }
         // A field of an open row's remainder: only the record's descriptor
         // knows where it is.
-        if (record.ext == null) invariant("a record pattern's field is absent from its type");
+        if (record.ext == .none) invariant("a record pattern's field is absent from its type");
         const position: u32 = @intCast(self.state.named_fields.items.len);
         try self.state.named_fields.append(self.arena(), name);
         return .{ .index = named_field_base + position, .ty = try self.b.patternType(sub), .pat = sub };
@@ -502,7 +522,7 @@ pub const Ctx = struct {
     }
 
     pub fn failTerminal(self: Ctx) Allocator.Error!LIR.CFStmtId {
-        return try self.b.store.addCFStmt(.runtime_error, self.b.origin(.lowering_glue));
+        return try self.b.store.addCFStmt(ComptimeFailure.terminal(self.state.comptime_failure), self.b.origin(.lowering_glue));
     }
 
     pub fn lirLocalForOcc(self: Ctx, step: match_tree.Step, ty: types.TypeId, parent: ?LIR.LocalId) Allocator.Error!LIR.LocalId {

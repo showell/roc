@@ -242,6 +242,57 @@ must revisit an entry, so it has found a cycle, which is an invariant
 violation. A walk whose store cannot be counted detects the cycle directly.
 No walk uses a fixed step limit that a legal program could exceed.
 
+### Table Storage Lifecycles
+
+Table owners choose storage from the lifecycle, not the initial bit pattern:
+
+| Lifecycle | Storage | Reset |
+| --- | --- | --- |
+| Every entry is written before read | `WriteFirstSlice` | Produce each entry again |
+| Read-first, dense, used once | Filled slices or `OptionalIndexColumn.initFilled` | Explicit fill |
+| Read-first, sparse, large domain | Fresh zero pages or `OptionalIndexColumn.initSparse` | Guaranteed-zero page reset or release |
+| Repeated scratch over a retained domain | `EpochSet` or `EpochColumn` | Advance an epoch |
+| Small flag-only domain | Bitset form of `EpochSet` | Clear the bits |
+| Growing columns | `ReservedList` or `ReservedColumns` | Explicit append writes; trim on seal |
+| Tables with one pass lifetime | `ScratchArena` | Reset to the pass boundary |
+
+Fresh zero storage guarantees the initial state of a new mapping and newly
+accessible reservation suffix. It says nothing about retained capacity,
+rollback/regrowth, descriptor recycling, or sharing with another thread.
+Every appended entry is written explicitly. Resetting a sparse mapping must
+guarantee zeros, not merely advise that its contents may be discarded.
+
+Optional-index columns preserve the owning domain's IDs. A zero-based shared
+domain stores `id + 1`, reserving the stored zero for absence. A private domain
+may instead reserve array slot zero and issue IDs from one; its column
+stores those IDs unchanged, and every iteration over entries excludes the unused
+slot. This choice never silently renumbers IDs crossing a compiler boundary.
+Borrowed column views own no allocation.
+
+Internally counted epochs start at one. Before an advance would reach
+`maxInt(u32)`, the stamps are cleared and the epoch restarts at one. Natural
+epochs are increasing producer-owned IDs; restarting their domain requires
+clearing the stamps. Data are read only under a matching stamp.
+
+Dense storage requests huge-page backing where supported; sparse storage
+avoids it so a small touched subset does not make large regions resident.
+Address stability below a reservation limit is a performance property, never
+a consumer contract. Exceeding a reservation may relocate the column, and
+allocation failure propagates without changing logical contents or ownership.
+Borrowed serialized views own no backing memory. A sealed borrowed view
+cannot grow. A writable one copies its entries into storage it owns the first
+time it grows, frees nothing, and leaves the serialized bytes alone.
+
+Groupings use CSR for dense keys and sorted pairs for sparse keys. Chains are
+appropriate only when construction and queries interleave. Group order is
+explicit: both collection builders preserve insertion order, so a consumer
+of a reverse-insertion chain must preserve its ordering deliberately.
+
+These primitives do not authorize blanket conversions. Each migration must
+preserve padding and value-byte initialization, prove its lifecycle,
+and pass the corpus performance gate. Reservation thresholds and commit-ahead
+policy remain measurement decisions, not guarantees of a speedup.
+
 ### Dense IDs and structural keys
 
 Compiler-owned identity domains prefer dense, store-local integer IDs. The
@@ -454,6 +505,9 @@ frozen address relocation when embedding a constant root. Private allocations
 retain hidden visibility and do not become host exports. A combined code/data
 object keeps local binding for private allocations because those references
 remain inside that object.
+Zero-sized definitions still belong to a defined section, even when it has no
+payload bytes; omitting that section must not turn a definition into an external
+declaration.
 
 Definitions retain their assigned symbol IDs through final metadata assembly.
 Object writers borrow immutable section bytes until emission, compute the final
@@ -469,6 +523,15 @@ code generation. Each explicit RC statement carries the concrete RC helper
 selected by LIR ARC insertion. Consumers may lazily cache code or interpreter
 execution plans for that helper, but they must not select a different helper
 from local layout data. Reference-counting policy belongs to LIR ARC insertion.
+
+This rule has exactly one exception. For an `incref` or `decref` of a dynamic
+local, the native dev backend may read the `contains_refcounted` flag of the
+local's descriptor and skip the call to `roc_desc_incref` or `roc_desc_decref`
+when the flag is clear ("Ownership" under "Dynamic Values In LIR"). The helper
+would return at once for such a descriptor, so the skip changes no reference
+count and decides nothing: the explicit statement still fully determines what
+happens. No other backend code reads reference-counting facts, and there is no
+other exception.
 
 Walks over post-check types and values must have an explicit termination
 argument. A structure reachable after checking can be
@@ -682,6 +745,48 @@ Writers stage complete files beside their destination and install them by atomic
 rename. Readers own an open file or mapping; no writer truncates an installed
 file. Missing, corrupt, or incompatible entries are ordinary cache misses.
 
+Every cache file the compiler reads back as data records its own total length
+in bytes at both ends: a 16-byte prefix holding the length (prefix and trailer
+included) as a little-endian `u64`, then zeros, and an 8-byte trailer holding
+the same length, read unaligned. The cache manager writes this framing around
+every entry of the checked, canonicalized (including source import
+inventories), pairing, Boxy object and test outcome families
+(`artifact_store.length_prefix_len`, `length_trailer_len`). Sixteen prefix
+bytes keep every payload at the 16-byte alignment in-place loads need, and the
+trailer follows the payload, so it disturbs nothing positioned from the start;
+a format that needs a larger alignment inside its file, such as a Boxy object's
+page-aligned image, aligns relative to the file. Once a file is mapped or read,
+both recorded lengths are compared with its actual length before any other
+byte is trusted, and a file too short to hold both is a mismatch. This is the
+one check that a file is as long as it was written, the same for every format;
+it computes no checksum. It catches truncation and appended bytes, and, because
+entries are renamed into place without being synced, a power loss that leaves
+a file at its full length with never-flushed blocks reading as zeros: flushing
+usually proceeds from the front, so such a file's trailer is what is lost. Loss
+confined to the middle of a file is not detected. A format's header lengths
+only locate its bodies: each body is bounds-checked against the payload (the
+file without its prefix and trailer) before it is sliced, so a header with a
+correct file length and garbage body lengths is still memory-safe, but bodies
+need not cover the payload exactly.
+
+The two prelinked-host families are not framed. A prelinked host record is
+copied into outputs by file range from block-aligned offsets, and each of its
+formats (ELF, Mach-O and COFF records, wasm unit images) already records its
+total size in its own header and checks it on load; a run host is an
+executable copied whole and launched, with no header of ours to carry a
+length.
+
+A loaded entry that fails the length check, or that its format then rejects as
+corrupt (an envelope that does not decode, a body that does not fit, an
+environment that fails validation, a parse-stage record or Boxy object that
+does not decode, a prelinked host record that is not one), is a miss: it is
+counted as an invalidation, named in one line under `--verbose`, and its file
+is deleted so no later build reads it again. The delete removes the path only
+while it still names the file that was loaded (same inode and size); a file
+another writer has renamed into place since is left alone. A failed delete is
+not an error. A test outcome file that does not parse records no outcomes and
+is replaced when the run files its outcomes.
+
 There is no cache catalog, index, lease, or background maintenance protocol.
 Each invocation owns a unique scratch directory and removes it on completion
 unless `--keep-temp` was requested.
@@ -690,6 +795,82 @@ Specialized compilation does not persist post-check IR, native procedure packs,
 linked objects, executables, or glue plugins. Every invocation
 specializes and emits its requested program from the current checked modules.
 In-memory sharing within a compilation remains independent of disk caching.
+
+### Loading environments in place
+
+A cached `ModuleEnv` is never copied into fresh storage. A canonicalized-cache
+hit, a checked-cache hit and a typing restore all load the entry's env body with
+the one loader, `ModuleEnv.Serialized.deserializeInPlace`, over a copy-on-write
+private mapping of the entry (or, where the platform cannot map files, a heap
+buffer holding it). Every list in the env borrows the entry's bytes: a
+`SafeList` with capacity 0 and a nonzero length, a `SafeMultiList` whose
+capacity word carries the borrowed mark, or a `ReservedList` whose storage is
+`borrowed`. A borrowed list reads and writes its items where they lie, so the
+probe tables of the interners and of the string-literal and import stores take
+new cells in place, and solving writes type rows in place. The first growth of
+a list copies its items into memory the env's allocator owns and leaves the
+entry's bytes alone. `deinit` frees only those copies: a borrowed list frees
+nothing, so a loaded env is released with the same `deinit` as a freshly built
+one.
+
+The env owns its entry as `loaded_entry` and releases it (an unmapping, or a
+free with the env's allocator) at the end of `deinit`, after every list that
+might still borrow it. The entry therefore lives exactly as long as the env,
+whichever thread loaded it and whichever thread releases it, and is released
+once on every path. Anything else read from the entry, such as a checked
+artifact's body or the typing metadata, lives as long as the env does.
+
+The loader takes the type store's access: `.sealed` for a checked hit, whose
+types are solved and only read, and `.writable` for a canonicalized hit and a
+typing restore, whose types checking solves further; a writable load also gives
+the node store its scratch buffers. Nothing in a loaded env is rebuilt: the
+identifier interners, the string-literal dedup table, the import lookup table,
+sorted method and exposure tables, and the type store's
+`invalid_nominal_decl_written` and `err_written` flags are all stored in the
+entry and used as loaded.
+
+Validation runs before the loader dereferences anything: every relocatable list
+must lie inside the body, and each probe table must have its stored shape (a
+power-of-two length, or empty with no entries; parallel columns of equal
+length; fewer entries than cells; list lengths agreeing with their counts). A
+violation is a cache miss. The checks are constant time and read no cell, so a
+corrupt table whose occupied cells outnumber its count, or a cell naming an
+entry that does not exist, is not detected.
+
+The stores of a checked artifact relocated beside its env, and of a pairing
+entry, load over the entry's bytes the same way. A store's list fields are
+`SafeList`s loaded borrowing the entry, so growth copies and `deinit` frees
+nothing borrowed; `SliceStoreSerde` rejects a `std.ArrayList` field at compile
+time, since one over loaded bytes would hand them to an allocator on growth or
+`deinit`. A store's plain slice fields have no growth operation; a loaded
+artifact frees only its own buffer (`serialized_backing`), never a sub-store's
+slices, which alias it. A loaded store whose build-only dedup tables are not
+stored (a checked type store's interning tables, a const store's blob index)
+takes no new entries.
+
+A LirImage view loads the same way. Every list of its LIR store (a
+`GuardedList`, whose backing is a `SafeList`) and every plain column of its
+layout store borrows the image; the compact layout columns, whose image form
+is portable typed columns, are rebuilt with the view's allocator. The image
+stores the string-literal dedup table beside the string bytes, so a viewed
+store deduplicates exactly as the store it was copied from. A view is released
+with the stores' ordinary `deinit`. Nothing writes through a view of an image
+in shared memory: the interpreter only reads it.
+
+The compiler's embedded Builtin module is viewed the same way, with a sealed
+type store, over the executable's static data. Every compilation in the process
+shares those bytes, so nothing writes through the view: it has no imports and
+no node scratch, and it is baked already prepared for checked-artifact use, so
+nothing inserts into its identifier or string-literal tables. The embedded
+Builtin artifact is viewed beside it the same way. On native targets both blobs
+are `const` data, and the loaders drop the bytes' constness in one place each
+(`ModuleEnv.Serialized.viewStatic`, `CheckedModuleArtifact.viewStaticBuiltin`),
+because lists hold mutable item pointers. An optimized native build (LLVM)
+places const data in read-only memory, so a write through either view faults
+where it happens. Debug builds made by Zig's self-hosted x86_64 backend place
+const data in a writable segment, and the compressed variant embedded in
+echo.wasm is decompressed into writable storage at startup, on a target with
+no page protection; in those builds the property rests on the invariant alone.
 
 ### Test outcome files
 
@@ -1604,6 +1785,17 @@ type declarations and standalone annotations among its statements; a block-local
 declaration that took the block's rank would be shared rather than copied by its
 uses, tying an application such as `Label(b)` to the declaration's own formals.
 
+A type declaration's template is generated on demand when another declaration
+names it, with one exception: an alias declaration that names a nominal
+declaration whose constructor shell is already reserved takes the shell and
+does not generate the nominal declaration's backing. An alias needs only the
+nominal application, which the shell is, and the nominal declaration is
+generated by its own request. Generating the backing inside the alias would
+make legal recursion order-dependent: with `T : Tree` declared before
+`Tree := [Leaf, Node(T, T)]`, the backing would re-enter the alias still
+being generated. Re-entering an alias being generated is therefore always a
+cycle with no nominal declaration in it, which is a recursive alias.
+
 After all local type declarations have been generated, checking computes the
 transitive closure of invalidity over those recorded dependency edges. This
 finalization is linear in the number of declarations plus recorded references,
@@ -1684,6 +1876,81 @@ identity selected by checking. `buildImportedTemplateClosure` and
 `collectPublicApiDependencies` receive defining checked module data explicitly
 when no lexical import exists.
 
+### Nominal Construction Through Aliases
+
+An alias of a nominal type names that nominal type, so a construction or
+pattern written through the alias (`Pt.{ x: 1 }`, `Hue.Red`,
+`Api.Item.{ ... }`) builds or matches the aliased nominal value exactly as
+writing the nominal type's own name does. Canonicalization does not interpret
+the alias annotation: it records the alias declaration it resolved as the
+type the `e_nominal` / `e_nominal_external` expression or `nominal` /
+`nominal_external` pattern names, local or imported, including an alias
+reached by following an exposed alias out of the import the path was written
+with (named by module content identity, like any declaration reached that
+way). Checking instantiates the alias declaration, follows its solved backing
+through any chain of aliases to the terminal nominal application, and uses
+that application as the nominal the node constructs or matches. The node's
+type is the instantiated alias it was written through, so `Pt.{ x: 1 }` with
+`Pt : Point` is a `Pt`: the alias is the public name and a transparent view of
+the nominal type, and the one relation that publishes the node's type relates
+it to that alias application instead of to the nominal application behind it.
+Everything else uses the nominal type. Opacity is judged on that nominal
+type, so an alias never widens who may construct an opaque (`::`) type. Once
+the nominal type is known, checking replaces the node's target with the
+nominal declaration: `e_nominal` / `nominal` when the nominal type is declared
+in the checked module, otherwise the external form naming the declaring
+module by content identity, since that module need not be one this module
+imports. Every consumer after checking therefore sees only nominal targets.
+An alias whose backing is not a nominal type is reported by checking as
+"Expected Nominal Type", and the use is erroneous. Like the associated lookup
+rewrite above, this replacement resolves a reference; it mutates no solved
+type and stamps no dispatch plan, so it adds no Rewrite Inventory entry
+(Solver-Mutating Rewrites). Omitted defaulted fields of a construction through
+an alias are found by checking, as for any construction whose nominal type
+canonicalization does not know (Defaulted Fields). The default-cycle pass is
+the one place canonicalization looks through an alias, and only along names it
+resolved itself: an alias whose annotation is a reference to a local type
+declaration names that declaration, so a construction through it contributes
+the same omission edges as one written through the nominal type's own name
+(Defaulted Fields).
+
+### Builtin Types Named Through Aliases
+
+`Str.Utf8Problem`, `Str.Utf16Problem` and `Str.Utf32Problem` are aliases of
+`StrUtf8Problem`, `StrUtf16Problem` and `StrUtf32Problem`, nominal types
+declared below the `Builtin` type's block. A type declared there is private
+to the Builtin module, as a type declared beside any type module's main type
+is, and its members do not shadow `Str`'s. The compiler has no rule specific
+to these types: they behave as a private nominal type behind a public alias
+behaves in any module.
+
+- The builtin type registry (`CIR.builtin_type_specs`) lists the aliases,
+  like every other type the `Builtin` block declares, which puts the bare
+  names (`Utf8Problem`) in scope and gives them their display names. It does
+  not list the private nominal types.
+- Printed types. A type reached through the alias is the alias, so it prints
+  under the alias's name. Builtin.roc's own annotations name these types
+  through the aliases, including inside the nominal types' blocks, so
+  inferred types carry the alias. A type that has lost its alias prints
+  under the nominal type's own name, as it does for any module.
+- Member lookup. `Utf8Problem.is_eq` and `Str.Utf8Problem.is_eq` are
+  Associated Item Lookup Through Aliases: canonicalization sees that the
+  path's type segments name an alias declaration and emits
+  `e_lookup_associated`, and checking resolves the alias to the nominal type
+  that owns the member.
+- Construction and patterns through the alias are ordinary Nominal
+  Construction Through Aliases.
+- Documentation and `roc bump` apply their one rule for a nominal type that
+  only an alias names (`adoptRenamedNominals` in src/docs/extract.zig and
+  src/bump/extract.zig): a public alias that applies a nominal type with no
+  public name of its own to exactly the alias's parameters is that type's
+  public name. The alias's entry is the nominal type's (its kind, parameters,
+  backing type and members, under the alias's name), the nominal type has no
+  entry of its own, and every reference to it renders as a reference to the
+  alias. The nominal type may be declared in the alias's module or in a
+  module the package does not expose, and a renamed type can rename further
+  types through aliases nested in it.
+
 ### Compile-Time Evaluation And Static Storage
 
 Frontend task completion and checked-value completion are distinct boundaries.
@@ -1725,6 +1992,9 @@ kind and its resolved value reference. It must not infer a procedure from source
 names, function type alone, body shape below the root expression, or post-check
 specialization results. Any wrapper, capture, conditional, call, or other
 function-valued computation remains an ordinary compile-time callable root.
+When platform pairing binds a required procedure, it records the resulting
+alias forwarding in the pairing's own callable templates and persists it with
+the pairing. The unpaired platform's templates remain unchanged.
 
 A shared post-check program represents a selected root read as an explicit
 `comptime_value` expression. Its identity is the checked module id, compile-time
@@ -1873,13 +2143,19 @@ as the scalar literal rather than a slot read, so range proving, loop
 versioning, and overflow elision see the constant they would have seen from
 a literal in source; a table built by `List.repeat` with a compile-time
 length keeps no index check the prover can discharge, and no slot, failure
-record, or guard exists for the root. Small strings may likewise use their
-immediate representation. All aggregate values, including empty lists,
-records, tuples, tags, boxes, and captured functions, read immutable stored
+record, or guard exists for the root. Discriminant-only enums (including Bool)
+are scalar values for this rule, even though their layout is a tag union.
+Small strings may likewise use their immediate representation. Restoring
+stored constants uses the same rule, so these values stay constructions,
+visible to constant propagation and worker preparation. All aggregate
+values, including empty lists, records, tuples, payload-bearing tags, boxes,
+and captured functions, read immutable stored
 data. There is no construction tree, runtime constructor, or fresh alternative
 for a completed value. Mutation uses the normal copy-on-write operation.
-Allocation capacity is not part of the frozen value; empty lists require no
-backing storage, and nonempty lists store their items without spare capacity.
+A list's or string's capacity is part of the frozen value (Static Lists And
+Strings Keep Their Capacity): its descriptor records the capacity the value
+was evaluated with, while its allocation stores the items alone, with no
+spare slots.
 The same rule applies when restoring values from the checked module cache.
 
 Static data can refer directly to a ConstStore node with its type plan, or
@@ -1898,6 +2174,11 @@ app module, and the readonly object binds every node globally so those
 references resolve; only slots with function-pointer relocations stay
 external declarations. Slot reads therefore fold to immediates and
 relocatable addresses instead of loads from a linker symbol.
+Self-contained glue generator objects instead own the complete retained frozen
+graph in their LLVM module, including callable and explicit helper relocations.
+They never embed compiler-process addresses: installed generators must survive
+another process. The loaded image outlives copying the generator's result,
+because returned values can borrow its immutable storage.
 A node whose bytes are all zero and that no relocation writes into is
 declared, not stored: the object writers place it in their format's zero-fill
 section (`.bss` for ELF and COFF, `__DATA,__bss` for Mach-O) by size and
@@ -1936,10 +2217,10 @@ program's root module, taken from its checked `runtime_requests`, and the
 package and the packages it reaches through filesystem paths), with every
 literal conversion those roots reach hoisted, at the host's width, with
 expects run (`compileTimeTarget`). Every compilation evaluates every requested
-root ("Demand-Driven Compile-Time Evaluation"). Its Solved policy is that of the program
-being built, so evaluation runs inside that program's one specialization;
-with no runtime program, as in `roc check`, it is a dev build's
-(`CheckedPipeline.dev_inline_mode`). Inlining and SpecConstr preserve meaning,
+root ("Demand-Driven Compile-Time Evaluation"). When an LSS runtime consumer
+continues that specialization (see "Runtime Programs Read Stored Values"), its
+Solved policy is that of the program being built; otherwise, as in `roc check`,
+it is a dev build's (`CheckedPipeline.dev_inline_mode`). Inlining and SpecConstr preserve meaning,
 and every function value keeps the captures the checked program gives it
 ("Stored Function Capture Contract"), so the policy changes how evaluation's
 code is built, never what it computes or stores.
@@ -1961,10 +2242,11 @@ no LSS runtime consumer continues that program, as in `roc check`, the
 program roots in that union are discovery roots and only the bodies that can
 register a literal root are specialized (see "Demand-Driven Compile-Time
 Specialization" below). An
-LSS runtime consumer continues that program and borrows it, unless the
-evaluation completed a compile-time root the program demands, when it
-continues the program specialized again from the stored values instead
-(see "Runtime Programs Read Stored Values"): none copies it,
+LSS runtime consumer continues that program and borrows it only when the
+evaluation has no compile-time root to evaluate and no discovery root to
+specialize; otherwise evaluation is specialized as in `roc check` and the
+consumer continues a specialization of its own roots made from the stored
+values (see "Runtime Programs Read Stored Values"): none copies it,
 none reruns any of those stages for it, and callable correspondence compares ids
 from one producer domain, never ids allocated by separate solver runs. A
 consumer continuing it chooses its target width, the explicitly shared
@@ -2011,11 +2293,13 @@ failure: it records the failure it read and is not reported again, because the
 failing root already reported it in the module that owns it. A literal root
 belongs to no checked module, so nothing retains its failure between
 compilations except the checked results that embed it: a checked root that
-stops at a literal root's value guard, or reaches a rejected literal inline,
-reports that failure in its own module, naming the literal as the failure's
-origin, which keeps that module from being cached clean while its result holds
-the failure. A failed literal root that no checked root embeds is reported at
-its literal once finalization is done. A module whose finalization completed in
+stops at a literal root's value guard reports that failure in its own module,
+naming the literal as the failure's origin, which keeps that module's checked
+entry from being written while its result holds the failure. A checked root
+that reaches another module's rejected literal inline reports the rejection
+the same way, and its entry stores that report beside the failed result it
+restores ("Literal Arguments"). A failed literal root that no checked root embeds is
+reported at its literal once finalization is done. A module whose finalization completed in
 an earlier compilation receives such a report through the coordinator's report
 destination for it, without its cached result changing; a literal in the
 builtin module, which belongs to no package, is rendered against the builtin
@@ -2048,38 +2332,66 @@ peaks. A completed compile-time program's procedures are likewise released
 once the values they produced have been read: what stays consulted is those
 values, their representation metadata, and the procedures' own identities.
 
-Boxy runtime lowering is a distinct declared specialization strategy. Compile-
-time evaluation remains LSS, so that consumer's runtime roots are excluded from
-the LSS union and lowered by the separate Boxy pipeline after checking completes.
-This split follows the selected strategy, never a failed specialization attempt.
+Boxy runtime lowering is a distinct declared specialization strategy: that
+consumer's runtime roots are excluded from the LSS union and lowered by the
+separate Boxy pipeline after checking completes. Under either strategy the
+`.boxy` evaluator completes every compile-time root that reads no function
+value ("Compile-Time Evaluation Under `.lss`"). This split follows the
+selected strategy, never a failed specialization attempt.
 
 #### Demand-Driven Compile-Time Specialization
 
 Compile-time evaluation runs the compile-time roots, and the literal roots
-that specializations register. Checking already gave every literal whose
-conversion is closed a compile-time root of its own, so a runtime body
+that specializations register. Under `.lss`, the `.boxy` evaluator has
+completed every compile-time root that reads no function value before the
+Solved program is specialized ("Compile-Time Evaluation Under `.lss`").
+Checking already gave every literal whose
+conversion is closed a compile-time root of its own, and every literal whose
+conversion depends on its instance a `literal_argument` root at each closed
+type a checked instantiation fixes it to ("Literal Arguments"), which every
+compilation evaluates and stores in its module. A runtime body therefore
 matters to compile-time evaluation only where specializing it registers a
-literal root: a conversion that depends on its instance, a custom
-interpolation, or a conversion root no evaluation requests. Specializing the
-rest of the runtime program, or lowering any of it for execution, is runtime
-work, and compile-time evaluation without an LSS runtime consumer to
-continue its program does none of it. Its program roots are *discovery
-roots*, specialized only to find those literal roots.
+literal root: a conversion that depends on its instance at an instantiation
+checking records no edge for (a program root's, a platform's call of the
+app's procedure, a method dispatch selects by type, a stored function value,
+a target derived from a function's type), a custom interpolation, or a
+conversion root no evaluation requests. A specialization that converts a
+literal at the closed type of a stored `literal_argument` root restores that
+root's value instead of registering a literal root. Specializing the rest of
+the runtime program, or lowering any of it for execution, is runtime work,
+and compile-time evaluation without an LSS runtime consumer to continue its
+program does none of it. Its program roots are *discovery roots*,
+specialized only to find those literal roots. A warm compilation of
+unchanged modules therefore specializes nothing to convert their literals:
+their roots' values, `literal_argument` roots' among them, come from the
+checked-module cache under either strategy.
 
 Which bodies can register a literal root is decided from explicit checked
 data (`postcheck.LiteralDemand`), per checked procedure template. The
 analysis is a graph over templates, the checked types their bodies use,
 nominal types, and the builtin types, with each node carrying flags for what
-it can contribute to a literal root. A template's own flags are *strict*
-when its body has a custom interpolation, or a literal whose conversion root
-no evaluation of this compilation requests and whose payload is not stored,
-or a read of a constant that is neither stored nor evaluated (its
-computation lowers in place); *dependent numeral* (*quote*) when its body has
-a numeral (quote) whose conversion depends on its instance. A nominal's own
-flags are *custom numeral* (*quote*) when it has a `from_numeral`
-(`from_quote`) method of its own. A template reaches the templates its
+it can contribute to a literal root. A literal whose conversion depends on
+its instance is a literal requirement of its own scheme (its template's, or
+a generalized local function's), and contributes nothing through the
+references and plans that instantiate that scheme: those are the
+instantiations checking records, each of which converts it in a
+`literal_argument` root or forwards it to the instantiating scheme's literal
+requirements. A template's own flags are *strict* when its body has a custom
+interpolation that is not such a requirement, or a literal whose conversion
+root no evaluation of this compilation requests and whose payload is not
+stored; *dependent numeral* (*quote*) when its body has a numeral (quote)
+whose conversion depends on its instance and that is not such a
+requirement. An instantiation checking records no edge for contributes the
+dependent kinds of the instantiated template's literal requirements (an
+interpolation's is *strict*): a program root's to the root's flags, a
+platform requirement's use of the app's procedure to the using template's,
+and a method a nominal or the builtin types reach by name to that type's. A
+nominal's own flags are *custom numeral* (*quote*) when it has a
+`from_numeral` (`from_quote`) method of its own. A template reaches the templates its
 resolved value references and its direct dispatch plans (with their nested
-evidence) select, and the types of its signature, references, and plans. A
+evidence) select, the entry templates of the constants it reads whose
+values are neither stored nor evaluated (a read lowers their computation in
+place), and the types of its signature, references, and plans. A
 type reaches its component types and the nominals it names. A nominal, and
 the builtin types, reach the procedures of their methods whose names
 dispatch can select by type rather than by an explicit plan: names of
@@ -2127,12 +2439,14 @@ discovery request otherwise.
 Literal roots registered in discovery bodies are evaluated exactly as before,
 so `roc check` reports every rejected or crashing conversion a build reports.
 
-An LSS runtime consumer needs its own runtime bodies specialized and continues
-the evaluation's program. An application build names its entrypoints as runtime
-roots; tests discovered in its modules are compile-time discovery roots. These test bodies
-must still validate specialization-dependent literals and replay compile-time
+An LSS runtime consumer needs its own runtime bodies specialized. An
+application build names its entrypoints as runtime roots; tests discovered in
+its modules are compile-time discovery roots. These test bodies must still
+validate specialization-dependent literals and replay compile-time
 observations, but do not become runtime demand merely because an unrelated
-application entrypoint has a runtime consumer. Its compile-time consumer lowers and evaluates the
+application entrypoint has a runtime consumer, so a runtime consumer never
+continues a specialization that kept a discovery root (see "Runtime Programs
+Read Stored Values"). Its compile-time consumer lowers and evaluates the
 same compile-time and literal roots.
 
 `--timings` reports these decisions under "Demand-driven specialization":
@@ -2291,12 +2605,17 @@ and its demanded pending roots evaluate against the same checked module data
 through the same declared root functions an uncached compilation uses.
 Afterwards every requested root still pending is `unevaluated` again, and the
 module is written to the checked module cache again only when this
-compilation evaluated a root it lacked. A module is cached only when checking
-and evaluation add no reports beyond those present before checked-cache lookup.
-Earlier parsing and canonicalization reports are reproduced before that lookup,
-so they do not prevent reuse and are not emitted again by the checked module data.
-An entry therefore never holds a new checking or evaluation diagnostic that a
-later compilation's evaluation could contradict.
+compilation evaluated a root it lacked. A checked entry holds the reports its
+module's checking and evaluation produced ("Cache Boundary"), and a reopened
+module continues from them: its evaluation starts from the entry's problems,
+already reported, with the imports and display names a cold evaluation renders
+with, so the reports it adds and the entry it writes again are those of one
+uninterrupted evaluation. An entry holds evaluation reports only when no
+requested root is unevaluated under any specialization strategy, so no later
+compilation reopens it and adds evaluation reports after stored ones in an order
+one evaluation would not produce. Earlier parsing and canonicalization reports
+are reproduced by their own caches before checked-cache lookup and are not part
+of the checked entry.
 
 Every command reports the compile-time failures of every root, including
 those a cache entry left unevaluated.
@@ -2305,6 +2624,11 @@ those a cache entry left unevaluated.
 
 Root eligibility consumes the checked producer's types and fixed-callable
 result. It does not mutate solved types or invent evidence from a use site.
+An ineligible callable root remains an instantiation template: its pending
+payload is not a promise of a stored value. Boxy instantiates its declared
+wrapper at each use's type arguments, including open result rows. An eligible
+pending root instead requires its compile-time producer; runtime lowering
+must never compute that missing value.
 Within each immutable root-output batch, concreteness and reachable
 callable-slot queries reuse completed graph proofs. Concreteness keys include
 whether a node is a value type or a nominal declaration's backing template:
@@ -2359,7 +2683,8 @@ the environment, checking metadata and finalized CheckedModule once to one priva
 file, then closes and atomically installs it. It never stages an environment
 for later rereading or copying. Failed writes leave only private staging data.
 One finalized snapshot is retained, not an implementation history. Only
-entries whose checking and evaluation add no diagnostics are stored. No
+entries whose checking and evaluation reports satisfy the replay contract
+("Cache Boundary") are stored. No
 source-location pointer selects an older module
 for transplantation, and no per-program literal bundle or root-validation
 certificate is persisted under a source placement.
@@ -2522,6 +2847,25 @@ arguments, which the prologue writes, and locals in deferred string-match
 captures, which the backend materializes outside the statements that access
 them, keep their activation lifetime.
 
+A speed build marks two kinds of procedure `alwaysinline`: a wrapper, a
+loop-free body of a few statements of its own, and a leaf, a moderate body
+that calls nothing. A leaf is judged by the body LLVM emits for it, with its
+always-inline callees expanded: it calls nothing only when every procedure it
+calls is always-inline and calls nothing itself, and its size counts a copy
+of each such callee at each of its call sites, so the leaf budget bounds what
+every call site of a leaf duplicates. A helper is therefore a leaf whether
+SpecConstr inlined its callees into it or the backend does; a builtin like
+`dict_insert_new_data`, whose shift-up loop SpecConstr leaves a call because
+no known value crosses it, still expands completely into `Dict.insert`. A
+procedure on a cycle of direct calls keeps a call however much is expanded,
+so it is never a leaf.
+
+Application entry procedures, identified by the backend's explicit entrypoint
+list, do not gain mandatory inlining through transitive leaf expansion. Their
+ABI-wrapper caller can inline them after simplification; forcing them in early
+can retain redundant computations. The original wrapper and direct-leaf rules,
+and transitive inlining of ordinary helpers, are unchanged.
+
 The always-inline selection of wrappers and leaves is a speed-build policy.
 A size build (`--opt=size`) selects nothing: every function the module
 defines, including the linked builtins and the private runtime, carries
@@ -2529,6 +2873,30 @@ LLVM's `optsize` and `minsize` and no `inlinehint`, so LLVM's size cost model
 is the one measure of every inlining decision, exactly as it is for a C or
 Zig module built for minimum size. The pinned leaf builtins keep
 `alwaysinline` in every mode.
+
+There are two string joins with one meaning. `str_concat` is the join a
+program spells (`Str.concat`); its LLVM wrapper carries the small-into-small
+fast path and is pinned, because a spelled join is usually one of a few and
+its operands are often small. `str_append` is the join generated renderings
+use (`Str.inspect`, `dbg`, and `expect` reports); its wrapper is only the
+call into the shared out-of-line concatenation and is not pinned, because a
+rendering has one join per piece and its accumulator stops being small after
+its first pieces, so at those sites the pinned path is a copy that never
+pays. The cost it avoids is the dominant compile cost of a program that
+renders many types: a pinned copy nets about 43 LLVM instructions after
+simplification, and a program with 22,958 rendering joins in one procedure
+(roc-pg's rebellion example) spends 73% of that procedure's 1.36M
+post-optimization instructions, about 1T of its 2.2T compile instructions,
+about 5 GB of its 8.6 GB peak memory, and 4 MB of its 17.4 MB binary on them.
+Both joins have the same result, the same ownership effect
+(`runtimeUniqueness` of the accumulator), the same backend entry through
+`LowLevelBuiltins.strOp`, and the same handling in every LIR pass; the
+string-append fusion (`src/lir/str_append.zig`, origin `str_append_fuse`)
+fuses a call followed by either join and keeps each join as it was: the
+variant joins onto the caller's accumulator with the consumer's join and
+keeps the source's own join where it folds a direct join return. A spelled
+`Str.concat` is never lowered as `str_append`, and generated renderings never
+use `str_concat`.
 
 LLVM call sites do not acquire `alwaysinline` from loop nesting. Nesting depth
 does not establish execution frequency or bound the combined body of a caller
@@ -3356,6 +3724,20 @@ canonicalization output explicit, keeps diagnostics in `Can`, and keeps release
 builds fast: the work runs once per source suffix or type declaration, with no
 runtime cost in the compiled program.
 
+### Reserved Module Names
+
+Every auto-imported builtin type name (`Bool`, `Str`, `List`, `U8`, and the
+rest of the builtin auto-import table) is a reserved module name, so a
+qualified name such as `Bool.not` or an `import Bool` always means the builtin.
+`canonicalizeFile` reports a single file-level `module_name_reserved` error for
+any importable module (type module, `module`-header module, or hosted module)
+named after one. The reserved set is exactly the builtin auto-import table;
+there is no second list. The Builtin module auto-imports nothing and is exempt.
+Because the error already explains the name, the module's own type of that
+name does not also report `builtin_type_shadowed_warning`. Qualified lookup
+and platform hosted resolution consult the builtin auto-import table before
+user imports; that order is correct only because these names are reserved.
+
 ### Control Flow and Var Writes Inside `expect`
 
 An `expect` body must never move control flow outside the `expect`. Optimized
@@ -3589,9 +3971,10 @@ relation.
 A scrutinee that always crashes (`...`, `crash`, or a block or `if` whose
 every result crashes) relates no branch pattern at all: no value ever reaches
 a branch, so no pattern is observed at runtime and the patterns are not
-required to agree with each other. Monotype consumes the scrutinee's checked
-divergence and lowers any match whose scrutinee diverges as the scrutinee's
-divergence alone; it never instantiates or relates the branch patterns. The
+required to agree with each other. Monotype and Boxy consume the scrutinee's
+checked divergence and lower any match whose scrutinee diverges as the
+scrutinee's divergence alone; neither instantiates or relates the branch
+patterns, nor builds a decision tree over them. The
 scrutinee lowers at its own type, exactly like a discarded divergent
 statement, followed by an unreachable continuation at the match's type: a
 scrutinee that diverges in its condition, such as an `if` whose condition is
@@ -4078,9 +4461,10 @@ same holds for an import that a package header narrows to one declaration:
 that declaration is the whole of what the import reaches. An import of a module
 itself reaches that module's own exposed names.
 
-A nominal construction or nominal pattern names its type through the import it
-was written with, so a declaration reachable only by following an alias out of
-that module is not one those positions can name. Values through an alias
+A nominal construction or nominal pattern resolves its type by the same walk;
+a declaration it reaches by following an alias out of the import is named by
+content identity, and an alias it reaches is resolved to its nominal type by
+checking (Nominal Construction Through Aliases). Values through an alias
 (`Gui.Files.pick_directory!`, `Gui.Files.Dir.value`) resolve by the same walk.
 An alias to a module's whole namespace is not a thing the language has; the
 walk only ever passes through type declarations.
@@ -4144,8 +4528,9 @@ no field that could express one, so an entry stays valid when any other module
 changes and is shared by identical modules in different packages, directories,
 or workspaces.
 
-An entry holds two bodies behind one header (magic, entry-version hash, the
-key, and both body lengths):
+Inside the file's length framing, an entry holds two bodies behind one header
+(magic, entry-version hash, the key, and both body lengths, which locate the
+bodies and are bounds-checked):
 
 - the serialized `ModuleEnv` exactly as canonicalization left it, which carries
   its diagnostics, import store, deferred import worklist, file-dependency
@@ -4155,8 +4540,11 @@ key, and both body lengths):
   renders from, plus the parser's own import inventory (each local import's
   spelling, base, and parent count, and each package-qualified import name).
   The parse stage produces these source-local records in the AST rather than in
-  the env, and a hit has no AST, so they are encoded explicitly, field by
-  field, and decoded the same way. Nothing is re-parsed to recover them.
+  the env, and a hit has no AST, so they are stored as an extern header over
+  lists of fixed-size records and one name-byte list, read in place after their
+  bounds are checked; each record's enum values and name ranges are checked as
+  it is read, and any failure is a miss. Nothing is re-parsed to recover them.
+  The env body is padded to 16 bytes so the record starts aligned.
 
 Location-dependent import normalization is deliberately absent from an entry:
 an import's package-root-relative module name depends on the importing module's
@@ -4165,17 +4553,20 @@ is a canonicalization input. The parse task normalizes the record's spellings
 against its own task inputs on a hit exactly as it does on a miss.
 
 The parse task probes this cache after reading the source and before parsing. A
-hit loads the env into fully owned, growable storage (every store copied, the
-identifier interner and module-identity table reopened for insertion, the
-string-literal builder rebuilt from the loaded store's own entries, and the node
-store given its scratch) because the drain patches nodes in place and appends
-nodes, diagnostics, identifiers, string literals, method rows, and module
-identities, and checking then grows types and regions. A hit then reads the
-module's file imports and renders both the parse-stage and canonicalization
-reports, and the coordinator handles it as a parse result followed by a
-canonicalized result, through the same two steps a miss takes. A miss parses,
-canonicalizes, and stores the entry before the env leaves the canonicalize task.
-A corrupt, truncated, stale, or misaligned entry is a miss.
+hit first reads the parse-stage record, renders its reports (a diagnostic's
+report reads only the source and the line starts of the env's common store,
+which alone is validated for it), and delivers them with the discovered imports
+as a `cached_parse` result. It then loads the env in place with a writable type
+store ("Loading environments in place"); the drain patches nodes in place and
+appends nodes, diagnostics, identifiers, string literals, method rows, and
+module identities, and checking then grows types and regions, each list copying
+itself on its first growth. The env takes the entry over as its
+`loaded_entry`. A hit then reads the module's file imports and renders the
+canonicalization reports in a `canonicalized_cached` result. The coordinator
+handles the two results as a parse result followed by a canonicalized result,
+through the same two steps a miss takes. A miss parses, canonicalizes, and
+stores the entry before the env leaves the canonicalize task. A corrupt,
+truncated, stale, or misaligned entry is a miss.
 
 Cache state never changes compiler output: a warm, cold, or disabled
 canonicalized cache yields identical diagnostics, identical checked data, and
@@ -4185,9 +4576,13 @@ The checked-module cache is unchanged in role: it stores the fully checked
 module after the drain, keyed by content identity and the direct imports'
 checked-module cache keys, and is probed once the direct imports are complete. A
 checked hit makes the drain unnecessary; a canonicalized hit makes parsing
-unnecessary. A checked hit installs the entry's env with the package-qualified
-display identity of the module being installed, exactly as a canonicalized
-result does.
+unnecessary. A checked hit loads the entry's env with the same in-place loader
+and a sealed type store, relocates the checked artifact in place beside it, and
+installs the env, which owns the entry, with the package-qualified display
+identity of the module being installed, exactly as a canonicalized result does.
+A typing restore loads the env of an entry whose typing inputs match with a
+writable type store, takes the entry over from the checking context, and seals
+the store once the reused typing is installed.
 
 A module's file imports are part of its source-input identity. They are read
 in the canonicalize task, after the canonicalized-cache entry is stored and
@@ -4199,7 +4594,9 @@ complete by the time the checked cache is probed.
 A successful parse also writes a small source import inventory, keyed by
 normalized source bytes within the compiler compatibility namespace. It holds
 parser-produced local import spellings, bases and parent counts, qualified
-imports, and public-name-to-source-module mappings. Syntax errors never produce
+imports, and public-name-to-source-module mappings, stored like the
+parse-stage record: an extern header over lists of fixed-size records and one
+name-byte list, read in place after bounds checks. Syntax errors never produce
 a reusable inventory. The inventory contains no filesystem paths or checked
 state. Graph tools consume this same parser output; a missing or corrupt
 optional record causes a fresh parse, never a guess about imports.
@@ -4224,8 +4621,9 @@ whitespace-only lines and lines whose first non-whitespace byte is `#`.
 
 ### Coordinator phases
 
-`Parse` (probe the canonicalized cache; on a hit load the env, read the file
-imports, and skip straight to the canonicalized result; on a miss parse) →
+`Parse` (probe the canonicalized cache; on a hit deliver the parse stage, load
+the env, read the file imports, and skip straight to the canonicalized result;
+on a miss parse) →
 canonicalization (enqueued as soon as the parse result is handled, never
 waiting on an import; canonicalize, store the entry, then read the file imports
 before the module leaves the task) → `WaitingOnImports` (canonicalized, waiting
@@ -4237,6 +4635,23 @@ identity is recorded on the env when the canonicalized result is handled,
 before the hosted transform, on a cache hit exactly as on a miss, and again on
 the env a checked-cache hit installs.
 
+A canonicalized hit delivers its parse stage as its own `cached_parse` result
+before it loads the env, so the coordinator registers the module's imports, and
+schedules their parses, while the env is still loading. The coordinator handles
+that result exactly like a parse result's reports and imports, and the task's
+own result follows it: a worker sends both through the result channel in order,
+counting the extra one in `inflight`, and a task run on the coordinating thread
+queues the early result for `handleResult`, which handles it first. Each
+module's imports are therefore registered once, and its reports keep the order
+a miss gives them (parse-stage reports, then import-registration reports, then
+canonicalization reports), whatever the cache state. A module that
+registration, or anything after it, finished is left finished when the task's
+own result arrives. When the env cannot be loaded after its parse stage was
+delivered, the module is parsed after all and its parse result is marked as
+already delivered: its reports and imports, which come from the same source
+bytes as the record, are not taken a second time (debug builds check that they
+match).
+
 ## Cache Boundary
 
 Every cache entry is keyed by the content hash of its inputs: the module's
@@ -4247,43 +4662,69 @@ literal-values file and no discovery manifest.
 
 A checked entry holds exactly the live data of the checked module ("The Live
 Checked Module"): the serialized `ModuleEnv` including the sealed solver
-store, the inference output, and the evaluation output. Derived data (type-content
+store, the inference output, and the evaluation output, together with the
+reports the module's checking and evaluation produced. Derived data (type-content
 type keys, evidence, synthesized templates, demand vectors, layouts) are never
 cached; after a hit, each is recomputed on its first demand through its slot
 ("On-Demand Analyses And Write-Once Slots"). An entry is written only when a
 cache is enabled; a `--no-cache` build serializes nothing.
 
 A platform/app pairing entry is keyed by the content hashes of the platform's
-and the app's checked entries. It holds only the pairing's evaluation output:
-the completed app-dependent evaluation results and their recorded debug
-observations. It never holds bodies, types, templates, source environments or a
-live checker continuation, because a pairing rewrites none of those. Only a
-completed pairing without new checking or evaluation diagnostics may be
-cached; already-replayed earlier-stage reports do not prevent caching. A hit
-consumes its stored outcomes and replays its recorded debug observations without
-evaluation.
+and the app's checked entries. It holds the pairing-owned changed columns,
+completed app-dependent evaluation results, recorded debug observations,
+and reports. Unchanged checked columns and source environments remain owned
+by the platform; the entry contains no live checker continuation. Only a completed pairing may be
+cached, under the same report rule as a checked module below. A hit consumes
+its stored outcomes, reports its stored reports and replays its recorded debug
+observations without evaluation.
 The canonicalized module cache is a separate, non-checked boundary; the rules
 below bind the checked module and pairing caches.
 Checked module cache entries are trusted compiler-produced data, not adversarial
 inputs. Payload-integrity checksums and recursive payload-validation scans are
-forbidden. File completeness is checked by comparing the lengths recorded in the
-header against the loaded byte slice's length, without an additional file-length
-syscall. Do not scan payloads to defend against malicious input, arbitrary
-malformed data or bit flips. Header identity, version and lengths establish which
-producer data to consume. Cache writers stage complete files and atomically
+forbidden. File completeness is the file's recorded lengths compared with the
+loaded byte slice's length ("Cache storage"), without an additional file-length
+syscall; header body lengths are bounds-checked to slice the bodies safely, not
+summed against the file. Do not scan payloads to defend against malicious input,
+arbitrary malformed data or bit flips. Header identity, version and lengths
+establish which producer data to consume. Cache writers stage complete files and atomically
 renames them. Content hashes identifying compilation inputs are separate from
 integrity verification. A cache hit never reruns checked validation, reselects
 hoisted roots, reconstructs checked data or walks expressions to prove cached
 output complete. Correctness belongs to the producer; invalidation belongs to
 the source/import key and explicit format versions.
 
-The coordinator captures each module's report count immediately before checked
-cache lookup, after parsing and canonicalization reports have been appended.
-Checking (including the deferred import drain) and evaluation only append to
-that same report list. `BuildEnv` moves those reports into its output sink only
-after finalization or when aborting. The cache write requires that the count
-has not changed, that evaluation has completed and, for a reopened cache
-entry, that this compilation completed roots the entry lacked. The write
+Checking records its problems in the checker's problem store and evaluation
+appends its own to the same store. An entry stores them as `CheckedReports`:
+every problem with the store's strings, the count of checking's, the snapshots
+and regions checking's problems render with (copied out of the checker before
+it is released), and the checker's import display names. The snapshots keep
+their frozen captures and node formats beside the text the miss rendered, so a
+snapshot whose text was never rendered renders on demand with the module's
+names, the stored import display names and the module's default sources, the
+same context the checker's type writer used. A hit reports, after
+parsing and canonicalization reports and before anything else is appended,
+the diagnostics import resolution recorded on the env beyond canonicalization's,
+then checking's problems and evaluation's, rendered by the same report
+builders a miss uses against the current filename, source, imports and
+platform. A warm build therefore prints the same reports in the same order, with
+the same exit code, as a cold one. A module with type errors is checked,
+evaluated, stored and reused like any other module: its errors are reports, its
+roots that reach code checking rejected are failed roots, and its importers
+check against the same checked module data whether it was loaded or checked. `BuildEnv`
+moves the reports into its output sink only after finalization or when
+aborting.
+
+Some evaluation problems are ones an entry cannot reproduce: a literal's
+rejection reported at the literal or a literal root's failure, which the
+program's literal roots decide again in every compilation; an empirical exhaustiveness failure another
+module's root reached; and a failure located in another module that is named by
+that module's package-qualified name, which is workspace information rather
+than part of the entry's identity. Evaluation marks the problem store it
+reports such a problem to (`problem.Store.unreproducible_reports`).
+The cache write requires that evaluation has completed, that the store has no
+such problem, that an entry with evaluation reports has no requested root
+unevaluated under any strategy, and, for a reopened cache entry, that this
+compilation completed roots the entry lacked. The write
 serializes the live `ModuleEnv` with its sealed solver store, which stays
 alive for every consumer of the module either way; serializing never releases
 or replaces it. A failed write is an ordinary cache-write failure: the
@@ -4457,11 +4898,11 @@ Checked-module cache writes stream the header and the relocatable bodies (the
 output) to a private staging file, then atomically rename it. They never gather
 another full-entry heap buffer. Each body starts at a 16-byte-aligned entry
 offset, so a cache hit relocates every body in place inside the entry's
-private mapping, which the installed module's environment storage owns. A failed write or rename removes the staging file
+private mapping, which the installed module's environment owns. A failed write or rename removes the staging file
 and records a cache-write failure; partial data never becomes a cache entry.
 
 Serialization never writes spare capacity. A `SafeMultiList` persists its live
-rows as `std.MultiArrayList`'s own column layout with capacity equal to length, so
+rows as columns in descending alignment, each exactly as long as the list, so
 both the blob's contents and its size depend on what the list holds and not on how
 it was grown. There is one column-writing implementation behind every
 `SafeMultiList` serialization entry point, so no two entry points can drift into
@@ -4673,7 +5114,9 @@ the owning relation and its error report.
 The checker records scheme-ness as explicit binding metadata at each
 generalization boundary. After rank adjustment, it walks the binding's type
 interface once and classifies the binding as a scheme exactly when a reachable
-variable was promoted to generalized rank. This producer-side classification
+variable was promoted to generalized rank. The same walk records a binding
+that is no scheme but whose type reaches anonymous structure copied per use
+(Anonymous Structure Is Copied Per Use, below). This producer-side classification
 is necessary because generalization is per variable: a partially generalized
 scheme can have a monomorphic structural root and quantified descendants. Root
 rank is therefore not a valid proxy for whether a binding is a scheme. The walk
@@ -4708,8 +5151,11 @@ typed like any other use; which instantiations a recursion may make is decided
 once the module's types are settled (Polymorphic Recursion). The same rule
 applies to
 block-local `s_decl` functions: each local function decl is a binding group
-of one with its own rank frame, and annotated (type-var-free) locals
-pre-declare their scheme. An unannotated local's lambda stays in that frame
+of one with its own rank frame, and annotated locals pre-declare their
+scheme. A type variable a local annotation looks up from an enclosing
+annotation belongs to the enclosing definition: the local's scheme shares it
+rather than quantifying it, so only the local's own variables can differ
+between its recursive uses. An unannotated local's lambda stays in that frame
 like a group member's; the frame's boundary unifies the pattern with the
 RHS, re-runs dispatch for receivers that unification pinned (an accumulator
 the recursive call passes as `[]`), and only then generalizes, so
@@ -4852,7 +5298,11 @@ quantified variables (the scheme-use pairs). Inside another generic
 definition those types are written over that definition's own variables, so
 the records are a graph over type variables: variable `u` flows into variable
 `v` when some use gave `v` a type that mentions `u`. The flow *grows* when
-that type is more than `u` itself. A strongly connected component of the
+that type is more than `u` itself. A body-local type's application lists its
+context variables as trailing arguments (Body-Local Type Context), so a type
+mentions them like any other argument: a recursive use at a local type whose
+methods read the recursion's `a` grows exactly as a use at `Local(a)` would.
+A strongly connected component of the
 graph that contains a flow is a recursion, and it is rejected when
 
 - a flow inside it grows, or
@@ -4884,6 +5334,164 @@ for any other rejected use; the definitions keep their schemes. Imported
 definitions take no part: a module's uses of an imported scheme give its
 variables types over the module's own variables, never the reverse, so no
 cycle passes through another module.
+
+### Anonymous Structure Is Copied Per Use
+
+A use of a binding can lift anonymous structure in the binding's type into a
+nominal type whose backing matches: given `make : U64 -> { count : U64 }` and
+`Counter := { count : U64 }`, the use `lifted : Counter = make(1)` relates
+the call's record to `Counter`, and unification rewrites the record's class
+to `Counter`. That rewrite belongs to the use. If the use shared the record
+with the binding's type, the lift would change `make` itself and every other
+use with it, and `plain = make(2)` would gain `Counter`'s methods. So each
+use owns its own copy of every anonymous record and tag union (empty ones
+included) that the binding's scope made, even when no variable in it is
+quantified, exactly as it owns copies of the quantified variables.
+
+The rule is carried as explicit descriptor data, not by rank: such a class is
+monomorphic, so marking it generalized would make every body-local record of
+the scope look polymorphic to post-check stages. Instead, when a
+generalization boundary leaves a class it made ungeneralized and some use can
+change the class (`UseAbsorbers.copiedPerUse`), it marks the class
+`DescriptorFlags.per_use_structure`, and the rank stays what rank adjustment
+computed. Only a record, tag union, empty record, or empty tag union not
+written in an opened nominal backing (`Descriptor.liftsIntoNominal`) can be
+changed by a use, and only in these ways:
+
+- A use lifts an anonymous tag union into a nominal type only when the
+  declaration's backing is a tag union whose row is open or lists every tag
+  the anonymous union itself lists, which is exactly what relating the two
+  checks before it lifts.
+- A use lifts an anonymous record into a nominal type only when the
+  declaration's backing is a record whose row is open or lists every field
+  of the anonymous record it cannot absorb. A backing absorbs only an
+  optional or defaulted field, and a field whose kind is still unsettled
+  becomes one only by relating to a widening field of its name.
+- A use widens a record with an optional or defaulted field the record does
+  not hold. That field's name was written in some module, as a `?:` or
+  defaulted field of an annotation, a `.?` access, or an unset.
+- A declaration that is one of its own type variables, or that is invalid
+  (relating to which poisons the structure), can take in anything.
+
+So a structure is marked only when something the module's checking can see
+could change it. A tag union is marked when some visible declaration could
+take it in: an open tag-union backing row, a closed one listing all of the
+union's own tags, or, for an empty union, any tag-union backing. A record is
+marked when some visible declaration could take it in by the same rule over
+the fields it cannot absorb, or when some visible widening field name is
+not among its own fields. A structure nothing visible could change keeps the
+same type under every relation, so every use shares it. Only a class's own
+tags or fields are counted; a tag or field further along its row only rules
+out a lift or a widening, so leaving it out can only mark more.
+
+What a module's checking can see is collected before any binding generalizes
+(`Check.use_absorbers`). From each module the check copies types from
+(Builtin, its imports, the owners of what it imports, and a platform's
+requirement surface) it is every declaration in that module's type store,
+less the opaque ones, into which another module cannot lift, and the name of
+every optional or defaulted field of a record in that store: a field name
+written in one module reaches another only through the type stores it copies
+types from. Sealing a checked store lists those names
+(`Store.widening_names`), so a module reads each source's list rather than
+walking its records. From the module itself it is read from its syntax, since checking
+registers a declaration or an optional field only as it reaches it: every
+nominal declaration's backing, and every field name written as optional or
+defaulted in an annotation, accessed with `.?`, or unset. A backing written
+as a tag union or record is the only one of the module's own that can take
+in anonymous structure: an application or a lookup is checked as the alias or
+nominal type it names, and relating structure to a nominal type whose
+backing is not the same kind of structure never lifts. Names are compared by
+a hash of their text, as they come from several modules; a collision can
+only mark a structure that did not need it. Debug builds assert that every
+module a check copies types from was collected, that every declaration the
+module registered admits no lift its syntax did not record, and that every
+optional or defaulted field of a record in the module's store is a collected
+widening field. A class an enclosing scope made keeps its sharing:
+a weak binding's one type is still shared by every use, and a function
+returning it returns that same class. A merge keeps the mark only when both
+sides had it, so a class that joins an enclosing scope's class is shared like
+that class.
+
+Binding classification records a binding whose type reaches a marked class
+(`Check.typeCopiedPerUse`). A binding that also reaches a quantified variable
+is a scheme; one that does not stays monomorphic, in
+`Check.per_use_copy_bindings`. Instantiation copies each marked class and
+every monomorphic node from which one is reachable, by the same reachability
+walk that reaches quantified variables, and gives the copy no mark; the copy
+is a new class at its use's rank. A scheme with a marked class therefore
+always walks its reachability. A monomorphic binding's copy quantifies
+nothing, so its uses record no scheme-use evidence, it carries no codec
+requirement, and post-check stages give it no dispatch scope of its own: a
+local function such as `g = |{}| Json.to_str(W.(r))` inside `|r| ...` reads
+the enclosing function's evidence for `r` exactly as if each use shared its
+type. Imported checked types are
+generalized templates whose nodes every use copies, so the mark needs no
+cross-module form; an exporting module's own lifts stay out of its exported
+types by the same rule.
+
+A use's copy can then differ from the binding's own structure in more than
+a lift. A closed record relates to a record that lists more fields when every
+extra field is optional and omitted, which widens the closed row, so two uses
+of `make = |value| { a: value }` can relate its result to
+`{ a ?: U8, b ?: U8 }` and to `{ a ?: U8, b ?: Str }`. Monotype specializes
+`make` at each use's type. Boxy lowers one worker for the template, whose
+result record holds no slot for `b`, so it treats two closed records of one
+value with different field counts like records stored in different orders
+(`Builder.storageDifference`) and rebuilds the call's result at the use's
+type by descriptors.
+
+Annotation instances follow the same rule. An annotation's instance of a
+type declaration is shared by later references at the same position only
+when it is ground and free of structure a use can change, by the same test;
+only such subtrees of a non-ground instance are shared with the next
+instance. Otherwise one
+definition's body, lifting its annotated result into a nominal type, would
+change every other annotation naming the same alias.
+
+The cost is one copy per use of a binding's anonymous records and of the tag
+unions a visible declaration could take in, with their field and tag runs,
+and of the nodes above them.
+The accepted and rejected sides are pinned by
+`test/cli/LiftedUseLeavesOtherUses.roc`,
+`test/cli/LiftedUseLeavesOtherUsesRejected.roc`,
+`test/cli/OptionalFieldsPerUse.roc`,
+`test/cli/issue_12482_encoder_for_in_nested_function.roc`,
+`test/cli/lifted_use_leaves_other_uses/`, and
+`src/check/test/per_use_structure_test.zig`, which pins which tag unions and
+records are copied and which are shared.
+
+### Scheme Relations Through Unrooted Variables
+
+A generalized function-body binding can quantify a variable its type never
+mentions. In
+
+```roc
+f = |r| {
+    h = |_n| {
+        g = |s| r.to_str().concat(s)
+        g(".")
+    }
+    h(1.U8)
+}
+```
+
+`g`'s requirement on the result of `r.to_str()` takes `s`, and `h`'s use of
+`g` copies that requirement with a fresh `s`, the type of `"."`. `r`'s method
+is the enclosing function's, so the relation is an explicit requirement of
+`h`'s scheme, and `h` quantifies the fresh `s`: each use of `h` copies the
+requirement again, relating its own copy of that type to `r`'s method. `h`'s
+type reaches none of it.
+
+When the closing boundary drops `h`'s checker-only scheme, it records each
+such requirement, one whose callable reaches a quantified variable the scheme's
+type and the constraints on it do not, on the binding scheme
+(`ModuleEnv.BindingSchemeCodecRequirement`, beside the generated-codec
+relations). The evidence pass walks that callable, so the variable's
+own requirements, `from_quote` here, become parameters of `h`'s scope, and each
+use's scheme-use substitution supplies them from the caller's copy. A
+requirement whose callable reaches only variables the type reaches is not
+recorded separately: evidence already finds them through the type.
+`test/cli/GeneralizedLocalReturnsEvidenceClosure.roc` pins the program above.
 
 ### Value Bindings Generalize By Expression
 
@@ -5189,7 +5797,11 @@ root is a solver variable. A post-check consumer that reads a direct
 dispatch's function type in its enclosing scope reads the edge's callable
 relation (`EvidenceTargetInstantiation`), a root the scope's own scheme
 variables appear in, never the specialized plan callable, whose variables no
-scope binds.
+scope binds. A type substitution matches its formals by variable identity,
+not by type id (`enterSubstitutingClone`): a literal requirement a nested
+generalized local forwards to its enclosing generalized local names the
+enclosing scheme's variable through a substitution clone of it, and the
+enclosing local's use edge must still substitute it.
 
 This is a checked-boundary rule, not merely a pipeline rule. Any checked
 module field outside `ConstStore` whose only purpose is to feed post-check
@@ -5351,9 +5963,16 @@ from the bound app procedure kind using the checked output rule;
 callable-evaluation bindings remain indirect unless they are exact procedure
 aliases, which forward (see "Procedure Aliases"). Exact procedure aliases whose
 required bindings are known through the pairing use the checked forwarding
-rule and require no compile-time evaluator. Completed independent roots are
+rule and require no compile-time evaluator. The pairing outputs and caches
+these forwarding proofs; it cannot borrow proofs made before the requirements
+were bound. Completed independent roots are
 read as stored values and never evaluated again. A pairing is never serialized
 into the platform's checked module.
+
+The pairing recomputes exact-alias forwarding after binding required values,
+before classifying calls or scheduling roots. That forwarding is a changed
+pairing column and survives a pairing-cache hit; borrowing the unbound
+platform's forwarding would incorrectly demand a computed callable.
 
 ### Type Content Keys
 
@@ -5382,6 +6001,13 @@ id) for resolution. The locator is valid for exactly as long as the entry that
 stores it, because that entry's content hash covers the referenced module.
 Resolving a type from its key alone (bump, glue) builds the owning module's
 key index on first demand, through the module's index slot.
+
+Within one module, representative type ids preserve variable identity and otherwise
+select the lowest source id, then the lowest synthesized id, with the same
+key. Each settled type remembers that answer atomically, so repeated lowering
+queries do not repeat key-index lookups. Pending synthesized graphs never
+record an answer. These process-local memos are not serialized and pairing
+stores own their synthesized memos independently.
 
 Type digests, type content keys, recursive layout keys, and derived callable
 and evidence digests use the shared `base.TypeDigestHasher`: SHA-256 over the
@@ -5488,14 +6114,14 @@ Generic allocator storage is not assumed to be zero. No bulk initialization,
 debug poisoning, slot destruction scan, huge-page advice or custom fault handler
 touches the mapping. Compile-time checks require the empty slot state to be
 encoded as zero and the atomic state representation to remain compatible.
-A slot's result is read only after its claimant writes it and publishes done.
+A slot's result is read only after its claimant writes it and stores `done` with release ordering.
 The identity array and key computation remain unchanged.
 
 Compiler-WASM selects a different storage backend at compile time: a directory
-of fixed 64-slot heap pages, each explicitly initialized before publication.
+of fixed 64-slot heap pages, each explicitly initialized before readers can access it.
 WASM linear memory and its recycling allocator do not provide independent,
 releasable OS mappings. Unsupported native hosts require an explicit backend.
-An allocation failure never changes backends. Storage publication completes
+An allocation failure never changes backends. Storage initialization completes
 before the request claims a key or locks the shared writer. Directory, page
 and key claims have distinct kinds where present. Slot addresses never move,
 and their owner releases storage only after all readers finish. Native mapping
@@ -5506,7 +6132,7 @@ from reserved virtual key bytes. Neither measures resident RAM. It counts
 successful key computations under the existing writer lock, incrementing only
 after the key writer succeeds. Key hits do no extra work, and tracing does not
 scan the native mapping. A concurrent snapshot can count a successful result
-before its slot publishes; quiescent counts equal completed keys. No key
+before its slot reaches `done`; quiescent counts equal completed keys. No key
 storage, diagnostic counter or derived result is serialized.
 
 There is no scheduling edge between modules. A module's analyses are never
@@ -5667,7 +6293,17 @@ inspecting solved type shape or by comparing the eventual runtime value kind.
 A procedure requirement's root evidence follows the complete scheme of its
 recorded app definition, including captured codec requirements. The copied
 platform requirement type supplies the solved interface, not the scheme's
-evidence identity. The pairing's root-request analysis validates a direct
+evidence identity. Once the binding's scheme is complete, checking records a
+source-free invocation with the ordinary scheme-use substitution and validates
+all of its copied requirements. The solved requirement and its identity slots
+name that instance. Checked output consumes the invocation's evidence. An attached
+codec parameter has a variable receiver, so its scheme has no uninstantiated
+root contract: a literal default is not a checked codec derivation. This rule
+also covers unused and aliased procedures, not just platform-bound definitions.
+Explicit composite codec requirements retain their private-validation verdict.
+This is one use, not a second body check or an output-time
+codec derivation. A monomorphic invocation with no evidence needs no record.
+The pairing's root-request analysis validates a direct
 procedure's root vector against the app template's parameter count. Monotype
 selects this root evidence before materializing an edge for a direct call,
 procedure value, or interface relation; downstream specialization receives
@@ -6027,6 +6663,14 @@ resolved. An undetermined field-kind cell remains specialization-owned even
 when its associated checked type cell is otherwise concrete, so it cannot make
 a compile-time root request eligible.
 
+A Boxy entry for such an ineligible root runs its expression under the
+worker's arguments. Only an eligible context-free root requires a completed
+stored representation before runtime lowering; request eligibility itself must
+already be decided by checking.
+An exact procedure alias likewise runs its checked forwarding lookup, not an
+evaluator. Module-unit wrapper emission consumes the recorded
+`CallableEvalTemplate.forwarded_lookup` decision for this case.
+
 A data root whose value contains a callable slot is context-free only when its
 producer fixes that callable graph with an explicit source annotation. A
 callable root itself also supplies producer-side callable evidence. An
@@ -6048,12 +6692,14 @@ enclosing function—no outer local, no outer rigid type variable, no local type
 declaration that names one—is a promoted local procedure. Checking decides
 promotion while it already walks the body: each `s_decl` of a lambda or
 closure is a candidate, every local lookup, rigid-variable use, and reference
-to a local type declaration naming an enclosing rigid variable records the
-candidate depths it crosses, and the greatest fixpoint over references between
-candidates removes every candidate that reaches a contextual one. A local type
-declaration names an enclosing rigid variable when its own annotation looks one
-up, other than its own parameters, or names another local declaration that
-does; any other local type declaration is context free. Naming a method of a
+to a local type declaration records the candidate depths it crosses, and the
+greatest fixpoint over references between candidates removes every candidate
+that reaches a contextual one. A reference to a local type declaration makes
+the candidates it crosses contextual, from the shallowest of the variables,
+when the declaration has a context ("Body-Local Type Context" below); its
+methods are checked after many references to it, so each reference records
+its candidates and they are marked once every context is final. A local type
+declaration with no context is context free. Naming a method of a
 local type through the type is a lookup of the method's binding, and a
 dispatch is a reference to the local procedure it selects: once targets
 settle, each lineage selecting one adds that reference for the candidates
@@ -6127,6 +6773,138 @@ whose only declaration context is type variables, or is rejected. No later
 stage meets a method that needs values of its declaration's frame: Boxy calls a
 local procedure a dispatch selects directly as its nested worker, and treats a
 method selection with runtime captures as an invariant failure.
+
+The checked method registry also determines how a local method declaration
+becomes a value. Its captures of other local procedures are immutable callable
+graph edges, reserved before following a recursive edge, rather than reads of
+declaration-order-dependent runtime binders. The graph retains its declaration
+instance, instantiated type inputs, and callable representation. This rule
+does not apply to ordinary closures, whose invocation-specific values remain
+runtime captures even when their code is identical.
+
+### Body-Local Type Context
+
+A type declared in a function body can depend on the type variables of the
+functions enclosing it: its annotation can name one (`Wrap := [Wrap(a)]`), and
+its methods can name one, in their annotations or bodies, directly or through
+the local procedures they refer to or dispatch to. Each instantiation of the
+enclosing function then gives the type different contents or different
+behavior, so the type's identity includes those variables: one declaration
+used at two instantiations is two types, exactly as if it had declared a
+parameter for each and every use applied it to the variable.
+
+Checking decides each such declaration's context from CIR
+before any type declaration is generated (`decideLocalTypeContexts`): the
+rigid type variables of enclosing functions it depends on, in source order.
+A declaration's parts are its annotation, its methods' annotations and
+right-hand sides, and, transitively, the annotations and right-hand sides of
+the local functions those refer to; methods never capture values (Methods
+Never Capture), so a local function is the only other binding a method can
+reach. Its context is each rigid variable its parts look up that none of
+them introduces (its own parameters, its methods' own variables, and those of
+the local functions they reach are introduced by its parts), and each
+variable of the context of a body-local type its parts name that none of
+them introduces, as a least fixpoint, so mutually referring types share their
+variables. A type variable alias in its parts (`Outer : a`, whose
+type-rooted calls go through `a`) counts as a lookup of the variable it
+aliases, which the alias names by that variable's own introducing
+annotation. A dispatch inside a
+method contributes nothing of its own: the value it dispatches on has a type
+whose application lists that type's own context.
+
+The context is part of every application in the checker's type store. A
+nominal declaration's formals are its header's variables followed by its
+context variables (`NominalDecl.formals`, the last `flags.context_len` of
+them), and its template application, built when the declaration is
+generated, lists the context variables themselves after its header's. An
+instance of a body-local declaration's template shares the context variables
+rather than copying them (`typeDeclTemplateContext`), so every application
+inside the body means the body's own variables, and an application inside the
+declaration's own backing lists them too. Opening an application's backing
+substitutes its trailing arguments for the context formals by variable, as it
+substitutes its declared arguments for the declared formals, and so does
+instantiating a method of the declaration for a dispatch on an application,
+a source dispatch or a generated codec's call of a format method alike
+(`receiverContext`): the method's scheme names the context variables as the
+enclosing functions' own, and its instance reads them as the receiver's
+context arguments. A method of a type an imported module declares in a
+function body is copied with the importing module's copy of the
+declaration's context formals in place of the context variables
+(`importedOwnerContextSubstitutions`), so its instance reads them as the
+receiver's context arguments the same way. A method whose signature does not name its type (a
+format's `encode_str : Str, s -> Try(s, e)`) is otherwise related to the
+receiver by nothing, so a fresh copy would make each derivation that
+instantiates it ask for a format no derivation in its chain matches. Instantiation
+and unification then treat context arguments like any other argument: an
+instantiation of the enclosing function's scheme substitutes its variables in
+every application of the type the scheme holds, including those in a
+requirement the scheme carries (a codec requirement naming a body-local
+format), and the generalizer ranks an application over all its arguments, so
+an application inside the body is no more general than the body's
+variables. Source types never write context arguments and printed types and
+diagnostics never show them (`Store.nominalDeclaredArgs`); arity checks and
+argument positions read the declared arguments, and a context argument is an
+invariant position. The escape rule (Body-Local Types Stay In Their Context)
+keeps a value of such a type inside the functions it depends on, so no
+diagnostic compares two applications that differ only in context arguments:
+a relation that fails there is the escape's consequence, and is withdrawn in
+favor of the escape's report.
+
+Once every body is checked, `finalizeLocalTypeContexts` makes each candidate
+enclosing a recorded reference to a type with a context contextual from the
+shallowest of its variables, and records the binding that owns each context
+variable of a nominal declaration (`local_type_context_owners`).
+
+Checked output reads the arguments as they are. A nominal use of such a
+declaration lists, after its own arguments, its context arguments, and its
+type identity key includes them; the resulting `CheckedNominalDeclaration` takes
+the same variables as formals after its declared ones (`context_len` of
+them). The declaration's backing names those variables directly, so binding
+the formals to a use's arguments substitutes them like any other formal.
+The backing walk binds each formal by its binder annotation, never by its
+name: in `Pair(a) := [Pair(Captured, a)]` inside a body over `a`, the
+backing's `a` resolves to the enclosing function's binder, so it stays that
+context variable rather than becoming the same-named parameter.
+Monotype's declaration scopes and its nominal caches, keyed by arguments,
+therefore tell `Wrap` at `U64` from `Wrap` at `Str`, and give each its own
+methods' specializations, with no rule of their own; Boxy reads the same
+arguments. A stored constant's type lists only the declared arguments;
+restoring it takes the context arguments from the restoring scope.
+
+A requirement the enclosing function's scheme carries can name such a type
+(a codec requirement whose format is a body-local type), so a caller in
+another module resolves it at its own instantiation of the scheme, and its
+evidence selects methods of the type, which are local procedures of the
+declaring module. Method lookup across checked views therefore returns a
+local procedure target of an imported module like any other target
+(`lookupCheckedMethodTarget`); the target names its declaring module
+(`MethodTarget.module_idx`), and both backends build the procedure in that
+module, from the declaration context of the call instance of the declaring
+function whose dictionaries the caller is building, while reading the
+dispatch's evidence and substitution in the caller's view. Monotype resolves
+the target's view by that module index (`moduleForModuleIdx`); Boxy lowers
+the procedure's value with its declaring module's view and switches back to
+the caller's view to read the evidence (`localMethodValue`,
+`localProcInstanceValue`). The instantiated context arguments give the
+procedure's declaration context its types.
+
+Because every application lists the context variables, identity
+enumeration lists them too. A method of the type
+annotated with it (`label : Local -> Str`) has a type whose application
+ranks with the enclosing function's variable, so it generalizes with that
+function and its checked type names the variable;
+its scheme therefore quantifies the variable, and checking and Boxy agree
+that it opens an evidence scope of its own.
+
+A local function that names such a type depends on the body, so it stays a
+local procedure, and so does any method whose signature names its own type.
+A codec dispatched inside one is built in that function's lexical scope: a
+stored codec runtime's evidence chain ends at the scope its chain names, which
+restoring checks frame by frame against the owner's checked scope tree, not at
+the root. A format method that is a local procedure reaches a Boxy codec
+family as a captured function value; the constructor calls `rename_field`
+through the value it captures, since the names tuple that holds the values for
+every other piece is what the constructor builds.
 
 A block-local value binding whose own binders are referenced inside its
 expression is a recursive value. Canonicalization rejects an eager
@@ -6224,6 +7002,72 @@ templates reachable from exported templates, static-dispatch targets, and
 compile-time checked callable leaves. Privacy affects source
 name lookup and diagnostics. It must not hide checked bodies from whole-program
 post-check specialization.
+
+### Body-Local Types Stay In Their Context
+
+A body-local type whose context is not empty (Body-Local Type Context) never
+leaves the functions whose type variables it depends on. Inside the body of
+`make_local : a -> _`, every use of a local `Local` whose method reads `a`
+means the body's own `a`, so checking never needs to tell instantiations
+apart. Outside that body there is no `a` to fill in: `make_local(Apples)` and
+`make_local(Pears)` would both have type `Local`, and a list holding both
+would mix two different types under one name. So the checker rejects such a
+type in the type of every binding that the body of a binding owning one of
+its context variables (the binding whose annotation introduced the variable)
+does not enclose. That covers the owner itself, every top-level definition,
+which is inside no function body, and every binding of an enclosing body
+outside the owner's. It may appear anywhere in such a binding's type:
+directly as an argument or result, or inside a record, tag union, list,
+tuple, function type, or another type's arguments.
+
+A value of a local type leaves its owner's body as an argument or result of
+the owner, which the owner's type shows, or through a monomorphic variable
+of an enclosing scope that the body unified with it: a weak top-level value,
+an enclosing function's parameter, which shows in the enclosing top-level
+definition's type, or a local of an enclosing body (`acc = []` that a nested
+function's body appends its local values to), which shows in that local's
+type. A nested function inside the owner may take or return the type
+freely: when the context variable belongs to an enclosing function, the
+value is still inside that function's body, and the variable appears in the
+nested function's type as the enclosing function's own variable. A
+body-local type with an empty context means the same type at every
+instantiation and may leave its body like any other type. A static dispatch
+requirement whose relation names such a type is not a value of it, so a
+requirement captured into the owner's scheme is not an escape.
+
+Checking applies the rule once every body is checked
+(`rejectEscapingLocalTypes`). Finalizing the contexts records, for each
+context variable, the binding that owns it (`local_type_context_owners`): a rigid
+variable remembers the binding annotation that introduced it, and each
+binding annotation that introduces a type variable remembers its binding. A
+module whose body-local types have empty contexts, or that has none, records
+no owner and does no work. Otherwise each top-level definition's type is
+judged, and the bodies of the top-level definitions that enclose an owner
+declared in a function body are walked: every binding they bind (a
+declaration, a lambda or `for` parameter, a `match` pattern) is judged by
+its type against the local types whose owners' bodies do not enclose it
+(`LocalTypeEscapeJudge`). Each binding's type is walked once, with a visited
+set over type nodes; no other body is walked. A rejected binding is a Local
+Type Escapes error at its name, showing its type and the local type's
+declaration, and suggesting a top-level declaration with a type parameter
+(`Local(a)`). A relation that failed only because the type left its
+context is that report's consequence and is withdrawn once every relation is
+checked (`withdrawLocalTypeEscapeConsequences`): the unifier marks a
+mismatch whose two applications of the type disagreed at a context argument
+(values of two instantiations met), or one of whose operands is a context
+variable of the type in a relation checked once the binding owning the
+variable is checked, generalization boundary included
+(`checked_polymorphic_bindings`): no more of that binding's body is checked
+then, so only a value of the type that left the body could carry the
+variable there, and the body's annotation could not generalize it (as an
+enclosing body's `acc = []` carries the variable of the nested function
+whose local values it holds). The checker records the type and that
+variable (`problem.LocalTypeEscapeCause`). A failure against the variable
+inside the owner's body is the body's own error and is reported alongside
+the escape. The binding binds nothing, so every use of it crashes, and
+every method of the escaped type is rejected like a capturing method
+(Methods Never Capture), so no dispatch outside the type's context reaches a
+local procedure that needs it.
 
 ### Function Definitions
 
@@ -7158,7 +8002,7 @@ from a missing procedure template.
 
 The Boxy strategy represents compiler-owned opaque serialization evidence
 explicitly. `Encoding.FieldName.FieldNames(_shape)`,
-`Encoding.FieldName(_shape)`, and `Encoding.ParseTagUnionSpec(a)` are not the
+`Encoding.FieldName(_shape)`, and `Encoding.ParseTagUnionSpec(a, encoding, state, err)` are not the
 zero-sized source backings that keep their implementation hidden from Roc
 code. They have compiler-defined runtime representations whose complete shape
 is selected by checking and Boxy lowering. Generic format workers can receive,
@@ -7220,11 +8064,29 @@ plan or enter the LSS pipeline as a fallback. Stored generated callables retain 
 and compiler-assigned capture identities so restoration rebuilds the same
 ordinary Boxy callable from `ConstStore` data. A format or custom codec method
 that is a local procedure (a method of a type declared in a function body that
-stays a procedure of that body) is a function value of its declaring body: each
-use builds it there, in the entry chain, and the constructor captures it and
-hands it to the runtime worker after the renamed names, where every call of it
-is an erased call. Restoring a stored runtime builds those values in the
-restoring body, since compile-time evaluation stores none of them.
+stays a procedure of that body) is a function value of its declaring body,
+built in the entry chain as an immortal composition; the constructor captures
+it and hands it to the runtime worker after the renamed names, where every
+call of it is an erased call. Its value is built only where the declaring
+body's hidden words are explicit: in a worker chain containing the declaring
+body, or from a *declaration context*, the declaring procedure's worker with
+the descriptors, dictionaries, and literal arguments of one instance of it.
+A caller building the dictionaries of a call instance (a direct call, a
+literal chain frame, or a platform requirement's root evidence) builds them
+in that instance's declaration context, since a caller-supplied codec
+requirement of the callee's scheme calls the callee's local procedures. The
+procedure's worker is then a lambda of the callee's procedure worker,
+capturing the instance's words; a procedure with its own scheme resolves its
+own dictionaries in the callee's scope. A method captures no value of its
+body other than the body's local procedures it refers to (a sibling method
+it calls), and built from a declaration context each of those is itself
+built from the same context. A body building the dictionaries of a
+call of its own procedure builds its own local procedures from its worker
+chain, since they are this body's values. Restoring a stored generated runtime builds
+those values in the declaration context of the instance of the stored value's
+procedure that built it, which the value records, since compile-time
+evaluation stores none of them. Building a local procedure's value anywhere
+else is a compiler bug.
 
 Boxy generated encoders call the same format methods, with the same callback
 protocols, as the checked derivation contract names. A tag union of any
@@ -7354,7 +8216,7 @@ terms of it:
 ```roc
 to_str : a -> Str where [a.Encodable([])]
 to_str_try : a -> Try(Str, err) where [a.Encodable(err)]
-parse : Str -> Try(a, [InvalidJson(Str), ..errs]) where [a.Parseable([InvalidJson(Str), ..errs])]
+parse : Str -> Try(a, [InvalidJson(Str)]) where [a.Parseable([InvalidJson(Str)])]
 ```
 
 so `where [a.Json.Encodable([])]` is the supported way for user code to require
@@ -7412,10 +8274,11 @@ constructs the concrete parser and the hidden `HttpHeaderState.{ raw }` is the
 runtime input state. Formats with no configurable behavior can still use a
 zero-sized internal encoding value.
 
-The error type is inferred from the format methods. A generated parser composes
-each format method's error row into its returned error row, preserving the
-method's own callable type. Encoder error types unify with the public function's
-returned error type.
+The error type is inferred from the format methods. Every operation in a
+generated parser uses that same error type, including nested custom parsers
+and tag payload callbacks. A custom parser translates domain errors explicitly
+if they differ from the format's errors. Encoder error types unify with the
+public function's returned error type.
 When a concrete encode operation cannot fail, its error type is empty, so
 `Json.to_str` can bind the underlying encoder result with an exhaustive
 `Ok(encoded_state) = ...` pattern and return `Str` directly. When a concrete
@@ -7806,7 +8669,7 @@ parse strings, `U64`, tag unions, and records uses these method shapes:
 ```roc
 encoding.parse_str : encoding, state -> Try({ value : Str, rest : state }, err)
 encoding.parse_u64 : encoding, state -> Try({ value : U64, rest : state }, err)
-encoding.parse_tag_union : encoding, Encoding.ParseTagUnionSpec(a), state -> Try({ value : a, rest : state }, err)
+encoding.parse_tag_union : encoding, Encoding.ParseTagUnionSpec(a, encoding, state, err), state -> Try({ value : a, rest : state }, err)
 
 encoding.parse_record_start : encoding, state -> Try([Counted({ len : U64, rest : state }), Uncounted(state)], err)
 encoding.parse_record_field : encoding, Encoding.FieldName.FieldNames(_shape), state -> Try(
@@ -7863,11 +8726,9 @@ ends. After a matched field's value or a skipped entry, a counted record counts
 that entry down and an uncounted record calls `parse_record_after_field`, whose
 `Continue` or `Done` says whether another entry follows.
 
-If the generated finisher sees that a required field was never filled, the
-generated parser itself reports the failure, as described in "Derived Parser
-Required-Field Error Composition": `MissingRequiredField(field_name)`, a tag
-every such parser's error row carries. Formats implement no missing-field
-callback. A field
+If the generated finisher sees that a required field was never filled, it
+calls `missing_field(encoding, field_name)`, as described in "Derived Parser
+Format-Owned Errors". The format owns both the error type and its message. A field
 whose key may be absent says so through its kind or type: an absent
 `Try(Str, [Missing])` field is `Err(Missing)`, an absent `?:` field is in its
 missing state, and an absent `??` field holds its default. A field annotated as
@@ -8175,7 +9036,7 @@ The exact derived parser type for a header record with mixed field shapes is:
 		},
 		rest : HttpHeaderState,
 	},
-	[BadHeader, MissingRequiredField(Str)],
+	[BadHeader, MissingHeader(Str)],
 ))
 ```
 
@@ -8184,7 +9045,7 @@ to parse a header record that contains a tag union is a compile-time
 static-dispatch error:
 
 ```roc
-bad : Try({ mode : [On, Off] }, [BadHeader, MissingRequiredField(Str)])
+bad : Try({ mode : [On, Off] }, [BadHeader, MissingHeader(Str)])
 bad = Encoding.HttpHeader.parse("mode: On\r\n")
 ```
 
@@ -8225,7 +9086,16 @@ there the next call's dynamic arguments live in the region, which a loop
 iteration would allocate again while they are still read, so the call is
 lowered like a tail call to any other procedure and replaces the frame
 (see "Frame-Replacing Calls"), whose dynamic arguments each backend moves out
-of the dying frame. A proven call to any other procedure has its continuation
+of the dying frame. A `.boxy` self call is also lowered that way when it does
+not pass the procedure's own descriptors, dictionaries, and literal arguments
+along unchanged: a polymorphic recursive call at other types needs the
+descriptors its body composes at entry composed again, which a loop jump never
+does. So is one that does not pass each dynamic parameter along unchanged: a
+dynamic parameter is the address of storage its caller owns, which a loop jump
+cannot rebind, while a frame-replacing call moves its dynamic arguments. A
+`.boxy` self-tail loop begins after the entry chain that composes those
+descriptors (`TailCalls.entry`), so every iteration shares them and each
+dynamic parameter's descriptor is defined before the loop binds it. A proven call to any other procedure has its continuation
 replaced by a `ret` of the call's target, so the tail position is structural:
 the statement after the call returns its result. That is the only form later
 stages read. A pass that moves a body into another procedure keeps the form:
@@ -9064,19 +9934,31 @@ which cannot stay residual. A body like `|msg| for_each!(msg, Stdout.line!)`
 inlines `for_each!` into itself on the function reference it supplies, so its
 clone is a whole loop wherever it lands; it stays one procedure, and copies of
 it at each caller are admitted only where they are productive there.
-Any other call qualifies only when inlining lets a known value meet a consumer
-that gains from it:
+Any other call qualifies only when a known value crosses the call's boundary
+and meets a consumer that gains from it on the other side:
 
-- a `match` on a known tag, a call of a known callable, or a loop entered with
-  a known constructor, reached by a known part of an argument or capture;
-- a part of the result that the callee constructs on every path that returns,
-  where the caller matches, calls, enters a loop with, or projects a field or
-  item from it. A projected result is read without building the aggregate. A
-  projected argument gains nothing from inlining, since the call-pattern
-  worker already takes a known argument apart. Returning a result, or storing
-  it in a constructor, is not such a use: the callee already builds it where
-  the caller receives it, and a result the caller returns is read by whatever
-  reads the caller's result.
+- a known part of an argument or capture reaches a `match` on a known tag, a
+  call of a known callable, or a loop entered with a known tag or callable,
+  inside the callee's extent, or through the callee's result in the caller's
+  continuation;
+- a part of the result that the callee constructs on every path that returns
+  (or passes through from an argument or capture the clone knows) reaches a
+  `match`, a call, a loop entry with a tag or callable, or a field or item
+  read in the caller's continuation. A projected result is read without
+  building the aggregate. A projected argument gains nothing from inlining,
+  since the call-pattern worker already takes a known argument apart.
+  Returning a result, or storing it in a constructor, is not such a use: the
+  callee already builds it where the caller receives it, and a result the
+  caller returns is read by whatever reads the caller's result.
+
+A known record or tuple entering a loop is not such a use by itself. Join
+scalarization (`scalarize_joins.zig`) splits a record- or tuple-typed join
+parameter of up to 64 fields that is only read field by field into one
+parameter per field in every mode, whatever its initializer is, so the copied
+body would carry the same scalar state the residual call does; a loop that
+uses its state whole keeps the aggregate in the copy too. The walk follows the record's fields through the loop variable, so a
+known tag or callable in a field still counts where a `match` or call inside
+the loop reads it.
 
 A known argument is one the clone holds as a constructor, callable, or known
 local at the consumed path, or a nested direct call whose callee constructs
@@ -9085,30 +9967,73 @@ Storing a known value, reading an unrelated field, or computing a scalar result
 is not a reason to copy a body: a callee that only stores a `Bool` literal it
 is passed stays a call.
 
-`inline_productivity.zig` derives this before any clone runs, as summaries of
-source bodies. For each function it records how the body consumes each part of
-each parameter and capture, either directly or by placing it in the function's
-result, and which result parts the body constructs or passes through on every
-path that returns; it records each call's demand on its result too. Demand
-flows from consumers to the values that reach them through bindings,
-field and payload reads, constructors, branches, loops, join points, and calls, including
-a function value's captures when the value may be called. Parts are paths of
-field, item, and tag-payload steps, each carrying the label that names the
-part within its parent and the part's own Monotype. A part whose type equals
-the type of a part above it on the path sits at a recursive position of that
-type, so the path folds to that part; a type that contains itself is
-recursive whatever labels lead back to it, and labels alone cannot decide
-this, since unrelated types share tag and field labels. The steps of a path
-therefore have distinct types, so a recursive type contributes as many paths
-as its unfolded shape has parts, not one per ordering of its recursive
-positions. Paths share one root, the value itself, so demand passes through a
-nominal wrap, row coercion, or typed boundary unchanged; a read meets the part
-it names by label, since a row coercion can show one part at two types. Each
-summary only grows within that finite set of paths, so the interprocedural
-fixed point ends without a round limit. The
-clone resolves a call's result demand against the demand on the result of the
-innermost call it is inlining, and checks the arguments it knows against the
-callee's summaries; it never reanalyzes a body.
+`inline_crossing.zig` decides this with a query at each call the clone asks
+about; nothing is summarized for the whole program, and no part of a type is
+ever enumerated. Before any clone or discovery task runs, `Index` records, in
+one pass over the source bodies, every use of every expression and local (a
+lifted body may share an expression node between parents, and bodies may share
+nodes with each other, so a node keeps one list of uses per body), each body's
+loops, its single definitions and slots, and the strongly connected components
+of the call graph over direct calls and function values. Slots are keyed by
+body: a lifted closure's capture slots are the very locals its enclosing body
+binds, so a local reads as a parameter or capture only within the body that
+declares that slot, and a summary memoizes an expression per body that reads
+it. The index is read-only afterwards. Each task owns a `Session` with its own memo tables, so
+queries share no mutable state and take no locks.
+
+A query walks forward from the crossing value: from the callee's parameter or
+capture slot for a known argument, from the call itself for a known result
+part, and from each enclosing inline frame's call when the value reaches the
+result of the body it is in. The seed (the clone's knowledge of the argument,
+or the callee's built result, `builtAt`) answers whether a part at a path is
+known; the walk descends into a part only where the seed knows it, so a value
+of a huge type costs only the parts the clone actually holds. A constructor
+the walk puts around the known part pushes a frame (a step, or a record update
+whose replaced fields no longer come from the part); a read of a matching step
+pops it, and a read through an update pops it and reads the field beneath
+unless the update replaced that field. A consumer counts only when no frame is
+on top. A function value built around the known part is entered at its capture
+when the walk calls it, and when it reaches a function's result, since any
+caller may call it.
+
+The walk is a pushdown reachability problem solved by saturation. No stack is
+stored: a pushed frame is a node keyed by the pushing body, the push site, the
+frame, and the seed path, and each node keeps the set of nodes that can lie
+beneath it. A configuration is a body position, a seed path, and a top node;
+a pop resumes every node beneath the popped one, now and as beneath-sets grow.
+Calls are summarized per entry (callee, slot, seed path, top node): each caller
+receives each of the entry's exits at its own call site, so a walk returns
+where it was called from, and a callee that pops the caller's frame resumes
+beneath it within the same entry. Nodes are shared by every invocation of a
+body within one query, so a pop can resume a node another invocation of that
+body pushed over; this adds states and never drops one, so it can admit an
+inline the exact walk would not, never refuse one it would admit.
+
+Two structural rules keep the walk to what the clone can realize. A loop's
+back edge (a `continue` value or a jump's loop value) does not carry a part
+wrapped in a frame pushed inside the loop it re-enters, and a recursive binding
+re-enters its own pattern only unwrapped: a structure that grows on every pass
+is no loop fixed point. Within a cycle of the call graph, a call does not carry
+a part wrapped in a frame that a function of the cycle pushed: the clone never
+inlines a recursive call whose argument grows.
+
+A callable worker's body is a root context. The inline frames active where the
+worker is created belong to that context, not to the worker, whose own callers
+read its result; `Cloner.result_boundary` marks them, so a query in a worker
+body climbs only the frames above it, and the body beneath them is the worker's
+source function (`crossing_root_fn`). A call-pattern worker's root frame, which
+names no call, ends the climb the same way.
+
+The cost of a query is polynomial in the program and the seed, and independent
+of type shape and composition depth. With U uses in the index (one per
+expression and parent body), S slots, N source expressions and K paths the seed
+knows, there are at most U·K + 1 nodes, at most S·K·(U·K + 1) call entries,
+and at most one visit to each (entry, body position, seed path, node), so a
+query does O(S·N·U²·K⁴) work in the worst case; in practice the seed prunes the
+walk to the parts the clone holds. `builtAt` is evaluated on an explicit stack
+with memoized (function or expression, path) results, a function whose result
+reaches itself at the same part building nothing there. Building the index is
+linear in U.
 
 When the continuation never observes a tuple loop result whole, SpecConstr
 gives the loop an exit ABI of the components it reads, dropping any it cannot
@@ -9281,10 +10206,26 @@ carry explicit continuation targets.
 
 Each normalization or discovery clone owns a short-lived scratch arena. Only
 accepted call patterns are copied into pass-wide storage, so discarded symbolic
-value graphs do not accumulate across functions. Generic analysis follows
-existing constructor evidence; a structural consumer requests a producer's
-result shape through the separate demand path, which propagates through the
-callee's exact used-argument plan.
+value graphs do not accumulate across functions. Within one clone, work whose
+results are discarded gives its scratch back as well, so scratch is bounded by
+the output a clone keeps rather than by how often it retries:
+
+- A direct-inline productivity query returns only its answer; the step
+  paths it builds in the clone arena are released when it returns, and its
+  walk state lives in the session's query arena, reset after every query.
+- Loop scalarization decides a split by attempt (clone the body, let each
+  `continue` supply or demote the slot leaves, retry while any demoted). A
+  rejected attempt releases everything it allocated in the clone arena; only
+  the demoted entry shapes the next attempt starts from are carried across.
+  Its jump sites in enclosing let-of-case joins are dropped, so a join sees
+  only the jumps of output that survives. Its program suffix and the ids
+  minted for it are rewound too, except when the attempt created a callable
+  worker: a worker is keyed by its template and ABIs alone, the retry and
+  every later clone reuse it, and its body lies in that suffix.
+
+Generic analysis follows existing constructor evidence; a structural consumer
+requests a producer's result shape through the separate demand path, which
+propagates through the callee's exact used-argument plan.
 
 Inlining a call additionally requires exact closed Monotype identity between
 the call-site result and the callee body's result. Independently specialized
@@ -9600,6 +10541,34 @@ Backends receive only ordinary LIR and explicit ARC statements. They must not
 know whether a value originated as a public iterator, a minted iterator,
 forced-dynamic callable state, or a scalarized loop.
 
+## Immutable Diagnostic Captures
+
+Diagnostics capture their type evidence before error poisoning, but render only
+the roots and tags their reports request. A capture retains variable identity,
+recursive references, polarity, naming scope, and literal-constraint display
+policy. Later solver writes, identifier insertion, or another capture's display
+options cannot change its text.
+
+The structural snapshot is the durable source of truth. Completed subgraphs share
+nodes within a capture; recursion markers retain their source identity rather
+than requiring repeated expansion of cyclic subgraphs. Only a capture whose text
+is requested acquires a private `TypeWriter` adapter graph, which restores that
+sharing and recursion without consulting the
+solver. Filling newly allocated presentation nodes is diagnostic construction,
+not a solver-mutating rewrite. Rendered strings have stable owned storage:
+requesting another root cannot invalidate a string already borrowed by a report.
+
+Constraint collection visits each receiver once per rendering and deduplicates
+exact callable identities before formatting. Equal displayed signatures are
+deduplicated without rescanning the accumulated list. These are presentation
+rules, not changes to evidence identity or constraint solving.
+
+Checking capsules retain the immutable capture and already-requested text, not
+an eager rendering of every node. Restored diagnostics use the same rendering
+path. Probe rollback discards speculative captures and rendered-result entries.
+Performance tests count capture and rendering visits as well as duplicate
+comparisons; eliminating one comparison loop alone is not sufficient.
+
 ## Solver-Mutating Rewrites
 
 Pure unification is the authority on what typechecks. Any code that mutates
@@ -9688,6 +10657,29 @@ arithmetic remains polymorphic, including heterogeneous user arithmetic;
 nominal and extended rows still guide nested defaulted/optional construction;
 inconsistent shared type variables and unsupported real dispatches still fail.
 
+### Call Arguments Relate In Order
+
+A call checks its arguments left to right, and relates each argument to its
+formal slot as soon as that argument has checked, before the next argument is
+checked. A later argument is therefore checked with every type its earlier
+siblings fixed: in `apply(ask, { plan: |a| ... })` with
+`apply : a, { plan : a -> b } -> b`, the record is checked knowing `a` is the
+type of `ask`, so a method call on the callback's parameter resolves while its
+arguments are checked and a record literal among them may omit defaulted
+fields. The flow is one-directional. An argument learns nothing from a sibling
+to its right until both relations have run, exactly as a deferred dispatch
+does.
+
+Each relation is owned by the call and leaves both operand graphs intact when
+it is rejected, so a rejected argument cannot poison the formal slots its
+siblings are checked against. The first rejected relation ends the fold, and
+an erroneous operand never relates; later arguments are still checked, and
+report their own errors. The fold runs exactly one relation per argument.
+`issue 12978: callback record accepts nominal method props with omitted
+defaults` in `type_checking_integration.zig` pins the accepted side, and
+`issue 10763 - a stored call result is monomorphic` pins that two wrong
+arguments of one call are each reported.
+
 ### Polarity: Output-Position Tag Unions Are Implicitly Open
 
 Every type annotation is walked with a POLARITY: the root is positive
@@ -9758,15 +10750,15 @@ definition to the late audit below.
 A definition can still widen a row after its body is checked through a
 generated codec its body introduced: a derived parser or encoder is often
 validated only once `finalizeGeneratedCodecConstraintsToQuiescence` resolves
-it, and its validation adds error tags to the codec's error row (Derived
-Parser Required-Field Error Composition). For a definition that generalizes,
+it, and its validation determines the codec's error type (Derived
+Parser Format-Owned Errors). For a definition that generalizes,
 the bound refuses that relation and codec validation reports it. For a value
 binding whose row is still open when its body is checked, each extension is kept, stamped with the source region of its
 binding's right-hand side (`Check.LateImplicitOpenExtAudit.owner_rhs`) and that
 right-hand side itself (`owner_expr`), which a report retires. Each codec
 validation records, with the region of the expression that introduced the
 codec relation, exactly which tags it requires in which error row
-(`Check.codec_row_demands`): `MissingRequiredField(Str)`, a nested custom
+(`Check.codec_row_demands`): a nested custom
 parser's error tags, and any tag the validation added to the row by relating it
 to a format method. After finalize, `Check.runLateImplicitOpenExtAudit` reports
 every demanded tag that lies in the extension of a binding whose right-hand side
@@ -10372,7 +11364,10 @@ converts instead (Sealed Result Rows); the checker is the same for both.
 **Where joins come from.** Every place a value's rows flow into another's:
 a row coercion and its value; a lambda's body and its function's result; a
 `return`'s value and its function's result; a `?` return's error row and the
-function's `Try` result. These are edges between types, not between rows:
+function's `Try` result. Generated `try_sequence` and `try_record_sequence`
+forward the input error payload to either their shared error continuation or
+their own result's error payload; both forms carry the same row-join edge.
+These are edges between types, not between rows:
 each edge is descended structurally, so rows at matching positions (a
 `Try`'s error argument, a tag payload, a record field) join too. Lambda
 Solved has every edge as a unification; `.boxy` reads the same edges from the
@@ -10911,6 +11906,16 @@ checked module data records for flex and rigid variables alike).
 Specialization therefore never meets a request wider than a template
 that cannot take it.
 
+A direct call is lowered at the wider row only when its template takes
+one by these two rules: the template's OWN root has a closed result row or
+a request-determined result row variable
+(`Builder.templateTakesWiderResultRow`). The call's instantiated type is
+not enough. A template whose result row variable it shares with an
+argument, like `same : Try(ok, err) -> Try(ok, err)`, is closed at a call
+whose argument builds no error tags (`same(Ok(x))`), yet its request's
+result row is its argument's, which the request does not widen. Such a
+call keeps its own row and is widened by a `row_widen`.
+
 The set of positions a use may WIDEN is kept within the row coercion's reach
 by construction rather than by a second rule that could drift: polarity's
 per-use opening is withheld at generation time from every position outside
@@ -11095,8 +12100,8 @@ its copies roll back with it. Nested contracts whose shapes nest therefore
 share all the structure below their own level.
 
 A codec whose shape, encoding, and state are settled at the closing boundary is
-validated once at that boundary, so its error-row demands (such as a record's
-`MissingRequiredField(Str)`) reach the definition's type before it generalizes
+validated once at that boundary, so its format-owned error type
+reaches the definition's type before it generalizes
 and before any use copies it. None of their refinable components may belong to
 an enclosing scope. When a refinable component escapes through a member's
 interface, a use can still refine it, so the relation also stays in the scheme
@@ -11180,8 +12185,8 @@ extension, so no later use can add a field, and the closed row is exactly the
 row module finalization would close. Closing at the boundary lets the codec
 produce its constraints, including its error row, before the definition's type
 is output. A row whose extension is still open when the definition
-generalizes would otherwise close at module finalization and add errors (such
-as `MissingRequiredField(Str)`) to a scheme that callers have already
+generalizes would otherwise close at module finalization and determine the
+format error in a scheme that callers have already
 instantiated, so callers' exhaustiveness and annotation checks would run
 against an incomplete error row. An extension owned by an enclosing scope or
 by a non-generalized value binding waits for its owner.
@@ -11231,157 +12236,73 @@ that error, and a parameter or returned record used only through field access
 nested records closing both at a boundary and outside any function, and that a
 shared value binding's record still collects fields from other definitions.
 
-### Derived Parser Required-Field Error Composition
+### Codec Derivation Recurrence
 
-Format methods, like custom nominal parsers, retain their own error rows.
-The generated parser requires inclusion of every child error tag with equal
-payload types, rather than equality of child and parent rows. An empty child
-row contributes no errors. This applies to first-order scalar, list, tuple,
-record, and dictionary format methods. `parse_tag_union` receives a
-`ParseTagUnionSpec` whose generated payload parsers execute at the enclosing
-contract row; its callable retains that shared row. This callback dependency
-remains part of its specialization identity. First-order format calls, for
-parsers and encoders alike (including `rename_field`, `invalid_value`,
-`encode_null`, scalar and key encoders, and collection helpers), specialize
-from their checked callable and evidence without inheriting the enclosing codec
-contract; unrelated parent errors therefore do not duplicate those callees.
-Composition does not widen ordinary user calls or change ordinary unification.
-Explicit parent rows excluding a
-child error, and incompatible payloads for a shared tag, remain errors.
+A generated codec's derivation instantiates its format's methods, and a
+method's own `where` clause can require a generated codec in turn. When that
+requirement asks for the codec being derived, as a string method whose clause
+requires the encoder of its state does when the state is the record being
+encoded, deriving it again would instantiate the same method and require the
+same codec once more, without end. Checking keeps the chain of derivations
+explicit instead: each derivation records a frame
+(`Check.codec_derivation_frames`) naming the derivation whose method
+instantiation required its relation, read from the requirements registered
+while that derivation ran (`codec_derivation_frame_by_child_fn_var`). A relation
+whose value shape, format, and state equal those of a derivation in its own
+chain (compared as `derivedCodecVarsEql` compares a recursive nominal's
+applications) is that derivation recurring. Its runtime callable is unified
+with the derivation's, so its error row is the derivation's, and it is
+output as a `GeneratedCodecRecurrence` rather than a derivation of its own.
+A recurrence of a derivation still in progress resolves when that derivation
+finishes; one of a rejected derivation is rejected without a report of its own,
+since the derivation's relation reported why. Every frame's parent precedes it,
+so the chain is finite, and the recurrence ends the walk because it
+instantiates nothing. Checked output indexes a recurring relation at its
+derivation (`EvidencePass.buildIndexes`), so the method's evidence names the
+derivation that calls the method, and Monotype specializes the cycle like any
+recursive call.
 
-`constrainDerivedParserErrorRowIncludes` collects a complete child row into
-retained scratch storage and imposes one open-row relation for its known tags.
-Only an unconstrained instantiated child extension may close; constrained or
-rigid extensions remain unsupported. Before closure, the selected method's
-instantiated dispatch requirements and their transitive targets settle against
-the actual encoding and state, just as for custom nominal parsers below.
-Settling is a position of the derived-parser walk: its drain stops after any
-relation that resolves an implicit parser requirement, that requirement's
-derived parser is validated as a child position with its own encoding, state,
-and error row, and the drain resumes at the next relation. A chain of custom
-parsers over derived shapes therefore never nests validations.
-An absent-constructor empty default is committed as a closed row on that method
-instance before checking seals the solver store.
-Non-row format errors, such as `Str`, retain ordinary equality through
-`constrainDerivedParserFormatError`. Checked codec callables preserve child
-types and their shared payload relations with the parent. Each format-method
-instantiation records its dispatch-target scheme use under the generated call's
-explicit evidence identity, including the method's copied `where` requirements.
-Lowering calls those exact callables and composes errors at the propagation
-boundary; an infallible
-call needs no error arm and equal rows need no conversion. Specialization
-merges sorted tag rows linearly and retains each sealed source-to-target tag
-correspondence once per emission context; propagation reuses that mapping.
-Differing rows use the ordinary Try sequence's cold error edge with an explicit
-conversion continuation, preserving direct success-record field binding.
-A tag-union format method can return the checked structural backing of the
-derived nominal shape. Its generated success edge binds the parsed value and
-rest directly, constructs each declared nominal layer around the value, and
-builds the parent result. This construction uses the checked nominal backing
-chain; error-row injection itself still requires identical success types.
+Under `.boxy` the cycle is a dictionary that captures itself: the constructor
+captures its format's local procedures, and the method's own scheme
+dictionary is that constructor. A constructor requested again while it is
+being composed (`Builder.beginCodecComposition`) is a back edge: the request
+names the constructor's reserved recipe, adapted to the requested type.
+Completing that recipe connects the cycle before any runtime value is emitted.
 
-Issue #11246 is pinned by
-`test/snapshots/parser_for_derived_list_error_union_issue_11246.md`,
-`test/cli/ParserFormatErrorComposition.roc`, and
-`src/check/test/issue_11246_test.zig` (including rejected parent rows and payloads).
+### Derived Parser Format-Owned Errors
 
-A compiler-derived structural record parser, rather than its input-format
-implementation, owns the failure produced when a required field is absent.
-When a parsed record contains at least one field whose type is not the
-recognized optional-field shape `Try(_, [Missing, ..])`, the checker requires
-the parser's shared error row to contain `MissingRequiredField(Str)`. It does so
-by unifying that row with an open row containing the tag, unconditionally: the
-generated body always reports an absent required field as
-`MissingRequiredField(field_name)`. Records whose fields are all optional do
-not add this error, and non-record shapes do not add it. Nested derived shapes
-contribute the error whenever any reachable derived record has a required
-field.
+A format owns the error type of every operation participating in a derived
+parser. Checking settles each selected method's requirements, commits its
+unconstrained error-row extension, and unifies its whole error type with the
+enclosing contract. It does not compose child error tags into a larger row.
+This equality applies to format primitives, collection protocols, nominal
+parsers, generated nested parsers, and tag payload callbacks. Non-row errors
+such as `Str` obey the same equality. Incompatible children are rejected during
+checking; no runtime boundary translates them implicitly.
 
-An open row simply gains the tag, so a program that never mentions it still
-sees `MissingRequiredField(field_name)`. A row the program closed without the
-tag rejects it. When the closed row belongs to an annotated value or
-function, the report is the annotation mismatch: the definition can produce a
-tag its annotation does not list (Polarity). When the closed row belongs to a
-where-clause parser contract, the report is the dedicated
-`derived_parser_error_row` problem instead of a generic row mismatch: it is
-located at the expression that instantiated the codec relation (the call that
-fixes the record type, where the user can act), and names the record type,
-the tag, the closed row, and the required fields. A nested custom parser whose
-error tag the enclosing row lacks reports the same problem; a payload conflict
-on a tag the row already lists remains an ordinary row mismatch (issue 11246).
-The failure is never mapped onto a format error.
+Required record fields demand the format method
+`missing_field : encoding, Str -> err`. Generated parsing calls that checked
+method with the missing field name. Optional and defaulted fields do not demand
+it and retain their absent-field behavior. JSON implements it with
+`InvalidJson` carrying an informative message; all JSON parsing entry points
+return only `[InvalidJson(Str)]`. A custom parser must return the format error
+or explicitly translate its domain errors.
 
-A custom nominal parser nested inside a derived shape keeps its own minimal
-error row. Its instantiated method requirements must settle against the actual
-encoding and state before error-row inclusion closes any extension. A generic
-error variable shared with a `where` method is not an absent-error proof: that
-method determines the errors. Checking drains the selected method's own dispatch
-work and its transitive requirements before composing the child row or freezing
-the generated callable, without replaying the enclosing derivation. Both local
-and imported methods obey this ordering, pinned by
-`src/check/test/issue_11728_test.zig` and
-`test/cli/JsonGenericCustomParser.roc` (issue #11728).
-That drain validates the generated codec requirements it copies on the spot
-rather than parking them in `final_codec_dispatch_constraints`: a custom parser
-that calls a derived `parser_for` has its errors determined by that derived
-parser, so the derivation cannot wait for the final codec boundary while the
-child row closes. A relation parked before the drain began is not one of the
-selected method's requirements and keeps its single final validation. Pinned by
-`src/check/test/issue_11838_test.zig` and
-`test/cli/JsonCustomParserOverDerived.roc` (issue #11838).
-During checking, `constrainDerivedParserErrorRowIncludes` closes an
-unconstrained extension on the instantiated custom-parser method and requires
-every resulting child error tag to occur with the same payload types in the
-parent parser row. A rigid open extension is rejected because the compiler
-cannot prove which additional errors it may produce. Monotype lowering calls
-the custom parser at that checked child row and explicitly injects each child
-error tag into the parent row. This lets a custom JSON scalar parser retain
-only `InvalidJson(Str)` when it is nested in a record whose generated parser
-also needs `MissingRequiredField(Str)`.
+Selected methods still settle their own transitive dispatch requirements before
+their errors are related. Generated call evidence records the exact resulting
+callables and target substitutions. A normalized callable row cannot recover
+which overlapping row variables checking selected; lowering carries that
+substitution alongside the nested evidence rather than inferring it again.
+Tag-union shape, payload and field-name evidence remains part of the
+generated spec; it does not authorize a different error representation.
 
-A compiler-GENERATED nested parser is the opposite case and keeps no row of its
-own. It has no declaration to respect, and its generated body is validated
-against the enclosing parser's error row, so the signature it is validated at
-names that same row—the derived encoder side already builds its nested
-expectation this way. This makes a generated derivation's frozen callable types
-a function of the contract key it is later matched by (kind, shape, encoding
-type, state type, error row), so two reads of one shape at one row—a nominal
-read on its own and the same nominal read again nested inside another derived
-shape—record the same contract instead of two that disagree about the nested
-parser's error row. `constrainDerivedParserErrorRowIncludes` therefore composes
-declared methods only. Pinned by
-test/cli/JsonNestedNominalContract.roc (both reads at one row, at a row wider
-than the shape demands, and at two different rows).
-
-Input formats contribute only errors that arise from reading their syntax and
-values. They do not implement a missing-required-field callback, and a derived
-record parser never calls a format's `invalid_value` for an absent field.
-Every type and every error-row tag is settled by checking: Monotype and Boxy
-construct `MissingRequiredField(field_name)` at the checked contract error row
-and treat a derived record parser whose checked row lacks the tag as a compiler
-invariant violation. No post-check stage widens a row or chooses a failure
-representation.
-
-Both sides are pinned by tests: accepted—
-test/cli/ParserRequiredFieldError.roc (a non-JSON derived parser reports the
-generic error with the missing field name and never constrains an
-incompatible, unused `invalid_value` declaration),
-test/cli/JsonParseErrorComposition.roc (JSON scalar parsing has only
-`InvalidJson(Str)`, while a required-record parser composes in
-`MissingRequiredField(Str)`),
-test/cli/ParserMissingFieldOpenRow.roc (an unannotated or `_` row gains the tag
-although nothing in the program names it),
-test/cli/JsonParseGenericWrapperErrors.roc (a generalized wrapper may consume
-the parser errors),
-and test/cli/ParserCustomNominalField.roc (a custom nominal parser's narrower
-error row injects into its containing record row); rejected—
-test/cli/ParserMissingRequiredFieldError.roc (a closed format error row that
-omits `MissingRequiredField(Str)`),
-test/cli/Issue11561ClosedErrorRow.roc (annotated value and function rows that
-omit it), test/cli/Issue11561ClosedRowPattern.roc (a use that names the tag
-does not excuse the annotation), and
-test/cli/ParserChildErrorOutsideAnnotation.roc (a nested custom parser's error
-tag outside the annotated row, including when a caller also widens the row).
+`ParseTagUnionSpec(shape, encoding, state, err)` binds the complete producer
+contract. Its `parse` options and result use those same parameters: a format
+cannot substitute different encoding, cursor, or error types and translate the
+result afterward. Such translation occurs outside the spec boundary; custom
+payload validation translates domain errors before returning the format error.
+Checking establishes this through ordinary nominal-argument unification.
+Both lowerers preserve all four parameters in generated spec identities.
 
 ### Parked Codec Relations Validate A Private Instance
 
@@ -11393,9 +12314,9 @@ U64.parser_for(Format.Default)`, whose state nothing in the definition fixes)
 therefore belongs to its scheme as a template, exactly like a relation over an
 unresolved receiver. `Check.activateSchemeDeferredCodecConstraints` marks it
 scheme-only at the boundary. Each use copies it and validates the copy at that
-use's own state and error row, so two calls of one definition in one body may
-take two rows, and a call's `Parser Error Row Missing Tag` or state mismatch is
-that use's own relation. `.boxy` constructs a stored lambda with its own
+use's own state and error type. A use cannot change a format's declared error
+type; its `Parser Error Type Mismatch` or state mismatch belongs to that use's
+own relation. `.boxy` constructs a stored lambda with its own
 dictionaries, and a `from_scheme` entry there means no use instantiated it, so
 that dictionary is a crash nothing reads.
 
@@ -11412,8 +12333,25 @@ it states the instance's callable, whose types that derivation was built at. So
 a procedure that runs as a root, which has no caller, relates to the instance as
 it would to a use, and a generalized binding nothing uses (`_ = any_parser`)
 still has evidence at its construction.
+Every dispatch relation the private instance copies, including constraints
+attached to its nested variables, belongs to the pending codec relation's
+recorded owner. Shared relations keep their original owner. Registering these
+copies is part of instantiation, before any of them can reach a dispatch drain;
+the later finalization boundary is not their creator.
 This validates in a private copy and rewrites no solved variable the program can
 reach, so it adds no Rewrite Inventory entry (Solver-Mutating Rewrites).
+
+The instance's copy of each of the template's variables is that variable
+throughout the instance's derivation (`Check.final_codec_instance_copies`). A
+format method of a type declared in the definition's body can name the
+definition's own variable in its signature (`rename_field : LocalFormat(a),
+Str -> Str`, with `a` the enclosing function's), and instantiating the method
+for the derivation reads that variable as the instance's copy rather than
+copying it again (`instantiateGeneratedCodecMethodTarget`). A second copy would
+carry the variable's `where` requirements as an instantiated relation of its
+own, whose receiver the instance's rigid copy then answers without being the
+variable the definition's clause declares. A derivation a format method's own
+requirement asks for reads the copies of the derivation that required it.
 
 A template relation that also reaches a variable of an enclosing scope
 (`_local = |_| U64.parser_for(Format.Default)(state)` inside a function of
@@ -11475,7 +12413,13 @@ module solves, each open row in its data whose tail carries only these
 constraints is grounded to the empty row by unifying the tail with it
 (`Check.closeValueRowTailsCarryingDerivations`), as every row of a top-level
 value closes when its module finishes checking (Value Rows: Uses Share One
-Row). A function's tail is left open: it
+Row). The module commits its permitted weak-value row defaults after the
+late annotation audit, then drains the dispatch work they create before
+freezing codec derivations or rejecting unresolved scheme requirements.
+A non-generalized tail shared through a function stored in a weak value
+must receive its default before a borrowing scheme is judged unresolved.
+These are the existing value-row commitments, not another whole-module
+finalization pass. A function's generalized tail is left open: it
 generalizes, and each instantiation supplies its row. An instantiation whose
 copy of the tail nothing pins leaves that copy to its row default too, so the
 ambiguity judgment never reports it: `make : U64 -> Set([X, Y])` built with
@@ -11781,7 +12725,14 @@ including a generated codec call, waits and records when that generation
 happens, so checking order is unchanged. Each site keeps the record policy it
 applies to every other scheme: a value use or generated codec call with an
 empty substitution is recorded only when the scheme has evidence params, and
-a source dispatch edge to a same-module target is always recorded.
+a source dispatch edge to a same-module target is always recorded. A
+group-start predeclaration that shares hole variables adds one case: its use
+is recorded even with an empty substitution and no evidence params. The
+binding's own scheme can quantify a hole, which no slot enumerates, and the
+record's substitution maps every unpaired variable to itself, which states
+that the use shares the hole with the body. Post-check stages read that
+identity to forward what the body's instantiation supplies, such as a literal
+argument whose type a hole decides.
 A receiver already at `Rank.generalized` is never captured as an outer-rank
 pending requirement. Generalization boundaries cannot run inside a commit
 probe; probes may append candidates, but rollback rewinds those candidates and
@@ -12735,10 +13686,24 @@ Restrictions:
     (lookups resolving to same-module defs, walked into their bodies—
     except lambda bodies, per the function-value rule below) and
     OMISSION edges (a LOCAL nominal construction whose literal omits a
-    declared defaulted field through an explicit constructor). Value references
+    declared defaulted field through an explicit constructor, written
+    through the nominal type's name or through a local alias whose
+    annotation is a resolved reference to a local type declaration,
+    followed through any chain of such aliases to the nominal declaration;
+    each hop is a name canonicalization resolved, not a solved type). Value references
     only point down the import DAG, so a
     name-resolvable cycle can never leave the declaring module; the pass
-    is module-local without loss. Each cyclic SCC containing a default
+    is module-local without loss. An alias never changes which stage owns
+    a construction: a construction through an alias is handled exactly as
+    the same construction written through the name of the type the alias
+    stands for, whichever module declares that type. A construction of
+    another module's nominal type, by its name or through an alias of it,
+    contributes no edge, because that type's defaults live in a module
+    that cannot reference this one; checking fills in its omitted
+    defaults. The one alias canonicalization does not follow is one that
+    reaches its nominal type through a type argument (`C : Same(Cfg)` with
+    `Same(a) : a`): it names its type only once the argument is
+    substituted, so a cycle through it is the checker's residue below. Each cyclic SCC containing a default
     reports `record_default_reference_cycle` ("Default Value Cycle")
     ONCE—on its first default in source order—and EVERY default in the
     SCC is dropped (fields degrade to required), so check and lowering
@@ -12772,8 +13737,11 @@ Restrictions:
     may legitimately be referenced both ways, each def carries TWO
     graph nodes, value-flavored and invoked-flavored (the invoked
     flavor's edges strictly superset the value flavor's), so an invoked
-    use never leaks body edges into a value use. Dispatch-call TARGETS
-    and foreign lookups terminate edges here by principle and are the
+    use never leaks body edges into a value use. Dispatch-call TARGETS,
+    foreign lookups, and constructions through an alias that does not
+    name a local nominal declaration that way (an alias of another
+    module's type, or one reaching its nominal type through a type
+    argument) terminate edges here by principle and are the
     checker's residue; a plain call through a function PARAMETER needs
     no edge of its own—the function value reached the parameter as an
     argument of some walked call, where the argument rule already
@@ -12923,9 +13891,15 @@ space, so even a same-module default materialized twice in one procedure
 never observes an earlier materialization's bindings, and the save/restore
 is stack-shaped so defaults that construct other defaulted nominals nest.
 Boxy reaches each omitted default through the same explicit checker-recorded
-data (`record_omitted_defaults` → `defaultExpr`) under the consuming site's
-worker; declaring modules resolve by content identity, and an unresolvable
-origin is an invariant violation, never a fallback. There is no archived
+data (`record_omitted_defaults` → `defaultExpr`); declaring modules resolve
+by content identity, and an unresolvable origin is an invariant violation,
+never a fallback. Boxy lowers a default as one worker of its declaring
+module whose scheme variables are the variables of the default
+expression's checked type (the fresh instantiation of the declaration's
+parameters): each construction relates that type to its field's type and
+passes the resulting types' descriptors, exactly as a call passes a
+template's, so a parametric default such as `Pair(x) := { items : List(x)
+?? [] }` builds `items` at `List(U8)` for a `Pair(U8)`. There is no archived
 VALUE, no `field_default` compile-time root, and no cross-root ordering:
 the inlined expression evaluates as part of whatever body consumes it—a
 comptime root's own evaluation for top-level constants, a runtime body
@@ -13058,8 +14032,8 @@ expression's node index—and every Monotype digest and structural
 equality includes it. This is load-bearing, not descriptive: derived
 codecs and specializations are keyed by monotype, and a derived JSON
 parser for `{ count : U8 ?? 10 }` must FILL an absent key while the
-parser for the same-shaped `{ count : U8 }` must ERROR
-MissingRequiredField, so rows that disagree about defaults (or about
+parser for the same-shaped `{ count : U8 }` must report the format's missing-field
+error, so rows that disagree about defaults (or about
 having one) must be DISTINCT monotypes—"same monotype ⇒ same
 behavior" stays an invariant instead of an approximation. The slot
 encoding is unchanged (defaulted fields remain plain inline slots;
@@ -13295,6 +14269,62 @@ and outside a loop; errors for a discarded value of another type on a `var`
 (`$items.len()`), the same call on an immutable binding, and an operator on a
 `var` (`$count + n`).
 
+### Frozen Scheme Relations Keep Enclosing Variables Monomorphic
+
+A local function that dispatches on a variable of an enclosing scope
+generalizes with that relation pending: in
+
+```roc
+labels = |prefix, keys| {
+    labelled = |suffix| keys.map(|k| "${prefix}${k.to_str()}${suffix}")
+    n = distinct(keys)
+    labelled("/${n.to_str()}")
+}
+```
+
+`labelled` generalizes while `keys` is still unknown, so its `map` relation
+holds `labelled`'s quantified item variable next to the enclosing `keys`.
+When `distinct(keys)` later gives `keys` the type `List(k)`, the relation
+resolves, and relating `List.map`'s signature to it unifies `labelled`'s
+quantified item variable with the enclosing `k`. Rank-minimum unification
+would leave that class generalized, and the next use of `labelled` would copy
+the enclosing function's own `k` as a fresh variable that nothing relates to
+`keys` again.
+
+A variable an enclosing scope owns is never quantified by a scheme nested in
+that scope. `restoreEnclosingVarRanks` enforces this where the two can meet:
+resolving a relation owned by a scheme whose boundary has already captured its
+requirements (`captured_scheme_owners`). Before such a relation resolves,
+`collectFrozenRelationEnclosingVars` records every non-generalized variable
+its callable and receiver reach, with its rank. Afterwards, each recorded
+variable that the resolution merged into a generalized class gets its rank
+back, and so does everything the class reaches. This is what
+checking the local function after the enclosing variable was known would have
+inferred: the variable is the enclosing scope's, shared by every use.
+
+A relation attached to a restored variable belongs to the enclosing scope
+along with its receiver, so its callable is restored too. A local function is
+therefore monomorphic in every variable such a relation relates: given
+`h = |d| keys.map(|k| k.combine(d))`, once `keys` is known to be a list of
+the enclosing scope's `k`, `d` is fixed by `k`'s one `combine` relation and
+two uses of `h` share it.
+
+This is a policy rewrite: it accepts programs that rank-minimum unification
+alone rejects with an unresolved requirement at the local function's use. The
+cost is confined to deferred relations whose owning scheme has already
+generalized: one walk of the relation's callable and receiver before it
+resolves, and one walk from each merged variable after. Every other deferred
+relation pays one owner lookup per constraint, and none when no scheme
+boundary has captured.
+
+The accepted side is pinned by `issue 12970: returned callback preserves
+captured method requirements across a where use` and `issue 12970: an
+unannotated enclosing function stays generic in its receiver's item` in
+`type_checking_integration.zig`. The rejected side is pinned by `issue 12970:
+a local function's variable fixed by its enclosing receiver is monomorphic`
+and `issue 12970: a relation on an enclosing item fixes the local
+function's other variables`.
+
 ### Rewrite Inventory
 
 - `finishAliasDeclarationParameters`—mechanism: completes an in-progress
@@ -13363,6 +14393,16 @@ Other solved-graph mutations:
   relation reads them. Unification consults the mark under the declared
   rule in Declared Backing Structure (above); the write itself never changes
   content or links classes.
+- `markPerUseStructure`—policy: Anonymous Structure Is Copied Per Use
+  (above). A generalization boundary marks each class it made and left
+  ungeneralized that a use can change (a record or tag union something
+  visible could lift or widen), after rank adjustment and before anything
+  instantiates the binding. The write never changes content, rank, or links classes; scheme
+  classification and scheme instantiation consult it, so each use copies the
+  class instead of sharing it. The accepted side (every use keeps its own
+  type, and a lifting use still lifts) and the rejected side (a method of the
+  lifted nominal called on another use) are pinned by the tests that section
+  names.
 - `unifyWithFresh` (`dangerousSetVarDesc`)—mechanism: fast path writing
   exactly the descriptor that unifying a root flex placeholder with fresh
   content would produce.
@@ -13431,7 +14471,7 @@ Other solved-graph mutations:
   codec boundary. A flexible extension carrying only `is_eq` and `to_hash`
   constraints admits the same closure, since the empty row derives both; a
   tail with any other constraint remains unresolved. The same condition governs
-  closing a declared parser child error row during error-row composition.
+  closing a declared parser child error row before format-error equality.
   Annotation provenance is minted by annotation generation via
   `Store.markAnnotationTagExt`, preserved by flex class merges and faithful
   copies, and cleared on fresh scheme instantiation. Derived `map`/`map!`
@@ -13477,16 +14517,16 @@ Other solved-graph mutations:
   non-function top-level value's data positions collects open row tails; one
   whose constraints are all `is_eq`/`to_hash` and that did not generalize is
   unified with the empty row through ordinary unification.
-- `constrainDerivedParserRequiredFieldError`—policy: Derived Parser
-  Required-Field Error Composition (above). A structural probe of derived
-  record fields gates ordinary unification of the parser's shared error row
-  with `[MissingRequiredField(Str), ..]`.
+- `beginParseErrorMethod`—policy: Derived Parser Format-Owned Errors
+  (above). Required record fields demand the format's error-construction method
+  through ordinary dispatch and unification, not a compiler-owned error tag.
+  Both `missing_field` and `invalid_value` settle their method requirements and
+  use the same complete-error equality as parsing methods.
 - `constrainDerivedParserFormatError` /
-  `constrainDerivedParserErrorRowIncludes`—policy: Derived Parser
-  Required-Field Error Composition (above). A format or custom parser method's
+  `constrainDerivedParserErrorEquality`—policy: Derived Parser
+  Format-Owned Errors (above). A format or custom parser method's
   instantiated error extension is closed after its method requirements settle,
-  then its concrete tags gate ordinary
-  unification constraints requiring the parent parser row to include them.
+  then its whole error type is unified with the parent parser's error type.
 - `processReturnConstraints` / `collectTryReturnRowUses` /
   `projectTryReturnRow`—policy: Try Return-Row Composition (above).
   A commit-probe seeds an unsettled inferred body only when ordinary
@@ -13544,6 +14584,11 @@ Other solved-graph mutations:
   deferred static-dispatch worklist. Retirement reads the explicit structural
   origin and checked scheme-use substitution produced by those operations;
   there is no rank rewrite, structural ownership probe, or graph restamp.
+- `restoreEnclosingVarRanks` (`setDescRank`)—policy: Frozen Scheme Relations
+  Keep Enclosing Variables Monomorphic (above). After a relation owned by an
+  already-generalized scheme resolves, every enclosing-scope variable it
+  merged into a generalized class, and everything that class reaches,
+  returns to the enclosing variable's rank. No content is written.
 - `codecInputsAreBoundaryLocal` / `quiesceSchemeRequirementsAtBoundary`—policy:
   Derived Parser Tag-Row Closure (above). Exact owned codec relations with
   settled local inputs move to boundary validation before generalization;
@@ -13834,6 +14879,13 @@ module's layouts, descriptors, and workers are a function of its own checked
 module and its imports' checked modules alone (Per-Module Output, below), so
 two modules never need to agree on anything a third module decided.
 
+A record field's default identity is part of its immutable checked type,
+even though required and defaulted fields have identical inline layouts.
+Boxy interns and digests the declaring module's content identity and default
+expression identity, preserving them through substitution and stored-function
+metadata. A same-shaped required record must never acquire another record's
+default merely because their layouts coincide.
+
 A descriptor's layout of a type is byte-for-byte the layout the layout store
 commits for the same type: static descriptor emission lays each descriptor
 out from the committed layout. The struct field ordering
@@ -13853,7 +14905,8 @@ a nested lambda or closure expression, a generated structural codec
 derivation, or an entry wrapper. Worker identity is the template or expression
 identity; a template is never lowered twice, whatever the number of its uses
 or instantiations, with one declared, bounded exception: a `List` template
-also has a `List(U8)` worker (Pre-Specialized List(U8) Workers). A worker is
+also has one worker per fixed-size integer item type (Pre-Specialized
+Integer List Workers). A worker is
 lowered at its checked definition type, in which its scheme's quantified
 variables appear as type variables.
 
@@ -13874,6 +14927,16 @@ input takes as one hidden argument after its explicit checked parameters
 the same way. A nested lambda that is not generalized has no scheme of its own: the
 descriptors and dictionaries its body mentions belong to the enclosing worker
 and reach it as captures (see Function Values).
+
+Checking can give a local function a dispatch scope that quantifies nothing
+and takes no hidden argument: no variable, dictionary, or literal argument
+(`LocalScheme.isEmpty`), such as `g = |s| Str.concat(r.to_str(), s)` inside a
+generalized local. Its procedure is called and stored like a monomorphic one,
+but the scope stays a link of the evidence and literal chains, whose depths
+count every checked scope: its worker carries an empty entry in
+`dict_scopes`, `dict_scope_params`, and `literal_scopes`
+(`Program.lambdaWorker`), so the depth of the enclosing function's `to_str`
+names that function's scope from inside `g` as it does in checking.
 
 A checked parameter or result whose type mentions a type variable in scope is
 *dynamic*. A dynamic parameter is passed as the address of storage the caller
@@ -13929,7 +14992,11 @@ callable carries the caller's instantiation: a `where` requirement whose
 interface mentions the variable (the dictionary's methods), or any
 parameter holding a nominal over a callable payload, whose callable's
 interface its methods hide from the signature
-(the argument traversal of `SealedSchemeSlots`). A bounded flex that unification
+(the argument traversal of `SealedSchemeSlots`). This includes
+`Encoding.ParseTagUnionSpec`: its nominal exposes the parsed shape, but its
+callback exchanges the format invocation's error row in both arguments and
+results. Sealing the format's row would change that callback's ABI.
+A bounded flex that unification
 tied to a rigid or a closed row is not a flex, so genuine row polymorphism
 (`[A, ..r] -> [A, B, ..r]`) and every other quantified variable keep their
 hidden descriptors.
@@ -13988,9 +15055,16 @@ types are one or commit one layout, since a reached row's source tags are a
 subset of its destination's and equal variant counts mean equal tag sets.
 
 A generated codec family (design.md "Dictionaries") seals in the same way.
-A family's value shape, encoding, and state are closed, so its only variables
-are those of its results, and its generated code constructs only the tags its
-contract names: nothing in a family's body can produce a value at a row tail.
+A family's value shape is closed, and its generated code constructs only the
+tags its contract names: nothing in a family's body can produce a value at a
+row tail. Its encoding and state can hold variables of the family: a format
+type declared in a function body lists the enclosing function's variables it
+depends on as hidden arguments (Body-Local Type Context), so a backing that
+stores one (`LocalFormat := [Default, Other(List(a))]`) has the instance's
+representation. Those are ordinary family variables with hidden descriptors;
+an erased family worker whose captures hold such an encoding reads them from a
+dynamic capture record (`beginDynamicErased`), and its callables are packed as
+dynamic closures.
 So a variable of the derivation's constructor type that seals to its row
 default (`variableSealsToRowDefault`) is no variable of the family
 (`contractEnv`), and takes no hidden descriptor. A family's helpers then have
@@ -14059,18 +15133,23 @@ closed operations use their committed layouts. Function values and erased calls
 retain the wrapper and its ordinary calling convention. This is direct lowering
 of a declared primitive, not general body inlining or specialization.
 
-#### Pre-Specialized List(U8) Workers
+#### Pre-Specialized Integer List Workers
 
-Byte lists are the one instantiation pre-specialized under `.boxy`. A
-monomorphic `List(U8)` call into a generic `List` worker would read the item's
-size from its descriptor, copy single bytes through it, and build each `Try`
-result through the descriptor of the result type, which dominates byte-oriented
-programs. So every `List` template has, besides its generic worker, a second
-worker lowered with its list item variable bound to `U8`
-(`TemplateBinding.list_u8`). No other type and no other template gets one,
-and nothing requests one on demand: this is not a specialization mechanism.
+Lists of fixed-size integers are the one family of instantiations
+pre-specialized under `.boxy`. A monomorphic `List(U32)` call into a generic
+`List` worker would read the item's size from its descriptor, copy each item
+through it, and build each `Try` result through the descriptor of the result
+type, which dominates byte- and integer-oriented programs (a decompressor's
+`List(U16)` and `List(U32)` tables). So every `List` template has, besides its
+generic worker, one worker per INTEGER LIST ITEM TYPE, lowered with its list
+item variable bound to that type (`TemplateBinding.list_int`). The integer list
+item types are exactly `U8`, `I8`, `U16`, `I16`, `U32`, `I32`, `U64`, `I64`,
+`U128` and `I128`, in that declared order (`ListIntItem`). No other type (not
+`F32`, `F64`, `Dec`, `Bool`, `Str`, a SIMD vector, or any composite or nominal
+type) and no other template gets one, and nothing requests one on demand: this
+is not a specialization mechanism.
 
-- A template has a `List(U8)` worker exactly when the Builtin module's method
+- A template has integer list workers exactly when the Builtin module's method
   registry names it as a method of `List`, its body is a checked body (a
   template with `provided_low_level` already emits its operation at every
   direct call), and its first parameter's type is `List(item)` for a scheme
@@ -14079,31 +15158,36 @@ and nothing requests one on demand: this is not a specialization mechanism.
   converted signature; it never reads a name or scans a body. Templates with
   other scheme variables (`map : List(a), (a -> b) -> List(b)`) bind only
   the item variable; the rest stay variables of the worker.
-- The worker's body, signature, and the lambdas its scope roots are lowered
-  with the item variable bound to the `U8` type (`Worker.list_u8_slot`), so
-  every value of the item type, and every type over it (`Try(item, e)`,
-  `List(item)`), is closed and lowers as monomorphic code does. Its hidden
-  inputs are the generic worker's in the same order: the item variable's
-  descriptor stays an input, which callers fill with `U8`'s descriptor and
-  the body never reads, and its dictionaries (`is_eq` on items) and literal
-  arguments are supplied as for the generic worker. Call sites, dictionaries,
-  and table recipes therefore need nothing of their own.
+- Each worker's body, signature, and the lambdas its scope roots are lowered
+  with the item variable bound to its integer type (`Worker.list_int`, the
+  slot and the type). The item type and types whose only open component was
+  that item (`List(item)`, or `Try(item, e)` with sealed `e`) are closed and
+  lower as monomorphic code does; other quantified variables remain open.
+  Its hidden inputs are the generic worker's in the same order: the item
+  variable's descriptor stays an input, which callers fill with the integer
+  type's descriptor and the body never reads, and its dictionaries (`is_eq` on
+  items) and literal arguments are supplied as for the generic worker. Call
+  sites, dictionaries, and table recipes therefore need nothing of their own.
 - A direct call of a generic `List` template whose instantiation binds the
-  list item variable to exactly `U8` calls the `List(U8)` worker
-  (`Program.directCallTarget`), with the hidden inputs computed for the generic
-  worker. Every other instantiation, including a variable the caller's own
-  instantiation will make `U8`, calls the generic worker. A function value of
-  the template (`List.get` used as a value, or a dictionary method) is the
-  generic worker's: only direct calls are redirected.
-- The worker's identity is a content identity of its own
-  (`listU8TemplateWorkerIdentity`), distinct from the generic worker's and the
-  same in every object of the link; its readable name is the template's with
-  `@U8` appended (`Builtin.List.get@U8`). Stored-function and table-needs
-  metadata name it with its own worker tag (`template_list_u8`).
-- The Builtin module's unit lowers and exports the `List(U8)` workers of all
-  its `List` templates with the generic workers (Per-Module Output), in
-  template order, since its importers are lowered independently and reach
-  them by symbol. The link drops those nothing calls.
+  list item variable to exactly one integer list item type calls that type's
+  worker (`Program.directCallTarget`), with the hidden inputs computed for the
+  generic worker. Every other instantiation, including a variable the caller's
+  own instantiation will make an integer type, calls the generic worker. A
+  function value of the template (`List.get` used as a value, or a dictionary
+  method) is the generic worker's: only direct calls are redirected.
+- Each worker's identity is a content identity of its own
+  (`listIntTemplateWorkerIdentity`, over the template and the item type),
+  distinct from the generic worker's and the other item types' and the same in
+  every object of the link; its readable name is the template's with the item
+  type appended (`Builtin.List.get@U8`, `Builtin.List.get@I64`).
+  Stored-function and table-needs metadata name it with its own worker tag
+  (`template_list_int`) followed by one byte naming the item type.
+- The Builtin module's unit lowers and exports the integer list workers of
+  all its `List` templates with the generic workers (Per-Module Output), in
+  template order and, within a template, in the declared item type order, so
+  the unit's output is the same whatever the thread count. Its importers are
+  lowered independently and reach them by symbol. The link drops those nothing
+  calls.
 
 #### Type Descriptors
 
@@ -14151,6 +15235,11 @@ of the component's type; for a list, box, recursion box, or nominal type the
 names block of its item, payload, or backing. A type with no record field
 or tag in its reach has none (null). Blocks are built by descriptor key, each
 reserved before its components', so a recursive type's block reaches itself.
+Filling follows an explicit worklist, so deep types consume heap storage rather
+than native stack frames. Label reachability reuses the shared demand-driven
+SCC analysis: every reached type is expanded once, and a negative answer is
+stored only after its complete component has no path to a label. Building
+nested unnamed wrappers therefore does not repeatedly traverse their suffixes.
 
 Only code that reflects over a type reads a names block: `dyn_inspect`
 (`Str.inspect`, `dbg`, and the rendered value of a failed `expect`'s `Err`)
@@ -14242,7 +15331,11 @@ callable, since the descriptor holding it lives for the program's lifetime.
 Two descriptors of the same type may be distinct static data (one without
 override scope, one carrying a body's overrides); no consumer compares
 descriptors by identity, and equality, hashing, and inspection are defined on
-values through descriptors, never on descriptors.
+values through descriptors, never on descriptors. An override capturing such a
+descriptor is likewise distinct static data for one method: two override scopes
+merged into one descriptor agree on a nominal type when each of its methods
+enters the same procedure, and the merged scope keeps the first scope's
+callables.
 
 #### Type Tables
 
@@ -14402,16 +15495,17 @@ descriptor explicitly as an operand:
   `Box` whose payload `desc` describes, and `dyn_slot_store(dst, slot, value,
   desc)` moves the built value into it ("Recursive values" above).
 
-The native dev backend emits five of these operations inline, reading the
+The native dev backend emits seven of these operations inline, reading the
 same descriptor fields the runtime helper reads, and calls the helper only
 for the cases listed:
 
-- `dyn_copy` loads `size` and copies a 1-, 2-, 4-, 8-, or 16-byte value with
-  loads and then stores, copies nothing for size 0, and calls `roc_desc_copy`
-  for every other size.
+- `dyn_copy` loads `size` and copies a 1-, 2-, 4-, 8-, 16-, or 24-byte value
+  with loads and then stores, copies nothing for size 0, and calls
+  `roc_desc_copy` for every other size. A `set_local` of a dynamic local is
+  the same copy.
 - `dyn_list_item_addr` is the list's bytes plus `index` times `size`. A
   zero-sized item calls `roc_desc_list_item_addr`, whose address it is.
-- `dyn_field_addr` with an immediate semantic index follows nominal `child`
+- `dyn_field_addr` with an immediate source-field index follows nominal `child`
   links to the record, reads the field's memory slot from that index's
   `entries` row, and adds that field's `offset` to the base. A field whose
   descriptor is a recursion box, and an index held in a `field_index` table
@@ -14422,11 +15516,18 @@ for the cases listed:
 - `list_get_unsafe`, `list_map_extract_unsafe`, and `list_move_out_unsafe`
   with an item descriptor write nothing for a zero-sized item or a list
   without bytes. Otherwise they copy the item as `dyn_copy` does.
+- `list_append_unsafe` and `list_map_write_unsafe` with an item descriptor
+  copy the item into the list's bytes as `dyn_copy` does, at the list's
+  length or at the given index, and write the list's three words to the
+  target with the length one greater for an append. A zero-sized item copies
+  nothing, and appending one writes a list with no bytes and no capacity.
+- `incref` and `decref` of a dynamic local load the descriptor's
+  `contains_refcounted` flag, do nothing when it is clear, and otherwise call
+  `roc_desc_incref` or `roc_desc_decref` ("Ownership").
 
-Every other dynamic statement, everything that allocates, and every
-reference count operation calls the runtime. The wasm backend, the LLVM
-backend, and the interpreter call the helpers for these five as well, and
-produce the same bytes.
+Every other dynamic statement and everything that allocates calls the
+runtime. The wasm backend, the LLVM backend, and the interpreter call the
+helpers for these seven as well, and produce the same bytes.
 
 A literal whose conversion depends on its instance never converts at a type
 the body does not know: its converted value is a literal argument of the
@@ -14500,9 +15601,20 @@ and the checker keeps those instances finite. Static dictionaries reserve every
 callable before filling any, so a capture relocates to its target like a
 recursive descriptor's, and a type table's recipes that lead back to one
 another are evaluated as one group the same way.
-A stored function value's types are closed, so a dictionary that captures
-itself is stored as its target and types alone and built again as static data
-on restore, which keeps the constant graph acyclic.
+A stored function's capture graph records these cycles explicitly. Restoring
+it reserves its nodes before connecting their edges; it never rediscovers
+dictionaries from types or emits runtime composition.
+
+A declaration context's dictionaries include the one being built, so a local
+procedure's value built from it can capture the dictionary that captures it:
+a generated codec constructor captures its format's local methods, which
+capture the callee's dictionaries, the codec among them. Each slot of the
+context is built on its first read; a procedure reading a slot still being
+built captures its reserved recipe. The completed graph retains the actual
+callee instance's descriptors, dictionaries, literal arguments and local
+procedure captures. The same graph is serialized for stored constructors,
+including mutually recursive captures, rather than replacing a declaration
+context with the caller's frame or reconstructing it during restoration.
 
 Compiler-derived structural evidence (equality, hashing, inspection) is a
 callable over the dispatcher's descriptor: the dictionary for `[a.is_eq]` with
@@ -14600,20 +15712,47 @@ strategy).
   other root's, and a runtime program converts the literal where the value
   is needed. This keeps a `.boxy` program's literal rejections identical to
   a specialized program's: every conversion a program reaches is run at
-  compile time, at the type it is reached at.
-- A literal argument root is the `.boxy` evaluator's. A `.boxy` compilation
-  evaluates it like any pending root of its modules, in dependency order:
-  the request scheduler (`CompileTimeRequestScheduler`) and the finalizer's
-  completion state walk the scheme a root's edge instantiates and treat a
-  template's `literal_argument_demand` as reads, so each root completes
-  before any root whose evaluation calls through it. A `.lss` compilation
-  converts each literal in the specialization that fixes its type and never
-  reads these roots, so it leaves them `unevaluated`, exactly as it leaves a
-  root it does not demand: a later `.boxy` compilation reopens the checked
-  module and evaluates them (`hasUnevaluatedRequests` takes the strategy).
-  The one checked module no compilation reopens, the baked Builtin, is
-  completed at its bake (`Options.complete_baked_module`), whose `.lss` finalization hands
-  these roots to the `.boxy` evaluator.
+  compile time, at the type it is reached at. A rejection is reported in the
+  module of the root whose evaluation rejected the literal: at the literal
+  when the literal is that module's own, and otherwise at the root, naming
+  the literal as the failure's origin. The report stays with the module
+  whose stored result holds the failure, so a compilation that restores the
+  result from the checked-module cache reports it again without converting
+  the literal again.
+- A literal argument root is the `.boxy` evaluator's, and every compilation
+  evaluates it like any pending root of its modules, under either strategy,
+  so a checked module holds the same values whichever strategy completed
+  it. A `.boxy` compilation evaluates it in dependency order: the request
+  scheduler (`CompileTimeRequestScheduler`) and the finalizer's completion
+  state walk the scheme a root's edge instantiates and treat a template's
+  `literal_argument_demand` as reads, so each root completes before any root
+  whose evaluation calls through it. A `.lss` compilation hands these roots
+  to the `.boxy` evaluator with every other root whose evaluation reads no
+  function value, in the one program that evaluates them before its Solved
+  program is specialized ("Compile-Time Evaluation Under `.lss`"); one that
+  reads a value of a root holding a function value completes once the
+  Solved program's roots have, with every pending root whose value it reads
+  that the Solved program did not demand. A module's own finalization
+  outside a program session (the baked Builtin's among them) hands each
+  batch's literal argument roots to the `.boxy` evaluator.
+- A specialization converts a literal where its type first becomes
+  concrete, which is where some module's literal argument root converts it
+  when checking recorded that instantiation, so every root for one literal
+  and one closed type holds the value the specialization's conversion would
+  produce. Monotype indexes the stored literal argument roots of the
+  program's modules by literal (`LiteralArgumentRootIndex`), and a
+  specialization converting a literal whose node's type is closed restores
+  the value of the root whose type's Monotype is that type
+  (`restoredLiteralArgument`) instead of registering a literal root. A debug
+  compiler asserts that every root for the literal at that type stored the
+  same value. A root whose conversion failed reported the failure in its
+  module and stores it; the specialization restores it as a failure already
+  reported (it lowers as reached checked-error code does), so a compile-time
+  root that reads it reports nothing more, as a `.boxy` read of a failed
+  root's value reports nothing more. Compile-time discovery accordingly specializes a body for a
+  literal whose conversion depends on its instance only where an
+  instantiation checking records no edge for reaches it ("Demand-Driven
+  Compile-Time Specialization").
 
 Lowering gives every worker one hidden input per literal requirement of its own
 scheme, after its dictionaries (`Worker.literal_params`, in literal requirement
@@ -14695,10 +15834,20 @@ descriptor, its second word the capture capacity of the allocation holding it
 (the record's size when the callable is first packed; an allocation repacked
 in place keeps its capacity), and the callable's `on_drop` is the shared
 runtime drop that reads the first word. When every capture is of closed type,
-the capture record has a static layout and `on_drop` is the per-worker helper
-the backend generates for that layout. Zero-capture functions are static,
-immortal callables. The `out_desc` slot of the erased-callable ABI is always
+the capture record has a static layout and `on_drop` names that layout's helper
+only when it contains refcounted data. The callback is optional, not a
+requirement of every exposed callable handle. Immortal static recipe wrappers
+need no callback: their descriptor and callable words own no runtime units,
+and decrementing a static allocation never invokes final-drop logic.
+A callable whose captures are all recorded constant data, including its type
+table, is immutable data too. Zero-capture functions are therefore static,
+immortal callables under both strategies, rather than allocations at each use.
+The `out_desc` slot of the erased-callable ABI is always
 written null: the caller knows the result type's descriptor itself.
+
+Completed callable parts carry the producer-selected drop helper along with
+the procedure. The static-data encoder preserves that relocation: an immortal
+allocation does not erase its callable ABI, including a host's explicit drop call.
 
 Every `.boxy` erased worker (a lambda, an adapter, a method entry, a literal
 or root thunk) takes the erased ABI's reuse argument as its last parameter,
@@ -14708,8 +15857,11 @@ closure the body packs repacks it when the worker's own closure is dynamic,
 a packing of the worker's own closed capture layout repacks it when that
 closure is closed, and otherwise ARC releases it. A worker's capture record is
 a view whose owner is that argument, so a packing that would repack the
-allocation while a later read of the captures is still to come retains it,
-and the runtime then packs afresh.
+allocation while a later read of the captures is still to come retains it
+before the packing statement, and the runtime then packs afresh. The retain
+must precede the packing because the packing decides by the allocation's
+count whether to repack in place; a retain after it would let the packing
+overwrite the captures that later reads still view.
 
 An erased call passes its arguments as one record in the uniform ABI. When the
 call's argument types are closed, that record has a static layout; when they
@@ -14763,8 +15915,11 @@ dynamic parameter as it treats any aggregate parameter, and no pass needs to
 know what the descriptor will say. Backends lower `incref`/`decref` of a
 dynamic local to the runtime's descriptor-guided `roc_desc_incref` and
 `roc_desc_decref`, which do nothing when the descriptor reports no refcounted
-content. Backends remain forbidden from reasoning about reference counting in
-any other way.
+content. The native dev backend reads that one flag inline and skips the call
+when the helper would do nothing. That skip is the only exception to the rule
+that backends do not reason about reference counting: it selects no helper,
+moves no statement, and infers no ownership. Backends remain forbidden from
+reasoning about reference counting in any other way.
 
 #### Host ABI
 
@@ -14804,9 +15959,10 @@ data of the program, immutable, so the runtime and the code calling it share
 nothing mutable between threads or between programs in one process.
 
 A helper that copies a value's bytes (copy, construction, adaptation, list
-item reads, writes, and sets) copies a 1-, 2-, 4-, 8-, or 16-byte value with
-one load and one store and every other size with `memmove`. Overlapping
-operands therefore copy as `memmove` copies them, whatever the size.
+item reads, writes, and sets) copies a 1-, 2-, 4-, 8-, 16-, or 24-byte value
+by loading all of it and then storing it, and every other size with `memmove`.
+Overlapping operands therefore copy as `memmove` copies them, whatever the
+size.
 
 Traversal stacks and other temporary buffers do not escape the operation
 that allocates them. In-process execution allocates these from the
@@ -14845,11 +16001,13 @@ Nothing a module emits depends on a module that imports it:
   every template's body and its dictionary entry are emitted, since another
   module may call a template or pack it as a function value, and the
   entries of its registered methods and its `??` defaults with them, and
-  for the Builtin module the `List(U8)` workers of its `List` templates
-  (Pre-Specialized List(U8) Workers); the
+  for the Builtin module the integer list workers of its `List` templates
+  (Pre-Specialized Integer List Workers); the
   wrappers of its `expect` and REPL roots are not, since nothing reaches them
   but a test plan's or a REPL's own roots, and each of those lowers as one
-  program whose roots may name modules no unit lowers;
+  program whose roots may name modules no unit lowers; exact procedure aliases
+  likewise emit no evaluator wrapper, because their checked forwarding metadata
+  directs every use to the referenced procedure rather than an evaluated value;
 - its conversion workers are its own and memoized within it alone;
 - ARC solves each of its procedures' ownership signatures from the procedure's
   body and its callees, and a call from another module never demands an
@@ -14910,9 +16068,8 @@ and program output. `roc
 check` accepts `--opt` and ignores it; it honors `--specialize`, because the
 strategy selects the compile-time evaluator that completes the module's
 roots. The checked module itself names no strategy: both evaluators store
-the same values, and the one kind of root only the `.boxy` evaluator reads
-(a literal argument root, "Literal Arguments") a `.lss` check leaves
-unevaluated for a `.boxy` compilation to complete, so a module checked under
+the same values, and every compilation hands a literal argument root
+("Literal Arguments") to the `.boxy` evaluator, so a module checked under
 one strategy is served to the other.
 
 The per-module Boxy cache is exactly as simple as the checked-module cache,
@@ -14928,7 +16085,15 @@ and Per-Module Output is the invariant that makes it possible:
   modules, so their keys already cover them. A key names one file.
 - An edit to a module changes its checked entry key and therefore the key of
   every module whose checked entry covers it, so the edited module and its
-  importers rebuild. A compile-time value a module computes by running an
+  importers rebuild. A unit's task computes its key on its lane, once its
+  imports' units are done: the module's own part of its digests (its stored
+  values and public surface, the bulk of the hashing) is hashed there, or
+  earlier by a lane no unit was ready for, and the imports' parts come from
+  the digest table their units recorded into, which the lanes share under a
+  mutex (`boxy_interface.Digests`). The exports digest a finished unit
+  records folds the object's stored export-record digest with its imports',
+  so the thread that sequences the units hashes no module content itself. A
+  compile-time value a module computes by running an
   import's code is part of the module's own evaluation output, so an edit that
   changes that value rebuilds the module.
 - NAMES come from the link, not from content. A worker's symbol and a nominal
@@ -14961,7 +16126,16 @@ and Per-Module Output is the invariant that makes it possible:
   lowered for the module, through the object's machine code, and the few
   words of ARC interface a downstream module compiles against (each exported
   procedure's solved ownership signature and uniqueness data, which
-  Per-Module Output makes a function of the module and its imports). There
+  Per-Module Output makes a function of the module and its imports), with
+  the digest of those records (`exportRecordsDigest`). An importer's key
+  folds in the module's export digest, which combines that records digest
+  with its imports' export digests (`Digests.recordExportsDigest`), so a
+  restored object's records are not hashed again. This is a checked
+  interface digest, never a payload-integrity hash. The v2 export digest
+  composition changes hash bytes; object format 19 also incorporates stored
+  field-default identities alongside integer worker bindings and invalidates
+  the older entries. Its inputs remain the module's own export records and its imports,
+  never its importers or other modules in the program. There
   is no index, no manifest, no second cache the file refers to, and nothing
   in it comes from any other cache. `ROC_VERIFY_BOXY_OBJECT_REUSE` rebuilds
   every restored object and compares the bytes, so a key that misses an input
@@ -15098,24 +16272,38 @@ with a rebuilt unit's exactly as it compared objects.
 
 ### Compile-Time Evaluation Strategy
 
-`--specialize` selects the compile-time evaluator as well as the runtime
-lowering (`CompileTimeFinalization.Options.strategy`). Under `.lss`,
-compile-time evaluation specializes the pending roots into a Solved program
-and evaluates it in dependency-ordered stages, as Compile-Time Constants
-describes. Under `.boxy`, the `.boxy` compile-time evaluator
-(`finalizeProgramBoxy`) orders the pending roots by the values they read,
+`--specialize` selects the runtime lowering, and which evaluator completes
+the roots holding function values (`CompileTimeFinalization.Options.strategy`).
+In a program's compilation, every other compile-time root is the `.boxy`
+compile-time evaluator's under either strategy, so the compilation lowers and
+compiles each procedure its compile-time roots reach once, and a checked
+module holds the same values whichever strategy completed it ("Compile-Time
+Evaluation Under `.lss`"). A module finalized on its own, outside a program
+session (the baked Builtin's among them), splits each batch of its roots
+between the two evaluators as `lowerEvalAndFinishRoots` describes.
+The `.boxy` compile-time evaluator (`evaluateRootsBoxy`) orders the pending
+roots by the values they read,
 computed from the checked modules alone (`eval/checked_root_graph.zig`: a
 root's wrapper template and every template it reaches through its value
-references, in any module of the program, with every read a dependency), and
-lowers each module's pending roots as one `.boxy` program of compile-time
+references, in any module of the program, with every read a dependency).
+A compilation that links module objects lowers each module's pending roots as one `.boxy` program of compile-time
 roots (`TargetConfig.boxy_compile_time`), module by module in an order that
-puts an import before the modules importing it. A root reads an earlier
-module's values from that module's constant store, exactly as a runtime
-`.boxy` program reads stored values, and reads a root of its own module
+puts an import before the modules importing it, against its imports'
+objects, which compile the imports' code once. A compilation that links no
+module objects (no cache, a Solved compilation, or a host that interprets
+compile-time code) lowers every pending root as one program: a module's own
+program would lower everything its roots reach, so the programs of modules
+reaching the same code would each lower and compile it. A root reads a
+value an earlier program completed from its module's constant store, exactly as a runtime
+`.boxy` program reads stored values, and reads a root of its own program
 through the root's compile-time value slot (`Program.rootValueSlot`): a
 static data slot with a failure record, which every read guards
 (`lir.ComptimeValueGuards`), exactly as a Solved program reads a completed
-value. Before any root runs, the evaluator marks every slot of the program
+value. The slot holds the value at the root's own type
+(`Program.rootValueType`); a read in another module is checked at that
+module's own copy of the type, which can store the value differently (a
+record row lifted into a padded nominal), so it converts the value as a read
+of a stored value does. Before any root runs, the evaluator marks every slot of the program
 failed with the failure a read of a value not yet evaluated reports
 (`markRootSlotsUnfilled`); completing a root writes its value into its slot
 and clears the mark, so a read of a root the program has not completed
@@ -15245,6 +16433,39 @@ A literal argument root ("Literal Arguments") is the module's program's
 whatever its value: one whose value holds a function is evaluated for its
 outcome and discarded.
 
+#### Compile-Time Evaluation Under `.lss`
+
+A pending root's routing follows its reachable checked references through every
+visible module, including cached imports. Visibility does not grant permission
+to finalize an imported root. A completed value available only to LSS blocks
+its readers from the pre-Solved Boxy batch; it is not a ready Boxy dependency
+merely because it is absent from that batch's pending roots. Direct template
+dependency and readiness summaries are decoded once per batch and shared by
+the roots that reach them, including through recursive calls.
+
+A `.lss` compilation (`finalizeProgram`) hands the `.boxy` evaluator every
+pending root that neither holds a function value nor reads, directly or
+through other roots, the value of a root that does; a literal argument root
+counts as holding none, since the `.boxy` evaluator owns it whatever its
+value ("Literal Arguments"). They complete in one program before the Solved
+program is specialized (`evaluateBoxyRoots`, `.before_solved`), so the
+specialization restores every value it reads exactly as a compilation of
+cached modules does: the Solved program of a cold compilation and of a warm
+one are the same program, and an LSS runtime consumer continues it without
+the program being specialized again when it has no root left to evaluate and
+no discovery root to specialize ("Runtime Programs Read Stored Values").
+A root holding a function value is the
+Solved program's, since a `.boxy` function value means nothing to Monotype
+("Stored Function Values"), and so is every root reading one; the Solved
+program evaluates them, and the literal roots its specializations register,
+in dependency-ordered stages, as Compile-Time Constants describes. A literal
+argument root reading a value of a root holding a function value completes
+after the Solved program's roots (`.after_solved`). A compilation whose
+roots hold no function value therefore compiles its compile-time code in one
+program, and specializes nothing for compile-time evaluation but the bodies
+that can register a literal root ("Demand-Driven Compile-Time
+Specialization").
+
 #### Demanded Checked Body Indexes
 
 A Boxy lowering registers every visible module's identity and interface, but
@@ -15257,6 +16478,29 @@ source traversal, guessed reachability, or persistent cache. Imports used only
 through linked code do not require their private body indexes. Allocation
 failure propagates, and the index is marked complete only after registration of
 all its records succeeds.
+
+A checked module's own body index (`body_analyses.ModuleIndex`: which nodes
+its bodies reach, the top-level unit owning each, and per-binding declaration
+data) follows the same rule one level down. It is a pure function of the
+module's CIR and promoted local procedures, so it is built on first demand into
+a write-once slot of the module's `BodyAnalyses`, like every other body analysis,
+and is never serialized. Storing a freshly checked module demands it, since
+storing reads it; installing a cached checked entry does not. A consumer
+demands the index of every module whose bodies it reads before reading any:
+LSS lowering at its preparation (`CheckedModules.demandBodyIndexes`), literal
+demand, and platform pairing. Boxy registration and preparation demand none:
+its body-metadata index, worker-body builder, capture reader and default-worker
+consumers demand only their own module. Unit worker seeding demands only the
+modules the unit owns. An import used through linked procedures therefore keeps
+its checked body index unbuilt. Reading the index of a module no consumer
+demanded is a compiler invariant violation. A run whose checked modules all
+come from the cache and that lowers nothing, such as a `roc test` whose every
+outcome is reused, builds no index. The index is not filed in the checked
+entry: it is several bytes per CIR node, so reading it back would cost about
+what building it costs, and a run that lowers nothing would still pay it for
+every module. The export interface digest reads only the number of
+defaulted-field defaults, which it counts from the CIR directly
+(`defaultExprCount`).
 
 #### Error-Type Reachability
 
@@ -15352,7 +16596,7 @@ versions; a module elsewhere in the recipe is an index into that table. The
 recipe then holds its own table of types rather than ids of stored types. A
 generated codec worker's signature is generic, so a recipe type can name
 variables, which no stored type does, and a table keeps a block-local nominal's
-outer arguments, which a stored type leaves to its reader's scope. Workers are
+context arguments, which a stored type leaves to its reader's scope. Workers are
 named as their keys name them: templates and lambdas by checked id, codec
 pieces by their family's derivation, a compile-time slot by its root.
 
@@ -15371,7 +16615,7 @@ read. The module's remaining roots then restore the stored values.
 
 The stored form lives in `CompileTimeRoot.boxy_value`, beside the payload the
 `.lss` evaluator fills, because a recipe means nothing to Monotype. Each producer
-publishes its own function representation without replacing the other's. A
+stores its own function representation without replacing the other's. A
 Boxy-first root leaves the LSS payload `.unevaluated`; an LSS-first root keeps
 its completed payload when Boxy adds its capture graph. The constant writer
 records whether the LSS root's materialization plan contains functions,
@@ -15382,17 +16626,18 @@ representation is pending even when the other strategy has completed its value.
 Coordinator object eligibility, evaluation selection and Boxy reads use this
 same view. Pending reads use the existing compile-time root slots; runtime
 lowering never reconstructs another strategy's callable captures. Non-function
-values remain shared. Publishing another representation replaces that root's
+values remain shared. Storing another representation replaces that root's
 previous debug observations rather than replaying both copies in one command.
 The baked Builtin producer completes both function representations before
 serialization, since its consumers cannot reopen it. A platform pairing keeps
 the declared requests for inherited values still missing either representation;
-semantic completion alone does not remove their producers from the schedule.
+completion by one strategy alone does not remove their producers from the schedule.
 
 A literal in a generic body converts at the first instantiation that fixes
-its type, under either strategy: as a literal root of the specialization
-under `.lss`, as a literal argument root of the instantiating module under
-`.boxy`. A `.boxy` compile-time program converts its literals exactly as a
+its type, under either strategy: as a literal argument root of the
+instantiating module where checking recorded the instantiation, which both
+strategies evaluate, and otherwise as a literal root of the specialization
+under `.lss` or a literal thunk under `.boxy`. A `.boxy` compile-time program converts its literals exactly as a
 runtime program does, through its literal arguments and dictionaries, so the
 evaluator runs no discovery pass and no literal table exists: a literal
 rejection, a conversion's effects, and a dormant-code diagnostic are the
@@ -15449,6 +16694,43 @@ it too. Each consumer reads its own representation into the shared
   an override call, ...). Monotype lowering builds rendering expressions from
   it, Boxy lowering emits rendering LIR from it, and the Boxy runtime renders
   descriptor-described values to bytes from it.
+
+  Monotype lowering's generated renderings append onto one accumulator.
+  The helper of each rendered type takes the accumulator ahead of the value
+  (`(Str, T) -> Str`) and returns the accumulator with the value's rendering
+  at its end; a nested rendering therefore writes into the same string as
+  its parent, and no rendering is built apart and copied in. Every piece
+  (literal text, a label, a primitive's text, an override's result, a
+  `<missing>` marker, a list separator) is joined with `str_append`, never
+  `str_concat`. The text between one child and the next (a separator, a
+  label, and the label's separator) is one piece, so a record field or a
+  payload costs one join for its text and one for its value. A rendering of
+  several pieces first reserves
+  (`str_reserve`) the byte length of the literal text it will append: a
+  record's braces, labels, label separators, and field separators; a tuple's
+  parentheses and separators; a variant's name, payload parentheses, and
+  separators (per variant, since each is its own rendering); a box's
+  `Box(` and `)`; a list's brackets. A child rendering's length is its own
+  rendering's and is not reserved, and neither are a list's item separators,
+  whose count is the list's runtime length; nothing is rendered ahead of
+  time to measure it. A rendering of one piece (a payload-less variant, an
+  empty record or tuple, a list of an uninhabited item type) is a plain append. `str_reserve`
+  grows a string to exactly the requested length and an append grows it
+  geometrically, so a nested reservation that outgrows the slack reallocates
+  once and the appends after it restore geometric slack; the first
+  reservation of a rendering is its one allocation when its literal text is
+  longer than a small string. `Str.inspect(value)` itself is the helper
+  applied to the empty string, except that a value whose shape renders as one
+  expression (a literal, a primitive, an override, an uninhabited type) is
+  that expression and no accumulator exists; a literal rendering still
+  evaluates the inspected value, whose effects (a nested `dbg`) are part of
+  the program. The LIR string-append fusion
+  needs no re-rooting for these helpers, since they already append onto the
+  accumulator they are given; it still fuses `str_append(acc, call)` where a
+  rendering appends an override's result, and a fused source that starts its
+  result from `Str.with_capacity` keeps that allocation and has its finished
+  result joined onto the accumulator at its return. Boxy's rendering is the
+  runtime walk over descriptors and is unaffected.
 - `inspect_override.zig`: `lookupInspectOverride`, the one selection of whose
   registry decides an owner's override (the first view, in method-dispatch
   search order, that declares `owner.to_inspect`), shared by Monotype
@@ -16024,7 +17306,14 @@ placeholder; completion joins that placeholder to the built node. Acyclic
 construction caches the built node directly. Checked aliases instantiate their
 parameter cells and cache their explicit backing cell: alias spelling is a
 checked view, never a separate value identity established by a placeholder
-unification. Allocation failure removes active
+unification. A closed checked type is cached under its canonical id, so equal
+closed types in a context share one cell, except in two occurrence roles that
+are cells of their own, exactly as in an imported Monotype: a record or tag
+union's row tail, and a nominal's backing. Relating an anonymous structure to a
+nominal lifts the structure's class into the nominal, so a row tail sharing
+that class would become a nominal, and a backing sharing it would come to name
+the nominal it backs. Such an owned occurrence is neither read from nor
+recorded in the cache; its components are. Allocation failure removes active
 entries, and copying completed cells into a child scope skips active entries.
 Graph node identities remain append-only, including recursive placeholders and
 all per-node request evidence. As relations are produced, explicit evidence
@@ -16126,16 +17415,36 @@ final demand validation or materialization, just as an unfinished placeholder
 must be filled. Unification with a checked variable preserves the checked
 variable's defaulting evidence. A cell that is unresolved or carries representation
 authority is captured as itself: relating it back would not be plain
-unification. An unfinished expansion is joined only by the instantiation it
-expands: each hole slot of the joining request names the class the expanding
-request supplied, or the expansion's own hole cell, as a recursive call inside
-the expansion does. Across mutually recursive expansions a slot may name
-another unfinished expansion's hole cell, which stands for the class that
-expansion's request supplied, and is followed to it. A single-request component takes a parametric
+unification. An unfinished expansion is joined only by a request for the types it
+expands, slot by slot over every hole slot, whether it was captured as a hole
+or as itself. An unfinished expansion's hole cell stands for its request's node
+in that slot, which may itself be another unfinished expansion's cell, so a
+slot is followed through the cells it reaches down the expansion stack. Two
+slots denote the same type when the nodes they reach share a class (a
+recursive call inside the expansion names the expansion's own cell; a call
+that swaps variables names the cells in the other order and joins only the
+expansion whose request was swapped the same way), or when what they finally
+reach are both settled and equal (a concrete argument such as `1.U8` is a
+fresh class at each recursive call). Joining relates the request to the
+expansion's roots, so a slot that denoted a different type would unify two
+types the program keeps apart. A request that joins beyond the expansion's
+own cells unifies the cell with that other node, so the expansion's interface
+is specific to that type and is stored for no other request.
+
+A generalized local function's relations are applied in a child scope frame
+at its use. A use inside that frame is a recursive use, which an annotated
+local may make at another instantiation of its own variables, so it relates
+to a fresh instantiation of the scope's root that shares only the enclosing
+frames' variables. The active frame already applies the scope's relations,
+and what they imply about enclosing variables is the same at every
+instantiation.
+
+A single-request component takes a parametric
 summary from its expansion before relating back to the request, so the summary
 keeps its holes open. Members of a larger component relate back to each other's
 requests before their summaries are taken, so a parametric member stores no
-reusable summary. The pins are the monotype capture test
+reusable summary, and neither does a member whose request holds another
+member's hole cell, which that member's request settles. The pins are the monotype capture test
 "interface constraints capture representation-neutral holes as variables", the
 compile test "interface summaries share one expansion across parametric
 instantiations", and test/echo/parametric_interface_summaries.roc (a template
@@ -16414,10 +17723,18 @@ runtime captures list, in ascending CaptureId order (the order of lifted
 capture slots). A lambda that captures nothing itself but calls a local
 procedure therefore differs between two enclosing instantiations whenever that
 procedure's captures do, and a local procedure does not differ on in-scope
-binders it never reads. Two binder kinds in the list contribute no frame
-value: a scheme alias, whose uses lower the callable it names, and a hoisted
-constant's binder, which is a frame local only while its own root lowers and
-is otherwise read through the ConstStore.
+binders it never reads. Only a frame value in the list is read from the
+enclosing frame. A scheme alias contributes none: its uses lower the callable
+it names. Neither does a method of a body-declared type, which a local
+procedure referring to it lists as a source capture (canonicalization leaves
+only a block's own local functions out of capture lists): a promoted method is
+a top-level procedure, and the uses of an unpromoted one (the checked method
+registry's `.local_proc` target) lower the procedure from its declaration
+context, its own runtime captures already in the referring site's list through
+that selection. Boxy reads the same list and builds an unpromoted sibling
+method's capture as that procedure's function value. A hoisted constant's
+binder contributes none either: it is a frame local only while its own root
+lowers and is otherwise read through the ConstStore.
 Stored function evidence remains graph-free across root and cache boundaries.
 Entering a restored nested body recreates its lexical substitutions in that
 body's instantiation context, consuming saved callable/capture interfaces and
@@ -17586,7 +18903,12 @@ No refcount plan exists for a value holding a hole. ARC borrows every such
 parameter, because the body never consumes it: the solver starts the position
 borrowed and nothing demands it, and a pinned signature (a code-keyed, root,
 hosted, or erased-callable procedure's, which is the one its types determine)
-borrows the position by its type. Two invariants pin this: requesting a
+borrows the position by its type. A tail loop over a shaped procedure makes
+such a parameter a join parameter that each loop jump rebinds. That join
+parameter carries no ownership unit, and rebinding it demands nothing of its
+value: a value holding a hole comes only from the procedure's parameters, so
+every value the loop rebinds it to is a borrow of a parameter that lives for
+the whole call. Two invariants pin this: requesting a
 refcount operation on such a value fails, and so does a procedure signature
 that owns such a parameter. The interpreter's refcount-effect conformance
 observer names such a value's own allocation, a list or box header, and
@@ -17607,7 +18929,9 @@ its final `alias_target`, and a callable-eval template carries its
 `forwarded_lookup` when the lookup reaches a directly callable procedure (an
 ordinary template, a hosted procedure, or another forwarding alias, to a fixed
 point). An alias of a function-valued constant is not a forward; calling it
-calls the evaluated value.
+calls the evaluated value. Root-request output and platform pairing omit
+evaluation only for this explicit forwarding proof, not for the lookup's
+procedure-reference shape: a computed callable alias still needs its value.
 
 A call through a forwarding alias is a direct call. Monotype enters the
 alias's scope with the call's use-site evidence and substitution, and requests
@@ -17972,12 +19296,24 @@ identities are interned in the caller's call-edge evidence slot, so the first
 request creates or loads the specialization and every repeated call is an O(1) hit before durable type
 or evidence digests are rebuilt. That identity is complete only for a
 specialization independent of the caller's local context. A caller-owned
-specialization (structural evidence lowered inside a local procedure context,
-or evidence naming a local procedure) also belongs to its lexical owner and
-lexical context, so the O(1) memo never records it; each repeated request takes
-the template lookup, which reuses it only from inside its lexical owner and
-only at an equal lexical context. Graph-participating targets consume their
-producer-authored graph protocol instead of taking this sealed-interface path.
+specialization (structural evidence lowered where a method of a body-declared
+type is visible, including inside a restored function whose retained scope
+can resolve one, or evidence naming a local procedure) also belongs to its
+lexical owner and lexical context, so the O(1) memo never records it; each
+repeated request takes the template lookup, which reuses it only from inside
+its lexical owner and only at an equal lexical context. Only a visible local
+method makes structural evidence caller-owned: structural derivation and
+generated codec contracts select methods by type, and a local procedure that
+is not a method is reachable only through evidence that names it. The lexical
+context a template body inherits is the visible local procedure declaration
+contexts and any restored-function scope, never the caller's value binders: a
+template body names none of them, and each local procedure it reaches installs
+its own declaration context's captured binders. The lexical context identity
+digests exactly that inherited context, so the recursive calls of a
+caller-owned body (whose inherited context equals its caller's) reuse it
+rather than lowering a new body per call site. Graph-participating targets
+consume their producer-authored graph protocol instead of taking this
+sealed-interface path.
 
 Nothing else exists. Absent an explicit checker-authored callable path,
 Monotype lowering never derives a method owner from type content, never
@@ -19101,7 +20437,22 @@ representation tier and marks a completed forced-dynamic backing callable as
 erased. It unifies all requirements through the same function
 `args/callable/ret` graph used for finite lambda sets. If a callable slot is
 forced to `erased`, direct LIR lowering produces packed erased callable values
-and indirect erased calls. If no explicit erased requirement reaches a callable
+and indirect erased calls.
+
+A capture-free erased callable is never packed at runtime. Its value is static
+data: a static-data slot whose `StaticDataValue.callable` names the target
+procedure, frozen directly as the callable's payload (the function-pointer
+relocation, no `on_drop`, no capture bytes) behind the static refcount, with no
+initializer procedure. The program interns one such slot per procedure, so
+every procedure that erases the same capture-free function reads the same
+slot. Worker preparation creates the slot for each capture-free member of every
+erased type it prepares, since workers cannot add static data; lowering then
+reads it with an `assign_literal` of the slot wherever it would have packed the
+member (a function reference at an erased type, and a callable-to-erased
+boundary over a capture-free variant). Such a read takes no erased-callable
+reuse destination: an immortal value is never unique, so no later repack can
+reuse it, and a repack of it allocates afresh. Debug builds assert after
+lowering that no capture-free `assign_packed_erased_fn` remains. If no explicit erased requirement reaches a callable
 slot and no box holds it, finite lambda-set dispatch is used.
 
 No ordinary source expression becomes erased because direct lowering finds
@@ -19328,8 +20679,8 @@ builder owns:
   pattern decisions and committed layouts, then emits LIR switches, joins, and
   bindings directly
 - callable lowering that turns generated callable tag unions into ordinary LIR
-  tag operations and erased callable values into explicit packed-erased-callable
-  statements
+  tag operations and capturing erased callable values into explicit
+  packed-erased-callable statements (a capture-free one is a static-data read)
 - bool predicate creation from ordinary Bool tag-union layouts
 - runtime value schema output from committed nominal layouts
 - erased callable code map output from Lambda Mono callable/procedure data
@@ -19623,6 +20974,14 @@ alignment to the struct, so pure padding never inflates a struct's alignment.
 Using an unnamed field in a structural record type is rejected during
 canonicalization.
 
+A padded nominal's record can extend a row variable, as in
+`Pad(r) := { z : U64, _ : U8, ..r }`. Its memory order is the declaration's
+entries in declaration order, then every field the extension supplies, in
+label order. The declaration cannot name those fields, so they have no
+declared position. Label order depends only on the type, not on the target
+or on committed layouts, so every stage computes the same order from the
+type alone.
+
 Declared field order is explicit checked data. Record rows are sorted
 lexicographically by name at several stages (checking, Monotype row lowering,
 and Monotype instantiation) because field-name resolution and digests depend on
@@ -19643,7 +21002,12 @@ layout store, so all backends agree.
 Under `.boxy` the backing of a padded nominal is a record type of its own,
 distinct from the record of the same fields: `Converter.backing` reads the
 declaration's declared fields and padding types, at the nominal's arguments, and
-interns a record node that carries them. Its fields stay in lexicographic order,
+interns a record node that carries them. The node keeps the declaration's
+entries, and the type store derives its complete slot list from them when it
+interns the node, including slots for fields a row extension supplies. A
+substitution that resolves the extension re-interns the node with the same
+entries, so resolving the extension early or late gives one type and one
+layout, and no stage remaps a slot. Its fields stay in lexicographic order,
 so a literal, a field read, a pattern, or a codec treats it as it treats any
 record. A padding type may mention the declaration's type variables, so it is a
 component of the node like a field: it counts toward the type's closedness and
@@ -19707,7 +21071,12 @@ re-testing columns already known. Exhaustiveness is consumed, never re-derived:
 a tag test whose arms cover the occurrence type's committed variant set emits
 its last arm as the switch default (a single-variant union emits no dispatch at
 all); open matches keep the `comptime_exhaustiveness_failed` / `runtime_error`
-terminal.
+terminal. Both lowerers end a failed match or destructure in
+`comptime_exhaustiveness_failed`, naming its checked exhaustiveness site,
+exactly when the site is in a compile-time root's own expression (not in a
+function it calls or defines) and checking left the site a pending diagnostic,
+so the evaluator reports the site's empirical failure whichever strategy
+lowered the root; every other failed test ends in `runtime_error`.
 
 Named record-rest binders are derived values, not durable pattern decisions.
 Monotype pattern lowering removes the rest binder from the record pattern,
@@ -19720,6 +21089,15 @@ is an ordinary body-local statement. The decision-tree emitter assigns all
 successful pattern locals before lowering the branch statement span, so later
 stages consume this ordering directly; no source record-rest pattern survives
 Monotype lowering.
+
+An or-pattern's alternatives share one source body before specialization work
+can multiply it. Monotype gives a multi-alternative arm a typed body join;
+successful alternatives supply its canonical checked binders. Guards and
+pattern-derived preludes remain alternative-specific, preserving ordered guard
+failure and retry semantics. The shared body's runtime-demand exemption requires
+every incoming alternative to be impossible, not just one. Its interface carries
+the actual state/result and producer representation evidence, including capture
+identity; a source arm is not a new callable boundary.
 
 **The sharing invariant.** Monotype is a DAG: an expression id referenced from
 multiple positions is re-lowered at each reference, so downstream control
@@ -20268,23 +21646,48 @@ assumption that fell (not re-derived, or shed in turn) is shed and retries
 next round, and the rest verify at once, so assumptions that support one
 another promote together. An assumption that fails is not refuted, only
 unprovable under that round's proof data. Rounds that rewrite a statement or
-persist a new bound open a new epoch; once the rounds after one reach their
+admit a persisted bound open a new epoch; once the rounds after one reach their
 fixpoint, every assumption that died under an earlier epoch's proof data is
 seeded once more, since the updated proof data may carry its verification (a
 counter's floor that needs the bound on its increment, which itself takes
 rounds to settle). Assumptions are never retried against the proof data they
-already failed under, which is what bounds the round count.
+already failed under, so each epoch revives each assumption at most once.
 
-Bounds persisted from round to round are widened rather than iterated: a
-persisted bound that comes back weaker three rounds in a row is being pushed
-along by the loop it describes (a cursor that advances by a constant each
-iteration bounded against a length, say) and would weaken forever, so it is
-replaced by a tombstone that later rounds skip and that keeps the widening
-from being forgotten. A bound that weakens once or twice while a loop's
-edges are still being discovered settles and is kept. Accumulated slack
-inside a query is clamped far outside any genuine bound; past that magnitude
-the ordering constraints contradict one another, which the clamp preserves
-without letting the arithmetic overflow.
+Everything a round carries into later rounds (each merge's environment meet
+and ordering intersection, each loop's entry orderings, each loop parameter's
+bounds) is a list of bounds or orderings, each identified by what it bounds:
+a bound by its base, an ordering by its endpoints. The lists form a lattice that only ever
+weakens. A round joins what it derived into each list it persists: an item
+it derived again keeps the larger of its stored and derived slack; an item
+it did not derive is dropped, and stays listed so that it is never admitted
+again; an item no round derived before is admitted while the list has room.
+
+Soundness follows from the induction the persisted state already rests on.
+The first round is seeded with nothing, so what it derives holds. A later
+round derives from seeds that hold, so what it derives holds too, and a
+rewrite only removes paths, so a relation every path satisfied still holds
+afterwards. The lattice never persists anything stronger than what the
+latest round to persist the list derived: a kept item's slack only grows,
+dropping removes an item, and an admission is exactly what that round
+derived. Weakening a true relation, or forgetting it, leaves a true relation.
+
+The lattice is also what bounds the rounds. Only an admission strengthens
+what the next round is seeded with, so a round asks for another only when it
+admitted something, rewrote a statement, or deferred or resolved an assumed
+invariant; a round that merely weakens the persisted state cannot prove
+anything the round before it could not. Each list admits each base or pair
+of endpoints at most once and has a fixed capacity, so the admissions, and
+with them the epochs and the rounds, are bounded by the procedure, and there
+is no cap on rounds. Debug builds assert that every round that asks for
+another made one of these one-way steps. A bound that its loop pushes along
+(a cursor that advances by a constant each iteration, bounded against a
+length) keeps the loosest slack any round derived rather than chasing the
+loop, and a bound that a capped query reaches only on some rounds drops out
+for good on the first round that misses it rather than oscillating.
+
+Accumulated slack inside a query is clamped far outside any genuine bound;
+past that magnitude the ordering constraints contradict one another, which
+the clamp preserves without letting the arithmetic overflow.
 
 A loop parameter that a back edge carries back as the very value its body
 was seeded with is unchanged around the loop, so the meet keeps the entry
@@ -20495,6 +21898,11 @@ not a memory layout: field addresses and representation sizes still come
 from runtime descriptors. A dynamic field occupies one ownership slot;
 a concrete struct field expands into its concrete slots. An open row or an
 unknown type has no enumerated product shape and remains opaque.
+
+An erased argument product's recorded slot boundaries are authoritative for
+both the start and width of each field read. Its non-owning prefix and scalar
+fields may occupy zero slots; their standalone layouts cannot supply widths in
+that product's coordinate system.
 
 ARC uses this explicit shape for the same field-take and residual-release
 rules as concrete products. Generic record field reads copy representation
@@ -20968,10 +22376,11 @@ callee can return with a call pending, and on each deferred call:
 - `none`: nothing can be pending after the statement.
 - `handed_up`: this procedure returns the value unchanged to a caller that
   makes the pending call, and until then the statement's target holds no
-  value. Only reference-count statements and jumps into a join body may
-  separate the call from the return; a pending call owns its closure and
-  every argument, so running those statements first releases nothing it
-  reads.
+  value. Only reference-count statements, residual-release field reads
+  explicitly marked `arc_dismantle`, and jumps into a join body may separate
+  the call from the return. The field reads neither dismantle, read, nor
+  overwrite the pending result. A pending call owns its closure and every
+  argument, so running that cleanup first releases nothing it reads.
 - `always`: pending calls are made here. This is every use of the value other
   than returning it, and every tail position in a procedure something other
   than Roc code or the erased-call runtime can enter: a root, a dictionary
@@ -21015,6 +22424,24 @@ one cell, from one of three places:
 A cell is empty whenever a statement that can fill it starts, because whoever
 fills it returns straight to whoever drives it. One cell therefore serves every
 statement of a procedure.
+
+A cell holds up to `native_callable.inline_args_words` words of the pending
+call's argument bytes itself, so recording a pending call allocates nothing; a
+larger argument block is copied to a heap block. A callee may read its
+arguments for as long as it runs (a dynamic argument stays where it arrived),
+and the cell is refilled while it runs: by the call it leaves pending, and by
+any chain a procedure handed this cell drives in it. So the driver never makes
+a call with the cell's own bytes: it copies inline arguments into its own frame
+first, and lets go of a heap block only once the call returns. That block then
+becomes the cell's spare, which the next large block is copied to when it fits
+(otherwise the spare is replaced by a block of the larger size), so a chain of
+large-argument calls holds two blocks however long it runs: the one the
+running call reads and the one it leaves pending. Every drive frees the spare
+when its chain ends. Backends use `native_callable.pendingByteSize` and
+`pendingAlignment` at the target word width, and zero the first
+`native_callable.zeroed_words` words (the pending callable
+and the spare) when they reserve it; the runtime writes everything else before
+reading it.
 
 The pass also commits `LirProcSpec.may_leave_pending`, its exact procedure
 summary, into native cache offers. Reusing a body-less native entry seeds the
@@ -21066,7 +22493,10 @@ function, and `returns_pending` becomes a query of the pending record
 followed by a return. Pending state belongs exclusively to the waiter's
 frame, including its argument packet. Packets of at most 32 bytes occupy
 inline byte storage in the cell; larger packets occupy an exact-sized host
-allocation. The driver copies an inline packet into separate 16-byte-aligned
+allocation. Backends obtain the cell's target-width byte size and alignment
+from `native_callable`; the header and the sixteen-word inline packet follow
+the target's pointer width, including the spare-block ownership fields.
+The driver copies an inline packet into separate 16-byte-aligned
 invocation storage before calling, so a subsequent deferral cannot overwrite
 arguments the active callee still reads. Heap packets remain owned by that
 invocation until it returns. Storage selection uses the explicit packet byte
@@ -21800,10 +23230,11 @@ reads of the container's slots offset by the view's first slot, so a
 consumed read through it takes those slots from the container, and its
 other uses observe its whole range. A borrowed tag union read out of a
 container is a view of its one slot: nothing reads through it except an
-ownership-complete payload view, which carries the union's whole unit, so
-it is held exactly when that payload reaches a consuming operand (the
-closure read out of a record of closures, whose captures are unwrapped and
-passed to the closure body), and it dismantles no further. Its definition copies only the
+ownership-complete payload view, which carries the union's whole unit. It is
+held when that payload reaches a consuming operand (the closure read out of a
+record of closures, whose captures are unwrapped and passed to the closure
+body), or when it dismantles through that payload view (the held tag-union
+view rule below). Its definition copies only the
 container's representation, which may name slots the container has already
 given away on that path; ARC writes those slots on the definition as the
 view's residual shell, numbered in the view's own layout. A view whose shell
@@ -21878,6 +23309,36 @@ variant, or any other occurrence of the union keeps its whole release. The
 shape this serves is a call returning `Try` of a record whose fields are moved
 out under `Ok`: without it every such field pays a retain and the whole result
 a release, on every call.
+
+A held tag-union view qualifies the same way. A borrowed tag union read out of
+a container (or out of a view the container holds) is solved as a take of its
+one slot at its definition when all of the following hold:
+
+- the container's takes apply to every emission, so the view holds the
+  union's unit wherever its take is committed. A container whose takes are
+  owned-only leaves the view borrowed
+- every occurrence of the view and of its borrowed pure aliases is a
+  discriminant read or exactly one borrowed `tag_payload_struct` view that
+  owns every refcounted byte of the union. A second payload view, a second
+  variant, a whole use, or any other occurrence leaves the view to the
+  consuming-operand rule above. A discriminant read of a view reads the tag
+  word in the representation the view's definition copied, so it observes
+  none of the container's slots
+- at least one refcounted field read through that payload view binds an owned
+  target, so holding the union can spare a retain
+
+Once the container's flow commits that take, the view's binding holds the
+union's unit and is bound once by its field read, so it is a union root: its
+payload view is the struct candidate, solved right after the container, with
+its own takes, use-point takes, and discriminant-dispatched residual release,
+and the field read is the fresh-value boundary of its take-state flow. If the
+container's flow declines the take, the view is a borrowed view again, its
+payload view dismantles nothing, and every read through it observes the
+container's slot. This is what lets a loop over
+`{ first : Dict(k, v), second : Dict(k, v), writes : U64 }` update both
+dictionaries in place: a `Dict` is a single-tag union around the record of
+its lists, and each list leaves the dying loop state by a take instead of a
+retain that the following `List.set` would have to copy for.
 
 A proc parameter solved borrowed qualifies conditionally: its takes are
 solved once against the shared ownership-neutral body but recorded as
@@ -22065,7 +23526,20 @@ later alias are present in LIR, so certification does not depend on the
 dismantle side table.
 If the final read result binds owned, that read moves the unit only when the
 root unit is present and the ownership place has no later RC-bearing use on
-that path; otherwise it retains exactly as an ordinary read would. An operand
+that path; otherwise it retains exactly as an ordinary read would. For a read
+whose target every emission binds owned, whether the place is used later is
+decided once per source procedure while ARC prepares the source's liveness,
+before uniqueness settles against the committed takes: once for emissions
+without an outcome convention and once for emissions with the procedure's
+outcome convention, whose restitution boundaries use the restituted
+parameters. Uniqueness treats a read retained under either contract as giving
+the projected value a second owner, and emission follows the decision of its
+own contract. The decision uses the base emission's binding overrides. An
+ownership variant only adds overrides; each cuts a borrowed binding out of its
+lender's place and counts the cut binding's own bind as a use, which happens
+only where the base place already had a later use, so a place unused in the
+base emission is unused in every variant. A read whose target only the
+emissions owning its root bind owned is decided by each such emission. An operand
 belongs to the place exactly when its solved liveness leader is the place's
 unit local: the unit local itself and every binding the solver anchored on it
 as a borrow (pure aliases, complete and partial field or tag payload reads,
@@ -22719,8 +24193,13 @@ same local can still execute after it before the local is redefined: two
 consumes on exclusive branches never both run, and a consume whose only
 successors read other locals leaves the value unique. A transfer edge (alias
 or join) carries the unit through to its target only when no use of the
-source at all, read or consume, can execute after it; otherwise the target
-holds a second reference and has no unique birth of its own. The order is
+source's ownership place at all, read or consume, can execute after it;
+otherwise the target holds a second reference and has no unique birth of its
+own. The place is the source's liveness group, the leader and every borrowed
+local anchored on it, which is the place emission keeps alive: a borrowed
+view of the source read after the edge needs the source's allocation, so
+emission retains the transferred value. A store into an aggregate and a
+call's row edge carry an operand's unit under the same rule. The order is
 answered over the procedure's predecessor edges, following jumps through the
 procedure's joins and stopping at a redefinition of the local: the oracle
 marks backward once per local from that local's uses and answers every edge
@@ -22738,7 +24217,17 @@ edges. A field read inherits the field's uniqueness only when it is the
 committed take that moves the container's stored unit, since any other read
 retains and leaves count 2; and not when a copy holding its own unit can reach
 the take: a consuming use of the container, or a retained read of the same
-field. Takes are decided after the borrow modes, so the solver settles without
+field. A value with a second holder shares every stored field with that
+holder, and so does every container viewing its fields (an aggregate alias, a
+tag's payload view, a join parameter), so no field read through such a value
+inherits. One bit per value records this: it starts on the values with a
+holder-adding occurrence, follows the container views and every value that
+becomes dead, and each value gains it at most once, so sharing never re-runs
+the per-field propagation. A complete aggregate field read whose root's ownership
+place is used after it is such an occurrence, since emission retains the
+projected value right after the read (see the place rule under field takes);
+the analysis reads that decision rather than re-deriving it. Takes are decided
+after the borrow modes, so the solver settles without
 them and emission re-derives uniqueness against the committed takes, settling
 the unique-return bits and the per-field unique-return mask of each signature
 to a fixpoint; a caller taking a field out of a callee's dying `Try` record
@@ -22853,11 +24342,15 @@ body for every level of nesting to remove one predictable branch per site;
 it keeps its flag-dispatched sets instead.
 
 `List.clear` is its own low-level, `list_clear`, run by every backend as the
-zero-length sublist from index zero: that window is never a slice, so unlike
-`list_sublist` its result is born unique, and a list cleared and refilled
-each iteration keeps both its allocation and its unique birth. Modeled as a
-sublist, the clear left the chain unborn, the parameter it emptied borrowed,
-and the retained parameter's clear returned an empty list with no capacity.
+`listClear` builtin: its result is never a slice and never shares an
+allocation, so unlike `list_sublist` its result is born unique, and a list
+cleared and refilled each iteration keeps both its allocation and its unique
+birth. Modeled as a sublist, the clear left the chain unborn, the parameter it
+emptied borrowed, and the retained parameter's clear returned an empty list
+with no capacity. A static list has no allocation the program may keep, so
+clearing one allocates the capacity its descriptor records (Static Lists And
+Strings Keep Their Capacity); a sublist of one never does, because a view
+reserves nothing.
 
 An append-only promoted loop versions on its slack instead. The fill limit
 answers whether the next append fits; a bound on the loop's remaining
@@ -23334,6 +24827,23 @@ A read that no definition reaches, in code no path from entry reaches or of a
 possibly-uninitialized local that LIR reads only behind its initialization
 guard, yields zero of the local's type, never `undef` or `poison`.
 
+A record or tag literal writes each byte of its storage once: its fields, or
+its payload and discriminant, and then zeroes only the bytes those leave (the
+padding between fields, the bytes between a short payload and the
+discriminant, and the alignment tail). It never zero-fills its storage and
+then overwrites it. LLVM's SROA rewrites an `llvm.memset` that lands on a part
+of a slot it promotes as a vector by first loading that part's old value. The
+load makes the slot live into its block, so mem2reg gives every join inside a
+loop around the write a phi of the slot's previous-iteration bytes, which
+nothing reads. A zero-fill under every field puts such a memset on every part
+of the slot; zeroing only the gaps puts it only on bytes nothing else writes.
+In a procedure with thousands of constructions in the arms of a large `match`
+inside a loop, whole-slot zero-fills give SROA's output tens of millions of
+dead phi incoming edges, and LLVM's value-range propagation queries every one
+of them before a later pass deletes the phis. Builtins that write only part of
+a result through its address still receive zeroed storage: that address
+escapes, so SROA never promotes the slot.
+
 Join parameters are ordinary locals: LIR jumps carry no operands, and lowering
 snapshots every replacement value before writing any parameter. Each write is
 an ordinary definition in program order, so simultaneous updates, including
@@ -23601,21 +25111,36 @@ once for the module. The same rule forbids reintroducing that search at the
 producer: a whole-module finalization pass whose only consumer is wasm local
 binding trades one redundant traversal for another.
 
+Pointer-local slots and the aggregate bytes they address have separate storage
+lifetimes. They share one procedure CFG and base lifetime solve; backing storage
+extends the solved ranges through admitted aliases before assigning byte slots.
+Every aggregate assignment has a planned destination, including a result local
+defined by several mutually exclusive calls. A closed value exposed through a
+dynamic view has dedicated backing storage, since its address escapes the
+static-local access inventory.
+
+Instruction-selection scratch does not survive its operation. It occupies a
+separate frame region whose extent is the maximum required by an operation, not
+the sum across emitted branches. Persistent slots and scratch are on opposite
+sides of the frame pointer; the prologue reserves both and every split fragment
+uses that same frame. Explicit address-producing allocations remain persistent.
+Assignment commits aggregate results before scratch is reused, so neither
+emission order nor a branch-local allocator reset determines value lifetime.
+
 ### Wasm Aggregate Aliases
 
 An aggregate local of the wasm backend holds the address of its bytes: a slot
-of the procedure's frame, or for a parameter the caller's storage, and
-either stays put for the rest of the procedure. An `assign_ref.local` of an
+of the procedure's frame, or for a parameter the caller's storage. An `assign_ref.local` of an
 aggregate therefore binds its target to the source's address rather than
-copying the bytes, exactly when `LocalWrites` proves the alias for the pair:
+copying the bytes when the shared stack planner proves the alias for the pair:
 the target has one definition, the source at most one, and neither is
 written in place (`set_local`, `init_uninitialized`, a join parameter, a
-string-match capture, a dynamic write); dynamic locals never alias. This is
-the rule the native dev backend's stack plan proves ("Dev Backend Register
-Lifetimes"), taken from the same shared definition walk, so a frame holds
-one copy of a record however many field reads name it. A `ref.local` the
-rule rejects copies, so a snapshot keeps the bytes it saw when its source is
-rewritten.
+string-match capture, a dynamic write), and the snapshot does not live across
+its owner's next definition around a back edge. Dynamic locals never alias by
+this rule. This is the native dev backend's proof ("Dev Backend Register
+Lifetimes"), with the same shared definition inventory and runtime CFG. The
+owner keeps its bytes through every alias read; a rejected alias copies, so
+storage reuse cannot change a snapshot when its source is rewritten.
 
 ## Wasm Body Generation
 
@@ -23861,7 +25386,9 @@ the bytes handed to Roc, so reallocation reads the old length from the header
 and deallocation is free; the host keeps no per-pointer table, whose cost would
 grow with the allocations a root has ever held rather than with the ones it
 holds. Host events and failure state stay root-local until deterministic
-replay.
+replay. The root-local arenas draw their memory from the finalizer's allocator, which
+need not be thread-safe, through one lock the program owns, so roots running
+at once on different threads never reach that allocator concurrently.
 
 #### Compile-Time Failure Sites
 
@@ -23897,9 +25424,18 @@ compiled host and builtin code points its frame pointer into the middle of its
 frame rather than at a saved-frame-pointer record, so the host unwinds those
 frames with the system unwind tables until it reaches generated code, then
 walks the generated frame-pointer chain from there. A stack overflow is
-caught by the guard-page handler, which records the faulting program counter,
-frame pointer, and stack pointer before escaping; the host records the counter
-when it is in generated code and walks the chain from the frame pointer.
+caught by the guard-page handler, which records the faulting frame pointer and
+stack pointer before escaping; the host walks the chain from the frame
+pointer. The faulting program counter is not part of an overflow's point:
+which instruction of the innermost frame touches the guard first depends on
+where the guard falls within that frame (a callee's frame-record push, a
+store to one of its slots, or an x86_64 `call` pushing its return address),
+so an overflow is located at the innermost generated call on the chain: the
+call that entered the innermost frame whose record was in place when the
+stack ran out. Every
+frame of a self-recursive procedure but the outermost was entered by its
+recursive call, so its overflow is reported at that call wherever in the
+frame the guard is hit.
 
 Compile-time code runs on a dedicated fixed stack, the evaluation stack
 (`base.eval_stack`), never on the stack of whichever worker picked the root up.
@@ -23916,10 +25452,11 @@ the system unwinder all read a stack's extent from the thread's TEB, and
 the stack pointer, together with the fiber-local storage the C runtime keeps
 its per-thread state in. Every root starts at the same top, the same distance
 above the guard, with no compiler frames beneath the generated entry, so how
-deep a program recurses before it overflows, and the instruction that
-overflows, are a function of the program and the compiler build alone, and an
-overflow's reported position is reproducible. The crash boundary is set on the
-evaluation stack (`CrashBoundary.run`), so the escape from a crash or an
+deep a program recurses before it overflows is a function of the program and
+the compiler build alone. The crash boundary is set on the
+evaluation stack (`CrashBoundary.run`). Its guarded callback is never tail-called:
+the frame containing the recovery point must remain live while the callback
+can escape to it. Thus the escape from a crash or an
 overflow lands there and the root returns to the thread's own stack through
 the switch it entered by. The guarded callback is explicitly never tail-called:
 the frame holding the recovery point must remain live until the callback returns
@@ -23931,7 +25468,7 @@ interpreter and compiled runtime programs keep their own stack handling.
 
 The evaluating program resolves the point: the meaning of the innermost call,
 and the source position of the innermost statement with a region among the
-faulting instruction's and the enclosing generated calls'. A return address
+enclosing generated calls'. A return address
 belongs to the statement of the call instruction just before it. A failure
 whose meaning is an exhaustiveness failure is the empirical failure of that
 site; every other failure is reported as a crash at its position.
@@ -24313,14 +25850,21 @@ const ConstValue = union(enum) {
     pending,
     zst,
     scalar: ConstScalar,
-    string: ConstStr,
-    list: union(enum) {
-        nodes: Span(ConstNodeId),
-        scalar_bytes: struct {
-            bytes: ConstBlobDataId,
-            len: u32,
-            item: ConstPackedScalar,
+    string: struct {
+        bytes: ConstStr,
+        capacity: u64,
+    },
+    list: struct {
+        items: union(enum) {
+            nodes: Span(ConstNodeId),
+            scalar_bytes: struct {
+                bytes: ConstBlobDataId,
+                len: u32,
+                item: ConstPackedScalar,
+            },
+            empty,
         },
+        capacity: u64,
     },
     tuple: Span(ConstNodeId),
     record: Span(ConstField),
@@ -24352,10 +25896,12 @@ const ConstStr = ConstBlobDataId;
 ```
 
 A stored string or packed list is a whole blob, never a view into a longer
-one. How evaluation's allocations shared bytes (a seamless slice, or a string
-that kept a longer allocation's capacity) is runtime representation and does
-not enter `ConstStore`; the writer stores each string's own bytes, and equal
-contents share a blob because interning is by content.
+one. How evaluation's allocations shared bytes (a seamless slice of a longer
+allocation) is runtime representation and does not enter `ConstStore`; the writer stores each string's own bytes, and equal
+contents share a blob because interning is by content. Capacity is not
+representation: `ConstList.capacity` records a list's beside its items, which
+may be nodes, a packed blob, or nothing, and `ConstString.capacity` records a
+string's beside its blob (Static Lists And Strings Keep Their Capacity).
 Strings and packed scalar lists intern into the same exact-content namespace.
 Packed multi-byte scalars use little-endian checked-value bytes;
 this is target-independent `ConstStore` data, not a captured host allocation or
@@ -24577,6 +26123,19 @@ stored set followed the optimized body, a value stored by one `--opt` would be
 unreadable by another command sharing the checked module cache, and by the
 compilation that stored it.
 
+A source capture restores through its checked binder and stored value witness,
+as a constant root does. A stored callable signature can include Lambda Solved
+row joins; those consumer rows do not replace the checked producer contract
+when its body is lowered again.
+
+Stored type-constructor arguments first constrain owner variables that may be
+absent from the restored function's signature, without replacing callable result
+rows. Within a draft, repeated restoration of one stored closure and capture at
+the same complete request and witness contract shares its graph guard. The key
+includes the module, stored function and binder; independent open instances do
+not share by structural shape. Recursive specialization reuse therefore does
+not conflate closure environments or error layouts.
+
 Two explicit rules establish the set:
 
 - Lifting decides the declared captures. A source lambda declares its free
@@ -24673,12 +26232,91 @@ specialization strategy or any backend. This is a compiler invariant, not an
 optimization preference. There is no fresh-construction alternative, including
 for a consumer that may later update a list. Required runtime operations retain
 their ordinary meaning, but cannot change a constant read into reconstruction.
+The copy a later update makes is the ordinary copy-on-write copy, and it is
+where a list's or string's recorded capacity is allocated (Static Lists And
+Strings Keep Their Capacity).
 All nested storage and callable captures are emitted as immutable target data
 with explicit relocations. Scalars may be immediate literals. Target-data
 encoding happens in the compiler and emits no runtime initializer.
 A product whose committed layout is zero-sized has no stored field offsets.
 Lowering represents its field reads as zero-sized value aliases, including
 when the product comes from an immutable slot.
+
+### Static Lists And Strings Keep Their Capacity
+
+Compile-time evaluation must not change how much a program allocates. A list
+built by `List.with_capacity(5000)` and then filled reserves once whether the
+compiler evaluated the `with_capacity` or the program did, so capacity is part
+of a completed list's or string's value, and every form the value takes
+records it. For a list:
+
+- `ConstStore` stores each list's `capacity` beside its items
+  (`ConstList.capacity`, never below the length), and two lists that differ
+  only in capacity are different values.
+- A frozen descriptor's capacity word is that capacity. Its allocation holds
+  the items alone: no spare slot is emitted, so recording a capacity costs the
+  binary nothing. An empty list with capacity points just past the header of
+  an allocation holding no items, because a list with nonzero capacity always
+  points into an allocation, whose refcount word is how every runtime
+  uniqueness check finds out it is static. A list of zero-sized items is the
+  one exception: it holds no allocation on any backend, so its data pointer
+  is null and its capacity is a count alone, which `List.with_capacity` and
+  `List.reserve` set and the operations that change a list in place carry
+  (`RocList.zeroSized`). Whether an item is zero-sized is decided by the
+  program that evaluates the root, and a function value's size follows its
+  lambda set there: a list whose only function is one capture-free lambda is
+  a list of zero-sized items where it is evaluated. Its reservation is
+  recorded as that count, so a runtime use that gives its items a wider
+  representation reserves the same number of slots.
+- A stored list restores as static data frozen straight from its node whenever
+  it has spare capacity and its items are data alone, exactly as a non-empty
+  stored list does, so its read lowers to no list operation. A list with
+  spare capacity that holds function values restores as its items under the
+  reservation it was evaluated with (`list_reserve`, or `list_with_capacity`
+  for an empty list); a static-data initializer evaluates that reservation
+  into the descriptor's capacity word rather than running it.
+
+Static data is never unique, so nothing writes through a static descriptor's
+capacity. The runtime uses it in exactly one way: when a builtin copies a
+static list to give the program storage of its own, the copy is sized as if
+the static list were an exclusively owned allocation of the recorded capacity
+(`RocList.copyCapacity`). A request that fits the capacity allocates the
+capacity; one that outgrows it takes the geometric step from the capacity, as
+growing in place would. `List.clear` of a static list allocates its capacity
+with no items. A copy of a list some other reference holds is still sized by
+the items it copies, since that list's spare capacity belongs to its owner.
+The program therefore allocates what it would have had it built the value
+itself, except that the allocation moves from the value's construction to its
+first update, and never happens for a value that is only read.
+
+A literal has no spare capacity, so its descriptor's capacity is its length
+and its copies are sized as they would be for a uniquely owned list of that
+length. Capacity is counted in items as the evaluation left it; a seamless
+slice's capacity is its window.
+
+Strings follow the same rule with one addition, because a string may be held
+inline in its descriptor. `ConstStore` stores each string's capacity beside
+its bytes (`ConstString.capacity`); a string that was inline, or a seamless
+slice, when its evaluation finished has none beyond its length. A frozen
+string is inline exactly when its capacity fits the target's inline string,
+so a string without spare capacity is inline whenever its bytes fit, and
+`Str.with_capacity(1000)` freezes as an allocated string of no bytes whose
+descriptor records the thousand. A stored string with spare capacity restores
+as its literal under `str_reserve`, which a static-data initializer evaluates
+into the descriptor, and whether its read needs target storage is decided by
+its capacity rather than its length (`StaticDataStorage.string_backing`). A
+copy of a static string keeps the recorded capacity
+(`RocStr.copyCapacity`), in an append, a reserve, or an in-place edit's copy.
+`Str.reserve` hands back its argument only when nothing else holds it: a
+static string's descriptor may record enough capacity for the request, but
+it has no room behind it.
+
+Deriving capacity at the read instead, by having ARC choose a fresh
+construction where a value reaches an updating operation, is rejected: it
+makes every program pay an ownership analysis for the few that reserve, and it
+lets a read allocate. Declining to freeze a value that has spare capacity is
+rejected too, since any list built by appending has some, including the large
+precomputed tables freezing exists for.
 
 A build's executable binary is a function of its source, its command line, and its
 optimization state; whether the checked module cache already held a
@@ -24692,22 +26330,28 @@ construction as its parts), and no runtime program declares a slot, a
 failure record, or a guard for a compile-time root that completed.
 
 The point at which this holds for a live compilation is explicit: the end of the
-program's evaluation (`finalizeProgram`). The specialization evaluation made declared
-each pending root's read as a slot read, because the value did not exist
-yet, so when that evaluation completed any compile-time root the program
-demands, its Solved program is not the one a runtime consumer continues.
-The program is specialized again from the checked modules, now holding
-every demanded value stored, exactly as a compilation that found them all
-in the cache specializes it (`ProgramSession.RuntimeStages.respecialized`).
-Runtime roots still register every conversion
-their own code uses. That specialization demands no compile-time root; it registers the
-runtime program's literal roots again and evaluates them, and their outcomes, which
-the first evaluation already reported, report nowhere. A literal root is
-not stored by any compilation, so both kinds of compilation read literal
-roots' completed values from the stages that evaluated them, the same way.
-A compilation that
-evaluated no compile-time root its program demands continues its one
-specialization, which is already that program.
+program's evaluation (`finalizeProgram`). The specialization evaluation makes
+declares each pending root's read as a slot read, because the value does not
+exist yet, so a specialization that evaluates a compile-time root is never the
+one a runtime consumer continues. Neither is one that keeps a discovery root:
+a test is no part of the runtime program, but its closures would join the
+lambda sets the runtime program shares with it, and the runtime program would
+then reach the test's values. Which case applies is decided before anything is
+specialized, from the pending compile-time roots and the discovery roots that
+can register a literal root (`planRoots`). When there are any, evaluation
+specializes exactly what `roc check` specializes, with the program roots as
+discovery roots, and afterwards the program roots alone are specialized from
+the checked modules, now holding every value stored, exactly as a compilation
+that found them all in the cache specializes it
+(`ProgramSession.RuntimeStages.respecialized`). Runtime roots still register
+every conversion their own code uses. That specialization demands no
+compile-time root; it registers the runtime program's literal roots again and
+evaluates them, and their outcomes, which the first evaluation already
+reported, report nowhere. A literal root is not stored by any compilation, so
+both kinds of compilation read literal roots' completed values from the stages
+that evaluated them, the same way. A compilation with neither specializes
+once, with its program roots in full, and its runtime consumer continues that
+specialization.
 
 ### Dependency-Ordered Compile-Time Evaluation
 
@@ -24874,7 +26518,12 @@ interning gives equal acyclic layouts one index, but a cyclic layout is
 built in raw slots of its own, so a commit that creates cyclic layouts looks
 each new layout's digest up among the layouts earlier such commits created
 and among its own, and commits again with every duplicate redirected to the
-existing layout. Each runtime representation therefore has one layout index,
+existing layout. The redirect sees graph nodes only, and the recursion boxes
+a commit inserts are not nodes. So a recursive slot edge whose target has an
+explicit `.box` node, seen through nominal wrappers, reads that node rather
+than inserting a box of the same content, and a debug build checks that the
+layouts a recursive commit reaches have distinct digests. Each runtime
+representation therefore has one layout index,
 which is what lets refcount helper names and layout-keyed procedure
 identities treat equal digests as equal layouts.
 
@@ -25233,6 +26882,34 @@ producer metadata; only non-debug size builds remove target-feature metadata.
 
 ## Host Symbol ABI
 
+Every function value, `Iter`, and `Stream` visible to the host must be the
+immediate payload of its own `Box`. Boxing an enclosing record, tuple, list,
+tag, or user nominal does not satisfy this requirement. Aliases are transparent;
+nominal and opaque user types are checked through their declared backing with
+their actual parameters substituted. The rule applies equally to hosted and
+provided arguments and results. A procedure's own signature is not a function
+value. Boxed iterators and streams are opaque handles: their private step
+closures are implementation state, not further host-visible values.
+
+Boxed sequences share the erased-callable ownership protocol. Their captures
+and private record view occupy one allocation; the view's step points back to
+that allocation without owning another reference. Unboxing retains the step
+when its record is copied. A unique step can be resized for boxing; copying a
+shared step retains its captured references independently. The callable header
+therefore carries the capture extent and its retain plan as well as final-drop
+information. Hosts need neither the capture layout nor a separate destructor.
+
+Boxing selects the existing forced-dynamic iterator interface before Monotype
+is sealed, so steps and successors agree even when producer state differs.
+This does not erase ordinary unboxed iterator pipelines. Constant storage
+preserves the checked box and nominal record while storing the same
+single-allocation representation; interpreter-owned callable context must
+remain valid when those captures are copied.
+
+Glue describes directly boxed sequences as opaque `RocErasedCallable` handles.
+It does not expose their step signatures or backing records. The host can
+retain, release, store, and return a handle, but only Roc steps it.
+
 The program's hosted catalog retains every visible hosted declaration and
 classifies its platform binding as mapped or unavailable. Only mapped entries
 carry a dispatch slot. An unavailable declaration lowers to the existing
@@ -25273,6 +26950,11 @@ stand between `src/glue/platform/*.roc` and the glue runner. Named fields select
 schema logical indices; the layout store supplies their byte offsets and
 layouts. A checked-source schema regression test locks the remaining marshaller
 field names and leaf types.
+
+The compiled glue script retains its readonly data image alongside its code.
+Code-to-data and data-to-function relocations are resolved together, and both
+images outlive extraction of the returned files; returned static strings must
+not become dangling pointers when the entrypoint returns.
 
 Glue's type table describes values. A function value, wherever it appears
 (boxed, in a record or tag payload, or in a stored signature), is one
@@ -25616,6 +27298,23 @@ import library writer (`coff/ImportLibrary.zig`). A Mach-O link puts the
 unmapped `__DWARF` segment at `__LINKEDIT`'s address, as dyld requires a
 dylib's segments in address order.
 
+Roc hosts must support relocatable code and data. Native executables always
+enable PIE/ASLR: ELF and Mach-O use PIE, and PE retains base relocations and
+enables dynamic-base loading. There is no platform opt-in or migration guard.
+This lets the function-address dictionary seed follow OS address randomization.
+Generated objects, including archives for foreign linkers, are PIC.
+
+ELF PIE executables are a distinct host-link mode, not shared libraries.
+They use section-backed provides and the same dynamic relative-relocation
+table extension as shared hosts; absolute provides cannot track the load base.
+The host key distinguishes fixed executables, PIE executables and libraries.
+Program startup and library exports remain separate from relocation policy.
+Static PIE requires platform-supplied self-relocating startup (for example
+musl `rcrt1.o`). Platform authors own startup correctness; selecting PIE never
+substitutes startup inputs or infers compatibility from filenames. The
+compiler-owned Linux default platform applies relocations before initialization,
+without libc. macOS and Windows loaders relocate their images before startup.
+
 A `.boxy` dev `roc run` of an app without a platform header builds it
 against the synthetic default platform with a fast dev link and runs the
 binary, reusing every object `roc check` filed (Caching Under `.boxy`).
@@ -25736,10 +27435,10 @@ one cache entry per host (`host_prelink`, `macho/HostPrelink`,
 `coff/HostPrelink`, family `prelinked_host`). The generated object defines
 every `provides` symbol as a window the host's references resolve to at
 prelink time, which each build fills in: a jump to the entry wrapper for a
-procedure, the value's bytes for a data symbol. In an ELF host (Linux and
-the BSDs) the windows are absolute addresses at a fixed place in the app
+procedure, the value's bytes for a data symbol. In a fixed ELF executable binary
+(Linux and the BSDs) the windows are absolute addresses at a fixed place in the app
 region, and a provided value larger than its window is a reported build
-error. On macOS and Windows the
+error. For ELF PIE/shared hosts, macOS and Windows the
 windows are sections of the host itself, a procedure's 16 bytes of code for a
 long jump and a value's layout size of writable data, where the pointers in
 the copied value can be relocated; which provides are procedures and how
@@ -25849,7 +27548,10 @@ the link is image relative: a 32-bit image-relative field (`rva32`) takes
 it as is, an absolute field adds the image base. The build id is written
 into the host's CodeView debug entry. When the host's header page cannot
 hold the inserted section headers, the host's section contents move one
-page down the file.
+page down the file. Regions with no virtual extent have no PE section header:
+Windows rejects empty mapped sections. Headers and symbols share dense section
+numbers for the remaining regions, including zero-fill-only regions, without
+changing their image-relative placement.
 
 ## Watch Mode For Check And Test
 
@@ -26412,7 +28114,15 @@ execution times include the recording overhead and are not benchmark results.
 
 `ROC_TRACE_BOXY_WORK` also separates checked-root graph construction from
 function-containing-root classification when evaluation timings are available.
-These diagnostic durations exclude the trace's per-root printing.
+These diagnostic durations exclude the trace's per-root printing. A build's
+library units print a timeline under it: when each unit was submitted, keyed,
+and restored, built or taken from compile-time evaluation, as milliseconds
+since the units' phase began and as the raw clock reading, which lines up
+with a `perf record -k CLOCK_MONOTONIC` profile. `ROC_TRACE_BOXY_DIGESTS`
+prints each part of every module's interface and object-input digest, so two
+traces show which part an edit changed; it hashes the parts separately,
+which costs more than the digests themselves, so the work trace leaves it
+out.
 
 
 

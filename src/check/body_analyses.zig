@@ -7,7 +7,7 @@
 //! declaration statement, or defaulted-field expression) owns each reached
 //! node, and the per-binding facts lowering reads from declarations.
 //!
-//! Every other fact here is computed on first demand into a write-once slot
+//! The index and every other fact here are computed on first demand into a write-once slot
 //! owned by the module and is never serialized: each top-level unit has one
 //! slot holding its divergence, inspect-elision, state-merge and
 //! loop-mutation facts; the module has one slot for its diagnostic-error
@@ -106,13 +106,13 @@ pub const ModuleIndex = struct {
     /// Defaulted-field default expressions, ascending.
     defaults: []u32 = &.{},
 
-    /// The index of `env`'s bodies. `promoted` lists the module's promoted
-    /// local procedures, each with its binding `pattern`.
-    pub fn build(allocator: Allocator, env: *const ModuleEnv, promoted: anytype) Allocator.Error!ModuleIndex {
+    /// The index of `env`'s bodies. `promoted_patterns` are the binding
+    /// patterns of the module's promoted local procedures.
+    pub fn build(allocator: Allocator, env: *const ModuleEnv, promoted_patterns: []const PatternId) Allocator.Error!ModuleIndex {
         var builder = try Builder.init(allocator, env);
         defer builder.deinitScratch();
         errdefer builder.deinitAll();
-        for (promoted) |entry| builder.node_flags[@backingInt(entry.pattern)].promoted_pattern = true;
+        for (promoted_patterns) |pattern| builder.node_flags[@backingInt(pattern)].promoted_pattern = true;
         try builder.walk();
         return builder.finish();
     }
@@ -360,9 +360,7 @@ pub const ModuleIndex = struct {
             const node_count: u32 = @intCast(store.nodes.len());
             var raw: u32 = 0;
             while (raw < node_count) : (raw += 1) {
-                const node: CIR.Node.Idx = @fromBackingInt(@intCast(raw));
-                if (store.nodes.get(node).tag != .ty_record_field_defaulted) continue;
-                const default_raw = store.nodes.get(node).getPayload().ty_record_field_defaulted.default_value;
+                const default_raw = fieldDefault(store, raw) orelse continue;
                 try self.defaults.append(self.allocator, default_raw);
                 self.node_flags[default_raw].default = true;
                 if (self.node_kinds[default_raw] != .unreached) continue;
@@ -651,7 +649,7 @@ pub const ModuleIndex = struct {
         fn indexDeclarations(self: *Builder) Allocator.Error!void {
             const env = self.env;
             const store = &env.store;
-            for (env.method_defs.entries.items) |entry| {
+            for (env.method_defs.entries.items()) |entry| {
                 if (store.nodes.get(entry.value.type_node_idx).tag != .statement_decl) continue;
                 const statement: StatementId = @fromBackingInt(@intCast(@backingInt(entry.value.type_node_idx)));
                 const decl = store.getStatement(statement).s_decl;
@@ -661,7 +659,7 @@ pub const ModuleIndex = struct {
 
             var recursively_referenced = collections.DenseMap(u32, void).init(self.allocator);
             defer recursively_referenced.deinit();
-            for (env.scheme_uses.items.items) |record| {
+            for (env.scheme_uses.items()) |record| {
                 if (record.slot_kind != @backingInt(ModuleEnv.SchemeUseRecord.Slot.recursive_value_reference)) continue;
                 const node: CIR.Node.Idx = @fromBackingInt(@intCast(record.node_idx));
                 if (store.nodes.get(node).tag != .expr_var) continue;
@@ -722,6 +720,14 @@ fn dedupeSorted(list: *std.ArrayList(u32)) void {
 /// A range of a unit's binder pool.
 const BinderSpan = struct { start: u32 = 0, len: u32 = 0 };
 
+/// A binder range or its absence in eight bytes: the length is stored plus
+/// one, so all zeros means absent and an empty range stays present.
+const OptionalBinderSpan = collections.OptionalStruct(BinderSpan, "len");
+
+comptime {
+    std.debug.assert(@sizeOf(OptionalBinderSpan) == 8);
+}
+
 /// Whether inline expects run when lowering evaluates a body.
 pub const InlineExpectMode = enum { run, omit };
 
@@ -738,10 +744,10 @@ const UnitFacts = struct {
     flags: []u8,
     /// For an `if`, `match`, or `for` expression and for an expression
     /// statement: the binders it reassigns anywhere inside it.
-    state_merges: []?BinderSpan,
+    state_merges: []OptionalBinderSpan,
     /// For a `for` expression or a loop statement: the binders its condition
     /// and body reassign.
-    loop_mutations: []?BinderSpan,
+    loop_mutations: []OptionalBinderSpan,
     binders: []BinderId,
 
     fn destroy(self: *UnitFacts, allocator: Allocator) void {
@@ -783,14 +789,44 @@ const SingleSourceFacts = struct {
     }
 };
 
+/// The default expression of node `raw` when it is a defaulted record field
+/// annotation.
+fn fieldDefault(store: *const can.NodeStore, raw: u32) ?u32 {
+    const id: CIR.Node.Idx = @fromBackingInt(raw);
+    if (store.nodes.fieldItem(.tag, id) != .ty_record_field_defaulted) return null;
+    return store.nodes.get(id).getPayload().ty_record_field_defaulted.default_value;
+}
+
+/// The length of `env`'s `ModuleIndex.defaults`, counted without building
+/// the index.
+pub fn defaultExprCount(allocator: Allocator, env: *const ModuleEnv) Allocator.Error!usize {
+    var defaults: std.ArrayList(u32) = .empty;
+    defer defaults.deinit(allocator);
+    const node_count: u32 = @intCast(env.store.nodes.len());
+    var raw: u32 = 0;
+    while (raw < node_count) : (raw += 1) {
+        try defaults.append(allocator, fieldDefault(&env.store, raw) orelse continue);
+    }
+    std.mem.sort(u32, defaults.items, {}, std.sort.asc(u32));
+    dedupeSorted(&defaults);
+    return defaults.items.len;
+}
+
+/// The module index and one fact slot per top-level unit it records.
+const Indexed = struct {
+    index: ModuleIndex,
+    unit_slots: []UnitSlot,
+};
+
 /// The body facts of one checked module, owned by the module. `allocator`
 /// must be safe to use from every thread that reads the module.
 pub const BodyAnalyses = struct {
     allocator: Allocator,
     io: std.Io,
     env: *const ModuleEnv,
-    index: ModuleIndex,
-    unit_slots: []UnitSlot,
+    /// The binding patterns of the module's promoted local procedures.
+    promoted_patterns: []PatternId,
+    indexed: collections.OnceSlot(*Indexed, .body_module_index) = .empty,
     dispatch_crashes: collections.OnceSlot(*NodeBits, .body_dispatch_crashes) = .empty,
     diagnostic_errors: collections.OnceSlot(*NodeBits, .body_diagnostic_errors) = .empty,
     single_source: collections.OnceSlot(*SingleSourceFacts, .body_single_source_calls) = .empty,
@@ -805,24 +841,25 @@ pub const BodyAnalyses = struct {
     ) Allocator.Error!*BodyAnalyses {
         const analyses = try allocator.create(BodyAnalyses);
         errdefer allocator.destroy(analyses);
-        var index = try ModuleIndex.build(allocator, env, promoted);
-        errdefer index.deinit(allocator);
-        const unit_slots = try allocator.alloc(UnitSlot, index.units.len);
-        @memset(unit_slots, .empty);
+        const promoted_patterns = try allocator.alloc(PatternId, promoted.len);
+        for (promoted, promoted_patterns) |entry, *pattern| pattern.* = entry.pattern;
         analyses.* = .{
             .allocator = allocator,
             .io = io,
             .env = env,
-            .index = index,
-            .unit_slots = unit_slots,
+            .promoted_patterns = promoted_patterns,
         };
         return analyses;
     }
 
     pub fn destroy(self: *BodyAnalyses) void {
         const allocator = self.allocator;
-        for (self.unit_slots) |*slot| if (slot.peek()) |facts| facts.destroy(allocator);
-        allocator.free(self.unit_slots);
+        if (self.indexed.peek()) |indexed| {
+            for (indexed.unit_slots) |*slot| if (slot.peek()) |facts| facts.destroy(allocator);
+            allocator.free(indexed.unit_slots);
+            indexed.index.deinit(allocator);
+            allocator.destroy(indexed);
+        }
         inline for (.{ "dispatch_crashes", "diagnostic_errors" }) |name| {
             if (@field(self, name).peek()) |bits| {
                 bits.deinit(allocator);
@@ -830,19 +867,48 @@ pub const BodyAnalyses = struct {
             }
         }
         if (self.single_source.peek()) |facts| facts.destroy(allocator);
-        self.index.deinit(allocator);
+        allocator.free(self.promoted_patterns);
         allocator.destroy(self);
     }
 
+    /// The module index, built on first demand.
+    pub fn demandIndex(self: *BodyAnalyses) Allocator.Error!*const ModuleIndex {
+        const indexed = try self.indexed.getOrCompute(self.io, Allocator.Error, self, computeIndexed);
+        return &indexed.index;
+    }
+
+    /// The module index, which a consumer demanded (`demandIndex`) before
+    /// reading the module's bodies.
+    pub fn index(self: *const BodyAnalyses) *const ModuleIndex {
+        return &self.demanded().index;
+    }
+
+    fn demanded(self: *const BodyAnalyses) *Indexed {
+        return self.indexed.peek() orelse invariant("the consumer must demand the module index before reading bodies");
+    }
+
+    fn computeIndexed(self: *BodyAnalyses) Allocator.Error!*Indexed {
+        const allocator = self.allocator;
+        const indexed = try allocator.create(Indexed);
+        errdefer allocator.destroy(indexed);
+        var module_index = try ModuleIndex.build(allocator, self.env, self.promoted_patterns);
+        errdefer module_index.deinit(allocator);
+        const unit_slots = try allocator.alloc(UnitSlot, module_index.units.len);
+        @memset(unit_slots, .empty);
+        indexed.* = .{ .index = module_index, .unit_slots = unit_slots };
+        return indexed;
+    }
+
     fn unitFacts(self: *BodyAnalyses, bodies: CheckedBodies, raw_node: u32) Allocator.Error!struct { *const UnitFacts, u32 } {
-        const unit_id = self.index.unitOf(raw_node);
-        const facts = try self.unit_slots[@backingInt(unit_id)].getOrCompute(
+        const indexed = self.demanded();
+        const unit_id = indexed.index.unitOf(raw_node);
+        const facts = try indexed.unit_slots[@backingInt(unit_id)].getOrCompute(
             self.io,
             Allocator.Error,
             UnitRequest{ .analyses = self, .bodies = bodies, .unit = unit_id },
             UnitRequest.compute,
         );
-        return .{ facts, self.index.position_in_unit[raw_node] };
+        return .{ facts, indexed.index.position_in_unit[raw_node] };
     }
 
     const UnitRequest = struct {
@@ -892,13 +958,13 @@ pub const BodyAnalyses = struct {
 
     pub fn stateMergeBinders(self: *BodyAnalyses, bodies: CheckedBodies, raw_node: u32) Allocator.Error![]const BinderId {
         const facts, const position = try self.unitFacts(bodies, raw_node);
-        const span = facts.state_merges[position] orelse invariant("a state merge was requested for a node that owns none");
+        const span = facts.state_merges[position].get() orelse invariant("a state merge was requested for a node that owns none");
         return facts.binders[span.start..][0..span.len];
     }
 
     pub fn loopMutationBinders(self: *BodyAnalyses, bodies: CheckedBodies, raw_node: u32) Allocator.Error![]const BinderId {
         const facts, const position = try self.unitFacts(bodies, raw_node);
-        const span = facts.loop_mutations[position] orelse invariant("loop mutations were requested for a node that is not a loop");
+        const span = facts.loop_mutations[position].get() orelse invariant("loop mutations were requested for a node that is not a loop");
         return facts.binders[span.start..][0..span.len];
     }
 
@@ -1552,20 +1618,18 @@ const InspectElision = struct {
 /// reuses that construct's published range instead of revisiting its parts,
 /// so each node is walked only by its nearest enclosing plan owner.
 const ReassignmentPublisher = struct {
-    const no_position = std.math.maxInt(u32);
-
     allocator: Allocator,
     bodies: CheckedBodies,
     unit: UnitId,
     nodes: []const u32,
-    state_merges: []?BinderSpan = &.{},
-    loop_mutations: []?BinderSpan = &.{},
+    state_merges: []OptionalBinderSpan = &.{},
+    loop_mutations: []OptionalBinderSpan = &.{},
     binders: std.ArrayList(BinderId) = .empty,
     scratch: std.ArrayList(BinderId) = .empty,
     work: std.ArrayList(Work) = .empty,
-    /// Per node of the unit, by position: for a binder being deduplicated,
-    /// its position in `scratch`.
-    scratch_positions: []u32 = &.{},
+    /// Per node of the unit, by position: whether a binder being
+    /// deduplicated is already in `scratch`.
+    scratch_seen: std.DynamicBitSetUnmanaged = .{},
 
     const PlanRef = union(enum) {
         /// A loop's mutations: its condition and body. The node is a `for`
@@ -1615,7 +1679,7 @@ const ReassignmentPublisher = struct {
     fn deinitScratch(self: *ReassignmentPublisher) void {
         self.scratch.deinit(self.allocator);
         self.work.deinit(self.allocator);
-        self.allocator.free(self.scratch_positions);
+        self.scratch_seen.deinit(self.allocator);
     }
 
     fn deinitResults(self: *ReassignmentPublisher) void {
@@ -1625,12 +1689,11 @@ const ReassignmentPublisher = struct {
     }
 
     fn run(self: *ReassignmentPublisher) Allocator.Error!void {
-        self.state_merges = try self.allocator.alloc(?BinderSpan, self.nodes.len);
-        @memset(self.state_merges, null);
-        self.loop_mutations = try self.allocator.alloc(?BinderSpan, self.nodes.len);
-        @memset(self.loop_mutations, null);
-        self.scratch_positions = try self.allocator.alloc(u32, self.nodes.len);
-        @memset(self.scratch_positions, no_position);
+        self.state_merges = try self.allocator.alloc(OptionalBinderSpan, self.nodes.len);
+        @memset(self.state_merges, .none);
+        self.loop_mutations = try self.allocator.alloc(OptionalBinderSpan, self.nodes.len);
+        @memset(self.loop_mutations, .none);
+        self.scratch_seen = try .initEmpty(self.allocator, self.nodes.len);
         const index = self.bodies.index();
         for (self.nodes) |raw| switch (index.nodeKind(raw)) {
             .expr => {
@@ -1708,9 +1771,9 @@ const ReassignmentPublisher = struct {
     /// The published range of a plan owner, if it has one yet.
     fn publishedRange(self: *const ReassignmentPublisher, plan: PlanRef) ?BinderSpan {
         return switch (plan) {
-            .loop => |raw| self.loop_mutations[self.position(raw)],
-            .state => |expr| self.state_merges[self.position(@backingInt(expr))],
-            .expr_statement => |statement| self.state_merges[self.position(@backingInt(statement))],
+            .loop => |raw| self.loop_mutations[self.position(raw)].get(),
+            .state => |expr| self.state_merges[self.position(@backingInt(expr))].get(),
+            .expr_statement => |statement| self.state_merges[self.position(@backingInt(statement))].get(),
         };
     }
 
@@ -1742,7 +1805,9 @@ const ReassignmentPublisher = struct {
                 if (item.nested) try self.pushContribution(item.plan, range);
             },
             .share_state => |item| {
-                self.state_merges[self.position(@backingInt(item.statement))] = self.state_merges[self.position(@backingInt(item.expr))].?;
+                const shared = self.state_merges[self.position(@backingInt(item.expr))];
+                std.debug.assert(shared.get() != null);
+                self.state_merges[self.position(@backingInt(item.statement))] = shared;
             },
             .append_binders => |range| {
                 try self.scratch.appendSlice(self.allocator, self.binders.items[range.start..][0..range.len]);
@@ -1796,21 +1861,21 @@ const ReassignmentPublisher = struct {
         const count = self.scratch.items.len;
         for (start..count) |i| {
             const binder = self.scratch.items[i];
-            const slot = &self.scratch_positions[self.position(@backingInt(binder))];
-            if (slot.* == no_position) {
-                slot.* = @intCast(end);
+            const slot = self.position(@backingInt(binder));
+            if (!self.scratch_seen.isSet(slot)) {
+                self.scratch_seen.set(slot);
                 self.scratch.items[end] = binder;
                 end += 1;
             }
         }
-        for (self.scratch.items[start..end]) |binder| self.scratch_positions[self.position(@backingInt(binder))] = no_position;
+        for (self.scratch.items[start..end]) |binder| self.scratch_seen.unset(self.position(@backingInt(binder)));
         const binders_start: u32 = @intCast(self.binders.items.len);
         try self.binders.appendSlice(self.allocator, self.scratch.items[start..end]);
         const range: BinderSpan = .{ .start = binders_start, .len = @intCast(end - start) };
         switch (plan) {
-            .loop => |raw| self.loop_mutations[self.position(raw)] = range,
-            .state => |expr| self.state_merges[self.position(@backingInt(expr))] = range,
-            .expr_statement => |statement| self.state_merges[self.position(@backingInt(statement))] = range,
+            .loop => |raw| self.loop_mutations[self.position(raw)] = .some(range),
+            .state => |expr| self.state_merges[self.position(@backingInt(expr))] = .some(range),
+            .expr_statement => |statement| self.state_merges[self.position(@backingInt(statement))] = .some(range),
         }
         return range;
     }
@@ -1967,7 +2032,7 @@ pub fn diagnosticErrors(allocator: Allocator, bodies: CheckedBodies, mode: Diagn
     defer allocator.free(states);
     var erroneous = try std.DynamicBitSetUnmanaged.initEmpty(allocator, node_count);
     defer erroneous.deinit(allocator);
-    for (bodies.env.erroneous_nodes.items.items) |entry| erroneous.set(entry.node_idx);
+    for (bodies.env.erroneous_nodes.items()) |entry| erroneous.set(entry.node_idx);
     var scan = DiagnosticScan{
         .allocator = allocator,
         .bodies = bodies,
@@ -2037,7 +2102,7 @@ const ConstantGraph = struct {
         var by_pattern = collections.DenseMap(u32, ExprId).init(allocator);
         defer by_pattern.deinit();
         for (roots.roots) |root| {
-            if (root.pattern) |pattern| try by_pattern.put(@backingInt(pattern), root.rootExpr());
+            if (root.pattern.get()) |pattern| try by_pattern.put(@backingInt(pattern), root.rootExpr());
         }
         for (refs.records) |record| {
             const ref = switch (record.ref) {
@@ -2415,7 +2480,7 @@ fn computeSingleSourceCalls(allocator: Allocator, bodies: CheckedBodies) Allocat
     const module = tables.module orelse invariant("single-source calls were computed without the module's identity");
     const env = bodies.env;
 
-    const count = templates.templates.items.len;
+    const count = templates.templates.items().len;
     const eligible = try allocator.alloc(bool, count);
     defer allocator.free(eligible);
     @memset(eligible, false);
@@ -2441,7 +2506,7 @@ fn computeSingleSourceCalls(allocator: Allocator, bodies: CheckedBodies) Allocat
     var public_defs = collections.DenseMap(CIR.Def.Idx, void).init(allocator);
     defer public_defs.deinit();
     for (tables.exported_defs) |def| try public_defs.put(def, {});
-    for (env.method_defs.entries.items) |entry| try public_defs.put(entry.value.def_idx, {});
+    for (env.method_defs.entries.items()) |entry| try public_defs.put(entry.value.def_idx, {});
     for (templates.by_def) |entry| {
         const id = local.template(entry.template) orelse continue;
         if (!public_defs.contains(entry.def)) eligible[@backingInt(id)] = true;
@@ -2450,7 +2515,7 @@ fn computeSingleSourceCalls(allocator: Allocator, bodies: CheckedBodies) Allocat
         const id = local.template(entry.template) orelse continue;
         eligible[@backingInt(id)] = true;
     }
-    for (templates.templates.items, eligible) |template, *is_eligible| {
+    for (templates.templates.items(), eligible) |template, *is_eligible| {
         if (template.target != .roc or template.body != .checked_body) is_eligible.* = false;
     }
 
@@ -2615,13 +2680,13 @@ fn singleSourceSites(
     var site_counts = collections.DenseMap(u32, u32).init(allocator);
     defer site_counts.deinit();
     for (sites) |site| {
-        const expr = site.checked_expr orelse continue;
+        const expr = site.checked_expr.get() orelse continue;
         (try site_counts.getOrPutValue(@backingInt(expr), 0)).value_ptr.* += 1;
     }
 
     for (sites, flags) |site, *flag| {
         if (site.owner != .template) continue;
-        const expr = site.checked_expr orelse continue;
+        const expr = site.checked_expr.get() orelse continue;
         const raw = @backingInt(expr);
         if (site_counts.get(raw).? != 1) continue;
         flag.* = shapes.callees.isSet(raw) or if (shapes.bound_by.get(raw)) |pattern|
@@ -2630,4 +2695,110 @@ fn singleSourceSites(
             false;
     }
     return flags;
+}
+
+const index_test_source =
+    \\Config := { count : U8 ?? 7 }
+    \\pick = |tag| {
+    \\    var $state = {}
+    \\    match tag {
+    \\        A => {
+    \\            $state = {}
+    \\            $state
+    \\        }
+    \\        B => $state
+    \\    }
+    \\}
+    \\expect 1 == 1
+;
+
+fn expectSameIndex(expected: *const ModuleIndex, actual: *const ModuleIndex) error{TestExpectedEqual}!void {
+    try std.testing.expectEqual(expected.has_expects, actual.has_expects);
+    inline for (.{ "node_kinds", "node_flags", "units", "unit_nodes", "top_level_defs", "defaults" }) |field| {
+        try std.testing.expectEqualDeep(@field(expected, field), @field(actual, field));
+    }
+    // Ownership and position are defined only for reached nodes.
+    for (expected.node_kinds, 0..) |kind, raw| {
+        if (kind == .unreached) continue;
+        try std.testing.expectEqual(expected.unit_of[raw], actual.unit_of[raw]);
+        try std.testing.expectEqual(expected.position_in_unit[raw], actual.position_in_unit[raw]);
+    }
+}
+
+test "body index stays lazy and matches eager indexing including defaults and promoted patterns" {
+    const allocator = std.testing.allocator;
+    var fixture = try @import("test/TestEnv.zig").init("Main", index_test_source);
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixture.checker.problems.problems.items.len);
+    const env = fixture.module_env;
+    const def = env.store.getDef(env.store.sliceDefs(env.global_value_defs)[0]);
+    const promoted = [_]struct { pattern: PatternId }{.{ .pattern = def.pattern }};
+    var eager = try ModuleIndex.build(allocator, env, &.{def.pattern});
+    defer eager.deinit(allocator);
+    try std.testing.expect(eager.has_expects);
+    try std.testing.expectEqual(@as(usize, 1), eager.defaults.len);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    const analyses = try BodyAnalyses.create(failing.allocator(), std.testing.io, env, &promoted);
+    defer analyses.destroy();
+    try std.testing.expect(analyses.indexed.peek() == null);
+    try std.testing.expectEqual(eager.defaults.len, try defaultExprCount(allocator, env));
+    try std.testing.expect(analyses.indexed.peek() == null);
+    const index = try analyses.demandIndex();
+    try expectSameIndex(&eager, index);
+    try std.testing.expect(index.node_flags[@backingInt(def.pattern)].promoted_pattern);
+    for (analyses.indexed.peek().?.unit_slots) |*slot| try std.testing.expect(slot.peek() == null);
+
+    // Repeated reads and demands cannot allocate or replace the index.
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectEqual(index, try analyses.demandIndex());
+    try std.testing.expectEqual(index, analyses.index());
+}
+
+test "body index allocation failures leave no partial index and can be retried" {
+    var fixture = try @import("test/TestEnv.zig").init("Main", index_test_source);
+    defer fixture.deinit();
+    var eager = try ModuleIndex.build(std.testing.allocator, fixture.module_env, &.{});
+    defer eager.deinit(std.testing.allocator);
+    var deterministic = collections.DeterministicAllocator.init(std.testing.allocator);
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(deterministic.allocator(), .{});
+        {
+            const analyses = try BodyAnalyses.create(failing.allocator(), std.testing.io, fixture.module_env, &.{});
+            defer analyses.destroy();
+            const initial_bytes = failing.allocated_bytes - failing.freed_bytes;
+            failing.fail_index = failing.alloc_index + fail_at;
+            const index = analyses.demandIndex() catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(analyses.indexed.peek() == null);
+                try std.testing.expectEqual(initial_bytes, failing.allocated_bytes - failing.freed_bytes);
+                failing.fail_index = std.math.maxInt(usize);
+                try expectSameIndex(&eager, try analyses.demandIndex());
+                continue;
+            };
+            try expectSameIndex(&eager, index);
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+    try std.testing.expect(fail_at > 1);
+}
+
+test "body analyses creation and undemanded destruction release every allocation" {
+    var fixture = try @import("test/TestEnv.zig").init("Main", index_test_source);
+    defer fixture.deinit();
+    const env = fixture.module_env;
+    const def = env.store.getDef(env.store.sliceDefs(env.global_value_defs)[0]);
+    const Scenario = struct {
+        fn run(allocator: Allocator, module: *const ModuleEnv, pattern: PatternId) (Allocator.Error || error{TestUnexpectedResult})!void {
+            // Creation owns this list but does not inspect its nodes.
+            const promoted = [_]struct { pattern: PatternId }{.{ .pattern = pattern }};
+            const analyses = try BodyAnalyses.create(allocator, std.testing.io, module, &promoted);
+            defer analyses.destroy();
+            try std.testing.expect(analyses.indexed.peek() == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{ env, def.pattern });
 }

@@ -13,6 +13,7 @@ const layout = @import("layout");
 const lir = @import("lir");
 const postcheck = @import("postcheck");
 const roc_target = @import("roc_target");
+const static_materialization = @import("static_data");
 
 const Coordinator = @import("../coordinator.zig").Coordinator;
 const CoreCtx = @import("ctx").CoreCtx;
@@ -114,6 +115,7 @@ fn sharedBuiltinModules() eval.BuiltinModules.InitError!*eval.BuiltinModules {
 
 /// Error set shared by LIR-lowering harness helpers and focused inspectors.
 pub const LowerToLirHarnessError = std.mem.Allocator.Error ||
+    static_materialization.MaterializationError ||
     lir.CheckedPipeline.LowerResourceError ||
     std.Io.Dir.CreateDirPathError ||
     std.Io.Dir.RealPathFileAllocError ||
@@ -140,6 +142,7 @@ pub const LowerToLirHarnessError = std.mem.Allocator.Error ||
         TestUnexpectedResult,
         UnsupportedBuiltinAnnotationOnly,
         UnsupportedHeader,
+        UnsupportedTarget,
         WriteFailed,
         Issue806UnsafeLargeStackStructAssign,
         Issue806UnsafeLargeStackTagAssign,
@@ -148,7 +151,6 @@ pub const LowerToLirHarnessError = std.mem.Allocator.Error ||
         Issue806UnsafeLargeStackCallArgument,
         Issue806UnsafeLargeStackReturn,
         Issue806UnsafeLargeStackJoinParam,
-        Issue806UnsafeLargeStackClosureCapture,
         Issue806UnsafeLargeStackPatternPayload,
         Issue806MissingStackProbe,
     };
@@ -266,13 +268,29 @@ pub fn expectAppPathLirInspection(app_path: []const u8, inspect: LirInspectFn) L
     try lowerAppPathToLir(std.testing.allocator, app_path, null, .{}, inspect, null);
 }
 
-/// The static data a lowered `.boxy` program's interpreter reads (its
-/// descriptors, dictionaries, and name table), or null for a program that
-/// froze none. The caller installs it on its interpreter and deinitializes it
+/// The checked modules a lowered or prepared inspection's program was lowered
+/// from. Set only while such an inspection runs.
+threadlocal var inspected_modules: ?lir.CheckedPipeline.CheckedModuleSet = null;
+
+/// The static data a lowered program's interpreter reads (Boxy descriptors,
+/// dictionaries, and name table, completed compile-time values, and static
+/// callables), built as every real pipeline builds its image's static data,
+/// or null for a program that has none. Called from a lowered or prepared
+/// inspection. The caller installs it on its interpreter and deinitializes it
 /// after the interpreter.
 pub fn interpreterStaticData(lowered: *const lir.CheckedPipeline.LoweredProgram) std.mem.Allocator.Error!?eval.InterpreterStaticData {
-    const frozen = lowered.frozen_static_data orelse return null;
-    return try eval.InterpreterStaticData.init(std.testing.allocator, frozen.exports, lowered.lir_result.static_data_values.items.len);
+    const modules = inspected_modules orelse
+        base.invariant("interpreterStaticData is called only from a lowered or prepared inspection", .{});
+    const exports = static_materialization.buildStaticDataForWidth(std.testing.allocator, .{
+        .root = modules.root,
+        .imports = modules.imports,
+    }, lowered, lowered.target_usize, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedTarget => base.invariant("a harness program's own pointer width has no static data layout", .{}),
+    };
+    defer static_materialization.deinitStaticData(std.testing.allocator, exports);
+    if (exports.len == 0) return null;
+    return try eval.InterpreterStaticData.init(std.testing.allocator, exports, lowered.lir_result.static_data_values.items.len);
 }
 
 /// Lower an app at `app_path` to LIR with explicit lowering options, then run
@@ -1176,6 +1194,28 @@ fn runToLirInspected(
     try lowerAppPathToLir(gpa, app_path, dump, opts, inspect, inspect_lowered);
 }
 
+/// Keep structural and executable inspections on the same lowering policy.
+fn loweringTarget(opts: LirLoweringOptions) lir.CheckedPipeline.TargetConfig {
+    return .{
+        .comptime_value_reads = opts.shared_comptime_reads,
+        .specialization_strategy = opts.specialization_strategy,
+        .target_usize = opts.target_usize,
+        .inline_mode = opts.inline_mode,
+        .spec_constr_clone_inlining = opts.spec_constr_clone_inlining,
+        .prove_uniqueness = true,
+        .consume_dead_boxes = opts.consume_dead_boxes,
+        .list_in_place_map = opts.list_in_place_map,
+        .proc_debug_names = opts.proc_debug_names,
+        .prove_ranges = opts.prove_ranges,
+        .replay_interface_summaries = .{ .value = opts.replay_interface_summaries },
+        .lifted_expr_count_out = opts.lifted_expr_count_out,
+        .solved_lir_parallel_metrics_out = opts.solved_lir_parallel_metrics_out,
+        .lir_pass_parallel_metrics_out = opts.lir_pass_parallel_metrics_out,
+        .arc_parallel_metrics_out = opts.arc_parallel_metrics_out,
+        .spec_constr_parallel_metrics_out = opts.spec_constr_parallel_metrics_out,
+    };
+}
+
 fn lowerAppPathToLir(
     gpa: std.mem.Allocator,
     app_path: []const u8,
@@ -1202,6 +1242,7 @@ fn lowerAppPathToLir(
     );
     defer coord.deinit();
     coord.enable_hosted_transform = true;
+    coord.specialization_strategy = opts.specialization_strategy;
 
     try coord.start();
     try coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
@@ -1300,34 +1341,33 @@ fn lowerAppPathToLir(
         .requests = lir_roots,
         .include_internal_static_data = opts.include_internal_static_data,
     };
-    const lower_target: lir.CheckedPipeline.TargetConfig = .{
-        .comptime_value_reads = opts.shared_comptime_reads,
-        .specialization_strategy = opts.specialization_strategy,
-        .target_usize = opts.target_usize,
-        .inline_mode = opts.inline_mode,
-        .spec_constr_clone_inlining = opts.spec_constr_clone_inlining,
-        .prove_uniqueness = true,
-        .consume_dead_boxes = opts.consume_dead_boxes,
-        .list_in_place_map = opts.list_in_place_map,
-        .proc_debug_names = opts.proc_debug_names,
-        .prove_ranges = opts.prove_ranges,
-        .replay_interface_summaries = .{ .value = opts.replay_interface_summaries },
-        .lifted_expr_count_out = opts.lifted_expr_count_out,
-        .post_check_executor = post_check_executor,
-        .solved_lir_parallel_metrics_out = opts.solved_lir_parallel_metrics_out,
-        .lir_pass_parallel_metrics_out = opts.lir_pass_parallel_metrics_out,
-        .arc_parallel_metrics_out = opts.arc_parallel_metrics_out,
-        .spec_constr_parallel_metrics_out = opts.spec_constr_parallel_metrics_out,
-        .timing = if (opts.timing_out != null) &timing else null,
-    };
+    var lower_target = loweringTarget(opts);
+    lower_target.completed_scalar_values = if (coord.program_session) |*session|
+        if (session.completed) |*completed| &completed.scalar_values else null
+    else
+        null;
+    lower_target.post_check_executor = post_check_executor;
+    lower_target.timing = if (opts.timing_out != null) &timing else null;
     if (opts.prepared_inspect) |prepared_inspect| {
         var prepared = try lir.CheckedPipeline.prepareCheckedModulesMonotype(gpa, lower_modules, lower_roots, lower_target);
         defer prepared.deinit();
+        inspected_modules = lower_modules;
+        defer inspected_modules = null;
         try prepared_inspect(&prepared);
         return;
     }
     var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(gpa, lower_modules, lower_roots, lower_target);
     defer lowered.deinit();
+    if (inspect_lowered != null or lowered.lir_result.static_data_values.items.len != 0) {
+        // Executing a lowered program, or reading its static values, requires
+        // the same complete readonly image that a linked program receives.
+        const exports = try static_materialization.buildStaticDataForWidth(gpa, .{
+            .root = lower_modules.root,
+            .imports = lower_modules.imports,
+        }, &lowered, opts.target_usize, .{});
+        if (lowered.frozen_static_data) |*frozen| frozen.deinit();
+        lowered.frozen_static_data = .{ .allocator = gpa, .exports = exports };
+    }
     if (opts.timing_out) |timing_out| timing_out.* = timing.snapshot();
 
     if (dump) |writer| {
@@ -1355,6 +1395,8 @@ fn lowerAppPathToLir(
     }
 
     if (inspect_lowered) |inspect_fn| {
+        inspected_modules = lower_modules;
+        defer inspected_modules = null;
         try inspect_fn(&lowered);
     }
 }

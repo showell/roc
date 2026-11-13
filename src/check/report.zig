@@ -79,6 +79,7 @@ const InvalidNominalDeclRecursion = problem_mod.InvalidNominalDeclRecursion;
 // Nominal type errors
 const CannotAccessOpaqueNominal = problem_mod.CannotAccessOpaqueNominal;
 const NominalTypeResolutionFailed = problem_mod.NominalTypeResolutionFailed;
+const AliasNamesNoNominalType = problem_mod.AliasNamesNoNominalType;
 
 // Platform errors
 const PlatformAliasNotFound = problem_mod.PlatformAliasNotFound;
@@ -126,6 +127,7 @@ const LiteralDefaulted = problem_mod.LiteralDefaulted;
 
 // Generic errors
 const VarWithSnapshot = problem_mod.VarWithSnapshot;
+const LocalTypeEscape = problem_mod.LocalTypeEscape;
 const RowLabelConflict = problem_mod.types.RowLabelConflict;
 
 // Context types for precise error reporting
@@ -240,8 +242,8 @@ pub const ReportBuilder = struct {
     /// Reset report builder, only fields it owns
     pub fn reset(self: *Self) void {
         self.bytes_buf.clearRetainingCapacity();
-        self.diff_fields.items.clearRetainingCapacity();
-        self.diff_tags.items.clearRetainingCapacity();
+        self.diff_fields.clearRetainingCapacity();
+        self.diff_tags.clearRetainingCapacity();
         self.typo_suggestions.clearRetainingCapacity();
         self.record_pattern_hint = null;
         self.method_conflict = null;
@@ -672,8 +674,8 @@ pub const ReportBuilder = struct {
             return report;
         }
 
-        const actual_formatted = self.getFormattedString(actual_snapshot);
-        const expected_formatted = self.getFormattedString(expected_snapshot);
+        const actual_formatted = try self.getFormattedString(actual_snapshot);
+        const expected_formatted = try self.getFormattedString(expected_snapshot);
         const actual_display = try self.type_displays.insert(self.gpa, actual_formatted);
         const expected_display = try self.type_displays.insert(self.gpa, expected_formatted);
 
@@ -760,7 +762,7 @@ pub const ReportBuilder = struct {
         // Print the actual
         try D.renderSlice(actual_label, self, &report);
         try report.document.addLineBreaks(2);
-        const actual_type_str = try report.addOwnedString(self.getFormattedString(actual_snapshot));
+        const actual_type_str = try report.addOwnedString(try self.getFormattedString(actual_snapshot));
         try report.document.addCodeBlock(actual_type_str);
 
         // Print hints
@@ -1023,6 +1025,9 @@ pub const ReportBuilder = struct {
             .nominal_type_resolution_failed => |data| {
                 return self.buildNominalTypeResolutionFailed(data);
             },
+            .alias_names_no_nominal_type => |data| {
+                return self.buildAliasNamesNoNominalType(data);
+            },
             .static_dispatch => |detail| {
                 switch (detail) {
                     .dispatcher_not_nominal => |data| return self.buildStaticDispatchDispatcherNotNominal(data),
@@ -1067,6 +1072,9 @@ pub const ReportBuilder = struct {
             },
             .anonymous_recursion => |data| {
                 return self.buildAnonymousRecursionReport(data);
+            },
+            .local_type_escape => |data| {
+                return self.buildLocalTypeEscapeReport(data);
             },
             .row_label_conflict => |data| {
                 return self.buildRowLabelConflictReport(data);
@@ -1355,7 +1363,7 @@ pub const ReportBuilder = struct {
         // pattern would have absorbed the extra fields rather than mismatching.
         if (!self.snapshots.?.isClosedRecord(pattern_snapshot)) return false;
 
-        self.diff_fields.items.clearRetainingCapacity();
+        self.diff_fields.clearRetainingCapacity();
 
         const pattern_range: ?SnapshotRecordFieldSafeList.Range =
             switch (try self.snapshots.?.gatherRecordFields(pattern_snapshot, self.gpa, &self.diff_fields)) {
@@ -1891,7 +1899,7 @@ pub const ReportBuilder = struct {
             try D.renderSlice(&.{D.bytes("But its body evaluates to:")}, self, &report);
         }
         try report.document.addLineBreaks(2);
-        const body_type_str = try report.addOwnedString(self.getFormattedString(types.expected_snapshot));
+        const body_type_str = try report.addOwnedString(try self.getFormattedString(types.expected_snapshot));
         try report.document.addCodeBlock(body_type_str);
         try report.document.addLineBreaks(2);
 
@@ -1960,7 +1968,7 @@ pub const ReportBuilder = struct {
             .flex, .err => return false,
             .rigid, .alias, .structure, .recursive => {},
         }
-        const err_type = self.getFormattedString(err_snapshot);
+        const err_type = try self.getFormattedString(err_snapshot);
 
         try D.renderSlice(&.{
             D.bytes("If this"),
@@ -2014,7 +2022,7 @@ pub const ReportBuilder = struct {
             D.bytes("It has the type:"),
         }, self, &report);
         try report.document.addLineBreaks(2);
-        const expected_type_str = try report.addOwnedString(self.getFormattedString(types.expected_snapshot));
+        const expected_type_str = try report.addOwnedString(try self.getFormattedString(types.expected_snapshot));
         try report.document.addCodeBlock(expected_type_str);
 
         return report;
@@ -2077,7 +2085,7 @@ pub const ReportBuilder = struct {
             D.bytes(" function has the type:"),
         }, self, &report);
         try report.document.addLineBreaks(2);
-        const expected_type_str = try report.addOwnedString(self.getFormattedString(types.expected_snapshot));
+        const expected_type_str = try report.addOwnedString(try self.getFormattedString(types.expected_snapshot));
         try report.document.addCodeBlock(expected_type_str);
 
         if (ctx.actual_args < ctx.expected_args) {
@@ -2194,7 +2202,7 @@ pub const ReportBuilder = struct {
                 return report;
             }
 
-            const expected_type = try report.addOwnedString(self.getFormattedString(types.expected_snapshot));
+            const expected_type = try report.addOwnedString(try self.getFormattedString(types.expected_snapshot));
 
             try report.document.addText("But the nominal type needs it to one of:");
             try report.document.addLineBreaks(2);
@@ -2222,7 +2230,7 @@ pub const ReportBuilder = struct {
             return report;
         }
 
-        const expected_type = try report.addOwnedString(self.getFormattedString(types.expected_snapshot));
+        const expected_type = try report.addOwnedString(try self.getFormattedString(types.expected_snapshot));
         try report.document.addText("But the nominal type wraps:");
         try report.document.addLineBreaks(2);
         try report.document.addCodeBlock(expected_type);
@@ -2247,8 +2255,8 @@ pub const ReportBuilder = struct {
             try report.document.addLineBreak();
         }
 
-        const actual_type = try report.addOwnedString(self.getFormattedString(types.actual_snapshot));
-        const expected_type = try report.addOwnedString(self.getFormattedString(types.expected_snapshot));
+        const actual_type = try report.addOwnedString(try self.getFormattedString(types.actual_snapshot));
+        const expected_type = try report.addOwnedString(try self.getFormattedString(types.expected_snapshot));
 
         try report.document.addText(found_intro);
         try report.document.addLineBreaks(2);
@@ -2625,7 +2633,7 @@ pub const ReportBuilder = struct {
             }, self, &report, &report.headline);
         }
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
 
         try self.addConstraintFailureHighlight(&report, data.owner_region, data.fn_var);
 
@@ -2647,7 +2655,7 @@ pub const ReportBuilder = struct {
     fn isPlainForLoopOverStream(self: *Self, data: DispatcherDoesNotImplMethod) bool {
         const types_store = &self.module_env.types;
         const failed_fn = types_store.resolveVar(data.fn_var).var_;
-        for (self.module_env.for_loop_dispatch_plans.items.items) |plan| {
+        for (self.module_env.for_loop_dispatch_plans.items()) |plan| {
             if (types_store.resolveVar(@fromBackingInt(@intCast(plan.iter_fn_var))).var_ != failed_fn) continue;
             const nominal = types_store.resolveVar(data.dispatcher_var).desc.content.unwrapNominalType() orelse return false;
             return nominal.ident.ident_idx.eql(self.module_env.idents.builtin_stream);
@@ -2753,7 +2761,7 @@ pub const ReportBuilder = struct {
 
         try self.addConstraintFailureHighlight(&report, data.owner_region, data.fn_var);
 
-        const row_str = try report.addOwnedString(self.getFormattedString(row_extension.row_snapshot));
+        const row_str = try report.addOwnedString(try self.getFormattedString(row_extension.row_snapshot));
         try D.renderSlice(&.{
             D.bytes(if (is_eq) "The values being compared have this type:" else "The values being hashed have this type:"),
         }, self, &report);
@@ -2854,7 +2862,7 @@ pub const ReportBuilder = struct {
             }, self, &report, &report.headline);
         }
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
 
         try self.addConstraintFailureHighlight(&report, data.owner_region, data.fn_var);
 
@@ -3085,7 +3093,7 @@ pub const ReportBuilder = struct {
             D.bytes("is a value of the function body around this type, so it can't be called as a method."),
         }, self, &report, &report.headline);
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
 
         if (self.getRegionSafe(@fromBackingInt(@backingInt(data.fn_var)))) |region| {
             try self.addSourceRegionOf(&report.document, region.*, .error_highlight);
@@ -3121,7 +3129,7 @@ pub const ReportBuilder = struct {
             D.bytes("cannot be resolved."),
         }, self, &report, &report.headline);
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
 
         if (self.getRegionSafe(@fromBackingInt(@backingInt(data.fn_var)))) |region| {
             try self.addSourceRegionOf(&report.document, region.*, .error_highlight);
@@ -3136,7 +3144,7 @@ pub const ReportBuilder = struct {
         try report.document.addLineBreaks(2);
 
         if (data.grown_from_snapshot) |grown_from_snapshot| {
-            const grown_from_str = try report.addOwnedString(self.getFormattedString(grown_from_snapshot));
+            const grown_from_str = try report.addOwnedString(try self.getFormattedString(grown_from_snapshot));
             try D.renderSlice(&.{
                 D.bytes("Satisfying this dispatch re-enters"),
                 D.ident(data.method_name).withAnnotation(.inline_code),
@@ -3235,7 +3243,7 @@ pub const ReportBuilder = struct {
     }
 
     fn addDeterminedType(self: *Self, report: *Report, determined: SnapshotContentIdx) Allocator.Error!void {
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(determined));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(determined));
         try D.renderSlice(&.{
             D.bytes("The type was determined to be:"),
         }, self, report);
@@ -3279,7 +3287,7 @@ pub const ReportBuilder = struct {
         var report = try Report.init(self.gpa, "Type Mismatch", "This number is being used where a non-number type is needed.", .runtime_error);
         errdefer report.deinit();
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
 
         // Get the region of the number literal from the num_literal info
         const num_literal = data.num_literal.?;
@@ -3423,7 +3431,7 @@ pub const ReportBuilder = struct {
         var report = try Report.init(self.gpa, "Invalid Number", "This number literal does not fit in the inferred type.", .runtime_error);
         errdefer report.deinit();
 
-        const expected_type = try report.addOwnedString(self.getFormattedString(data.expected_type));
+        const expected_type = try report.addOwnedString(try self.getFormattedString(data.expected_type));
 
         try self.addSourceRegionOf(&report.document, data.region, .error_highlight);
         try report.document.addLineBreak();
@@ -3510,7 +3518,7 @@ pub const ReportBuilder = struct {
         errdefer report.deinit();
         try D.renderSliceInto(&.{
             D.bytes(intro),
-            D.bytes(self.getFormattedString(data.default_snapshot)).withAnnotation(.inline_code),
+            D.bytes(try self.getFormattedString(data.default_snapshot)).withAnnotation(.inline_code),
             D.bytes("instead."),
         }, self, &report, &report.headline);
 
@@ -3549,7 +3557,7 @@ pub const ReportBuilder = struct {
             }, self, &report, &report.headline);
         }
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
 
         try self.addConstraintFailureHighlight(&report, data.owner_region, data.fn_var);
 
@@ -3599,7 +3607,7 @@ pub const ReportBuilder = struct {
 
         try self.addConstraintFailureHighlight(&report, data.owner_region, data.fn_var);
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
         try D.renderSlice(&.{D.bytes("The type is:")}, self, &report);
         try report.document.addLineBreaks(2);
         try report.document.addCodeBlock(snapshot_str);
@@ -3634,7 +3642,7 @@ pub const ReportBuilder = struct {
 
         try self.addConstraintFailureHighlight(&report, data.owner_region, data.fn_var);
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
         try D.renderSlice(&.{D.bytes("The type is:")}, self, &report);
         try report.document.addLineBreaks(2);
         try report.document.addCodeBlock(snapshot_str);
@@ -3694,7 +3702,7 @@ pub const ReportBuilder = struct {
         );
         try report.document.addLineBreak();
 
-        const snapshot_str = try report.addOwnedString(self.getFormattedString(data.requirements_snapshot.?));
+        const snapshot_str = try report.addOwnedString(try self.getFormattedString(data.requirements_snapshot.?));
         try D.renderSlice(&.{D.bytes("Its type needs all of these:")}, self, &report);
         try report.document.addLineBreak();
         try report.document.addLineBreak();
@@ -3803,11 +3811,11 @@ pub const ReportBuilder = struct {
 
         try D.renderSlice(&.{D.bytes("One of them has the type:")}, self, &report);
         try report.document.addLineBreaks(2);
-        try report.document.addCodeBlock(try report.addOwnedString(self.getFormattedString(leaf.expected_snapshot)));
+        try report.document.addCodeBlock(try report.addOwnedString(try self.getFormattedString(leaf.expected_snapshot)));
         try report.document.addLineBreaks(2);
         try D.renderSlice(&.{D.bytes("But another has the type:")}, self, &report);
         try report.document.addLineBreaks(2);
-        try report.document.addCodeBlock(try report.addOwnedString(self.getFormattedString(leaf.actual_snapshot)));
+        try report.document.addCodeBlock(try report.addOwnedString(try self.getFormattedString(leaf.actual_snapshot)));
         try report.document.addLineBreaks(2);
         try D.renderSlice(&.{
             D.bytes("Hint:").withAnnotation(.emphasized),
@@ -3998,12 +4006,12 @@ pub const ReportBuilder = struct {
 
         try D.renderSlice(&.{D.bytes("One type is:")}, self, &report);
         try report.document.addLineBreaks(2);
-        const actual_type_str = try report.addOwnedString(self.getFormattedString(types.actual_snapshot));
+        const actual_type_str = try report.addOwnedString(try self.getFormattedString(types.actual_snapshot));
         try report.document.addCodeBlock(actual_type_str);
         try report.document.addLineBreaks(2);
         try D.renderSlice(&.{D.bytes("The other is:")}, self, &report);
         try report.document.addLineBreaks(2);
-        const expected_type_str = try report.addOwnedString(self.getFormattedString(types.expected_snapshot));
+        const expected_type_str = try report.addOwnedString(try self.getFormattedString(types.expected_snapshot));
         try report.document.addCodeBlock(expected_type_str);
         try report.document.addLineBreak();
 
@@ -4181,76 +4189,29 @@ pub const ReportBuilder = struct {
         self: *Self,
         data: DerivedParserErrorRow,
     ) Allocator.Error!Report {
-        var report = try Report.init(self.gpa, "Parser Error Row Missing Tag", "", .runtime_error);
+        var report = try Report.init(self.gpa, "Parser Error Type Mismatch", "", .runtime_error);
         errdefer report.deinit();
 
-        switch (data.reason) {
-            .required_field => {
-                try D.renderSliceInto(&.{
-                    D.bytes("This parser can fail with the tag"),
-                    D.bytes("MissingRequiredField(Str)").withAnnotation(.inline_code),
-                    D.bytes("but its error row does not include it."),
-                }, self, &report, &report.headline);
-            },
-            .nested_row => {
-                try D.renderSliceInto(&.{
-                    D.bytes("This parser can fail with a tag that its error row does not include."),
-                }, self, &report, &report.headline);
-            },
-        }
+        try D.renderSliceInto(&.{
+            D.bytes("Every operation in a derived parser must use the same format-owned error type."),
+        }, self, &report, &report.headline);
 
         try self.addSourceRegionOf(&report.document, data.region, .error_highlight);
         try report.document.addLineBreak();
 
-        switch (data.reason) {
-            .required_field => {
-                try report.document.addReflowingText("The parser is derived for the record type:");
-                try report.document.addLineBreaks(2);
-                const record_str = try report.addOwnedString(self.getFormattedString(data.record_snapshot.?));
-                try report.document.addCodeBlock(record_str);
-                try report.document.addLineBreak();
-                const fields_text = self.problems.getExtraString(data.required_fields.?);
-                if (data.required_field_count == 1) {
-                    try report.document.addReflowingText("The field ");
-                    try report.document.addAnnotated(fields_text, .inline_code);
-                    try report.document.addReflowingText(" is required, so the derived parser can fail when it is missing.");
-                } else {
-                    try report.document.addReflowingText("The fields ");
-                    try report.document.addAnnotated(fields_text, .inline_code);
-                    try report.document.addReflowingText(" are required, so the derived parser can fail when one is missing.");
-                }
-            },
-            .nested_row => {
-                try report.document.addReflowingText("The nested parser can produce the tags:");
-                try report.document.addLineBreaks(2);
-                const tags_str = try report.addOwnedString(self.getFormattedString(data.tags_snapshot.?));
-                try report.document.addCodeBlock(tags_str);
-            },
-        }
+        try report.document.addReflowingText("One operation uses the error type:");
+        try report.document.addLineBreaks(2);
+        const tags_str = try report.addOwnedString(try self.getFormattedString(data.tags_snapshot));
+        try report.document.addCodeBlock(tags_str);
 
         try report.document.addLineBreaks(2);
-        try report.document.addReflowingText("But the error row is closed at:");
+        try report.document.addReflowingText("But this parser requires:");
         try report.document.addLineBreaks(2);
-        const row_str = try report.addOwnedString(self.getFormattedString(data.row_snapshot));
+        const row_str = try report.addOwnedString(try self.getFormattedString(data.row_snapshot));
         try report.document.addCodeBlock(row_str);
         try report.document.addLineBreak();
 
-        switch (data.reason) {
-            .required_field => {
-                try report.document.addReflowingText("Make the required field optional with ");
-                try report.document.addAnnotated("?:", .inline_code);
-                try report.document.addReflowingText(", ");
-                try report.document.addAnnotated("??", .inline_code);
-                try report.document.addReflowingText(", or ");
-                try report.document.addAnnotated("Try(_, [Missing])", .inline_code);
-                try report.document.addReflowingText(", or add ");
-                try report.document.addAnnotated("MissingRequiredField(Str)", .inline_code);
-                try report.document.addReflowingText(" to the error row.");
-            },
-            .nested_row => {
-                try report.document.addReflowingText("Add the missing tags to the error row, or widen it so it includes them.");
-            },
-        }
+        try report.document.addReflowingText("Use the format's error type in each parser operation, translating custom domain errors explicitly.");
 
         return report;
     }
@@ -4292,7 +4253,7 @@ pub const ReportBuilder = struct {
         try report.document.addReflowingText("Its type is:");
         try report.document.addLineBreak();
         try report.document.addLineBreak();
-        const record_str = try report.addOwnedString(self.getFormattedString(data.record_snapshot));
+        const record_str = try report.addOwnedString(try self.getFormattedString(data.record_snapshot));
         try report.document.addCodeBlock(record_str);
         try report.document.addLineBreak();
         try report.document.addLineBreak();
@@ -4402,7 +4363,7 @@ pub const ReportBuilder = struct {
         evidence: TypeMismatchEvidence,
         ctx: Context.RecordAccessContext,
     ) Allocator.Error!Report {
-        self.diff_fields.items.clearRetainingCapacity();
+        self.diff_fields.clearRetainingCapacity();
 
         const actual_snapshot = switch (evidence) {
             .record => |record| record.actual_snapshot,
@@ -4474,7 +4435,7 @@ pub const ReportBuilder = struct {
         evidence: TypeMismatchEvidence,
         ctx: Context.RecordUpdateContext,
     ) Allocator.Error!Report {
-        self.diff_fields.items.clearRetainingCapacity();
+        self.diff_fields.clearRetainingCapacity();
 
         const expected_snapshot = switch (evidence) {
             .record => |record| record.expected_snapshot,
@@ -4698,6 +4659,33 @@ pub const ReportBuilder = struct {
         return report;
     }
 
+    fn buildAliasNamesNoNominalType(
+        self: *Self,
+        data: AliasNamesNoNominalType,
+    ) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Expected Nominal Type", "", .runtime_error);
+        errdefer report.deinit();
+        try D.renderSliceInto(&.{
+            D.bytes("You are using the type"),
+            D.ident(data.alias_name).withAnnotation(.inline_code),
+            D.bytes("like a nominal type, but it is an alias of a type that is not nominal."),
+        }, self, &report, &report.headline);
+
+        if (self.getRegionSafe(@fromBackingInt(@backingInt(data.var_)))) |region| {
+            try self.addSourceRegionOf(&report.document, region.*, .error_highlight);
+        }
+
+        try report.document.addLineBreak();
+        try D.renderSlice(&.{
+            D.bytes("Hint:").withAnnotation(.emphasized),
+            D.bytes("You can declare the type it aliases with"),
+            D.bytes(":=").withAnnotation(.binary_operator),
+            D.bytes("to make it nominal."),
+        }, self, &report);
+
+        return report;
+    }
+
     /// Build a report for when a nominal type variable doesn't resolve properly.
     /// This is a compiler bug - it should never happen in correctly compiled code.
     fn buildNominalTypeResolutionFailed(
@@ -4778,7 +4766,7 @@ pub const ReportBuilder = struct {
             fn explain(fields: @This(), builder: *Self, rep: *Report, index: usize) Allocator.Error!void {
                 const field_name = builder.can_ir.getIdentText(fields.names[index]);
 
-                const field_type_str = try rep.addOwnedString(builder.getFormattedString(fields.contents[index]));
+                const field_type_str = try rep.addOwnedString(try builder.getFormattedString(fields.contents[index]));
 
                 try rep.document.addText("    ");
                 try rep.document.addAnnotated(field_name, .emphasized);
@@ -4815,7 +4803,7 @@ pub const ReportBuilder = struct {
             }
 
             fn explain(elems: @This(), builder: *Self, rep: *Report, index: usize) Allocator.Error!void {
-                const elem_type_str = try rep.addOwnedString(builder.getFormattedString(elems.contents[index]));
+                const elem_type_str = try rep.addOwnedString(try builder.getFormattedString(elems.contents[index]));
 
                 try rep.document.addText("    element ");
                 try builder.addAnnotatedFmt(rep, "{d}", .{index}, .emphasized);
@@ -4869,7 +4857,7 @@ pub const ReportBuilder = struct {
                         if (!first) try rep.document.addText(", ");
                         first = false;
 
-                        const arg_type_str = try rep.addOwnedString(builder.getFormattedString(arg_content_idx));
+                        const arg_type_str = try rep.addOwnedString(try builder.getFormattedString(arg_content_idx));
                         try rep.document.addAnnotated(arg_type_str, .type_variable);
                     }
                     try rep.document.addText(")");
@@ -5108,7 +5096,7 @@ pub const ReportBuilder = struct {
         }, self, &report);
         try report.document.addLineBreaks(2);
 
-        const actual_type_str = try report.addOwnedString(self.getFormattedString(data.snapshot));
+        const actual_type_str = try report.addOwnedString(try self.getFormattedString(data.snapshot));
         try report.document.addCodeBlock(actual_type_str);
         try report.document.addLineBreaks(2);
 
@@ -5164,7 +5152,7 @@ pub const ReportBuilder = struct {
         }, self, &report);
         try report.document.addLineBreaks(2);
 
-        const actual_type_str = try report.addOwnedString(self.getFormattedString(data.snapshot));
+        const actual_type_str = try report.addOwnedString(try self.getFormattedString(data.snapshot));
         try report.document.addCodeBlock(actual_type_str);
         try report.document.addLineBreak();
 
@@ -5205,7 +5193,7 @@ pub const ReportBuilder = struct {
             try report.document.addLineBreak();
         }
         try report.document.addLineBreak();
-        try report.document.addCodeBlock(try report.addOwnedString(self.getFormattedString(data.outer_snapshot)));
+        try report.document.addCodeBlock(try report.addOwnedString(try self.getFormattedString(data.outer_snapshot)));
         try report.document.addLineBreaks(2);
 
         try D.renderSlice(&.{D.bytes("It also comes from here:")}, self, &report);
@@ -5214,7 +5202,7 @@ pub const ReportBuilder = struct {
         try report.document.addLineBreaks(2);
         try D.renderSlice(&.{D.bytes("where it is:")}, self, &report);
         try report.document.addLineBreaks(2);
-        try report.document.addCodeBlock(try report.addOwnedString(self.getFormattedString(data.inner_snapshot)));
+        try report.document.addCodeBlock(try report.addOwnedString(try self.getFormattedString(data.inner_snapshot)));
         try report.document.addLineBreaks(2);
 
         try D.renderSlice(&.{D.bytes(rule)}, self, &report);
@@ -5248,7 +5236,7 @@ pub const ReportBuilder = struct {
         }, self, &report);
         try report.document.addLineBreaks(2);
 
-        const actual_type_str = try report.addOwnedString(self.getFormattedString(data.snapshot));
+        const actual_type_str = try report.addOwnedString(try self.getFormattedString(data.snapshot));
         try report.document.addCodeBlock(actual_type_str);
         try report.document.addLineBreaks(2);
 
@@ -5263,6 +5251,103 @@ pub const ReportBuilder = struct {
         return report;
     }
 
+    fn buildLocalTypeEscapeReport(self: *Self, data: LocalTypeEscape) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Local Type Escapes", "", .runtime_error);
+        errdefer report.deinit();
+        const subject: D = if (data.def_name) |def_name| D.ident(def_name).withAnnotation(.inline_code) else D.bytes("this definition");
+        if (data.owner_name) |owner_name| {
+            try D.renderSliceInto(&.{
+                D.bytes("The type of"),
+                subject,
+                D.bytes("uses"),
+                D.ident(data.type_name).withAnnotation(.inline_code),
+                D.bytes(",").withNoPrecedingSpace(),
+                D.bytes("a type that depends on the type variable"),
+                D.ident(data.var_name).withAnnotation(.inline_code),
+                D.bytes("of"),
+                D.ident(owner_name).withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report, &report.headline);
+        } else {
+            try D.renderSliceInto(&.{
+                D.bytes("The type of"),
+                subject,
+                D.bytes("uses"),
+                D.ident(data.type_name).withAnnotation(.inline_code),
+                D.bytes(",").withNoPrecedingSpace(),
+                D.bytes("a type that depends on the type variable"),
+                D.ident(data.var_name).withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report, &report.headline);
+        }
+
+        try self.addSourceRegionOf(&report.document, data.region, .error_highlight);
+        try report.document.addLineBreak();
+
+        try D.renderSlice(&.{D.bytes("Its type is:")}, self, &report);
+        try report.document.addLineBreaks(2);
+        try report.document.addCodeBlock(try report.addOwnedString(try self.getFormattedString(data.def_snapshot)));
+        try report.document.addLineBreaks(2);
+
+        try D.renderSlice(&.{
+            D.ident(data.type_name).withAnnotation(.inline_code),
+            D.bytes("is declared here:"),
+        }, self, &report);
+        try report.document.addLineBreak();
+        try self.addSourceRegionOf(&report.document, data.type_region, .dimmed);
+        try report.document.addLineBreak();
+
+        if (data.owner_name) |owner_name| {
+            try D.renderSlice(&.{
+                D.bytes("Because"),
+                D.ident(data.type_name).withAnnotation(.inline_code),
+                D.bytes("depends on"),
+                D.ident(data.var_name).withAnnotation(.inline_code),
+                D.bytes("from"),
+                D.ident(owner_name).withAnnotation(.inline_code),
+                D.bytes(",").withNoPrecedingSpace(),
+                D.bytes("each use of"),
+                D.ident(owner_name).withAnnotation(.inline_code),
+                D.bytes("at a different"),
+                D.ident(data.var_name).withAnnotation(.inline_code),
+                D.bytes("gives it a different type, so it can't be used outside"),
+                D.ident(owner_name).withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report);
+        } else {
+            try D.renderSlice(&.{
+                D.bytes("Because"),
+                D.ident(data.type_name).withAnnotation(.inline_code),
+                D.bytes("depends on"),
+                D.ident(data.var_name).withAnnotation(.inline_code),
+                D.bytes(",").withNoPrecedingSpace(),
+                D.bytes("it can't be used outside the function that introduces"),
+                D.ident(data.var_name).withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report);
+        }
+        try report.document.addLineBreaks(2);
+
+        const parameterized = blk: {
+            const text = try std.fmt.allocPrint(self.gpa, "{s}({s})", .{ self.can_ir.getIdentText(data.type_name), self.can_ir.getIdentText(data.var_name) });
+            defer self.gpa.free(text);
+            break :blk try report.addOwnedString(text);
+        };
+        try D.renderSlice(&.{
+            D.bytes("Hint:").withAnnotation(.emphasized),
+            D.bytes("Declare"),
+            D.ident(data.type_name).withAnnotation(.inline_code),
+            D.bytes("at the top level with a type parameter, like"),
+            D.bytes(parameterized).withAnnotation(.inline_code),
+            D.bytes(",").withNoPrecedingSpace(),
+            D.bytes("so each use says which"),
+            D.ident(data.var_name).withAnnotation(.inline_code),
+            D.bytes("it means."),
+        }, self, &report);
+
+        return report;
+    }
+
     fn buildPolymorphicValueReport(self: *Self, data: VarWithSnapshot) Allocator.Error!Report {
         var report = try Report.init(self.gpa, "Polymorphic Value", "This top-level value still has an unresolved polymorphic type.", .runtime_error);
         errdefer report.deinit();
@@ -5272,7 +5357,7 @@ pub const ReportBuilder = struct {
             try report.document.addLineBreak();
         }
 
-        const type_str = try report.addOwnedString(self.getFormattedString(data.snapshot));
+        const type_str = try report.addOwnedString(try self.getFormattedString(data.snapshot));
         try report.document.addLineBreak();
         try report.document.addReflowingText("Its type is:");
         try report.document.addLineBreak();
@@ -5463,10 +5548,15 @@ pub const ReportBuilder = struct {
     }
 
     fn buildHostedUnboxedFunctionReport(self: *Self, data: HostedUnboxedFunction) Allocator.Error!Report {
-        return self.buildHighlightedRegionReport("Hosted Function Requires Boxed Lambda", "Hosted functions cannot accept or return unboxed functions.", .runtime_error, data.region, &.{
-            D.bytes("Wrap function types in"),
-            D.bytes("Box").withAnnotation(.inline_code),
-            D.bytes("when crossing the host boundary."),
+        return self.buildHighlightedRegionReport("Hosted Function Requires Boxed Lambda", "Host-visible functions, Iter, and Stream must each be directly boxed.", .runtime_error, data.region, &.{
+            D.bytes(self.problems.getExtraString(data.path)).withAnnotation(.inline_code),
+            D.bytes("contains an unboxed"),
+            D.bytes(switch (data.kind) {
+                .function => "function",
+                .iter => "Iter",
+                .stream => "Stream",
+            }).withAnnotation(.inline_code),
+            D.bytes("value. Make that value the immediate payload of its own Box. Boxing an enclosing record, tuple, list, tag, or user type does not count."),
         });
     }
 
@@ -6472,11 +6562,9 @@ pub const ReportBuilder = struct {
         }
     }
 
-    /// Get the formatted string for a snapshot.
-    /// Returns a placeholder if the formatted string is missing, allowing error reporting
-    /// to continue gracefully even if snapshots are incomplete.
-    fn getFormattedString(self: *const Self, idx: SnapshotContentIdx) []const u8 {
-        return self.snapshots.?.getFormattedString(idx) orelse "<unknown type>";
+    /// Request only the frozen type this diagnostic displays.
+    fn getFormattedString(self: *const Self, idx: SnapshotContentIdx) Allocator.Error![]const u8 {
+        return @constCast(self.snapshots.?).formatType(idx);
     }
 
     /// Returns the operator symbol for a given method ident, or null if not an operator method.
