@@ -95,6 +95,14 @@ pub const LookupResult = union(enum) {
             .field_access => |field_access| ModuleEnv.varFrom(field_access.segment_idx),
         };
     }
+
+    /// Return the source region of the selected lookup site.
+    pub fn region(self: LookupResult, store: *const NodeStore) Region {
+        return switch (self) {
+            .expr => |expr_idx| store.getExprRegion(expr_idx),
+            .field_access => |field_access| store.getFieldAccessSegmentRegion(field_access.segment_idx),
+        };
+    }
 };
 
 // Helper Functions
@@ -611,9 +619,21 @@ pub fn findLookupAtOffset(module_env: *ModuleEnv, offset: u32) ?LookupResult {
     return ctx.result;
 }
 
+/// Find the lookup at `offset`, unless a narrower node than the lookup holds it.
+///
+/// Operators and method calls count as lookups, so `findLookupAtOffset` also
+/// returns them for offsets in their operands and arguments. `narrowest` is the
+/// region of the smallest node at the offset: a lookup larger than that merely
+/// encloses the node, and doesn't describe it.
+pub fn findLookupNoWiderThan(module_env: *ModuleEnv, offset: u32, narrowest: Region) ?LookupResult {
+    const lookup = findLookupAtOffset(module_env, offset) orelse return null;
+    if (regionSize(lookup.region(&module_env.store)) > regionSize(narrowest)) return null;
+    return lookup;
+}
+
 /// External nominal reference information for a tag.
 pub const TagNominalExternal = struct {
-    module_idx: CIR.Import.Idx,
+    module: CIR.Expr.NominalExternalModule,
     target_node_idx: u32,
 };
 
@@ -641,7 +661,7 @@ const FindTagAtOffsetContext = struct {
         switch (expr) {
             .e_tag => |tag| ctx.result = ctx.tagRef(tag.name, ModuleEnv.varFrom(expr_idx)),
             .e_nominal => |nom| ctx.findNominalBackingTag(nom.backing_expr, nom.nominal_type_decl, null),
-            .e_nominal_external => |nom| ctx.findNominalBackingTag(nom.backing_expr, null, .{ .module_idx = nom.module_idx, .target_node_idx = nom.target_node_idx }),
+            .e_nominal_external => |nom| ctx.findNominalBackingTag(nom.backing_expr, null, .{ .module = nom.module, .target_node_idx = nom.target_node_idx }),
             .e_match => |match_expr| {
                 // A tag that a match branch pattern matches carries the match condition's type.
                 const cond_var = ModuleEnv.varFrom(match_expr.cond);
@@ -822,7 +842,7 @@ const FindTagAtOffsetContext = struct {
                 },
                 .nominal_external => |nom| {
                     nominal_decl = null;
-                    nominal_external = .{ .module_idx = nom.module_idx, .target_node_idx = nom.target_node_idx };
+                    nominal_external = .{ .module = nom.module, .target_node_idx = nom.target_node_idx };
                     current = nom.backing_pattern;
                 },
                 .as => |as_pat| current = as_pat.pattern,
@@ -883,7 +903,7 @@ pub fn collectReferences(
     var results: std.ArrayList(LspRange) = .empty;
     errdefer results.deinit(allocator);
 
-    for (module_env.store.write_occurrences.items.items) |write| {
+    for (module_env.store.write_occurrences.items()) |write| {
         if (write.pattern_idx == target_pattern) {
             if (regionToRange(module_env, write.region())) |range| {
                 try results.append(allocator, range);
@@ -1029,6 +1049,10 @@ const CollectBindingsContext = struct {
     annotated: *PatternSet,
     /// The patterns a definition or a statement declares.
     declared: *PatternSet,
+    /// The patterns the walk has already reached. A reassignment points back
+    /// at its var's pattern, so the walk reaches that pattern again for every
+    /// write to it.
+    visited: *PatternSet,
     oom: ?std.mem.Allocator.Error = null,
 
     fn visitStmtPre(ctx: *CollectBindingsContext, _: CIR.Statement.Idx, stmt: CIR.Statement) VisitAction {
@@ -1046,6 +1070,9 @@ const CollectBindingsContext = struct {
             pattern.var_assign.ident
         else
             return .continue_traversal;
+
+        if (ctx.visited.contains(pattern_idx)) return .continue_traversal;
+        ctx.visited.insert(pattern_idx);
 
         // A leading `_` marks a binding the author deliberately ignores.
         // Annotating what someone said they do not care about is noise.
@@ -1105,6 +1132,8 @@ pub fn collectUnannotatedBindings(
     defer annotated.deinit(allocator);
     var declared = try PatternSet.init(allocator, &module_env.store);
     defer declared.deinit(allocator);
+    var visited = try PatternSet.init(allocator, &module_env.store);
+    defer visited.deinit(allocator);
 
     var results: std.ArrayList(UnannotatedBinding) = .empty;
     errdefer results.deinit(allocator);
@@ -1118,6 +1147,7 @@ pub fn collectUnannotatedBindings(
         .results = &results,
         .annotated = &annotated,
         .declared = &declared,
+        .visited = &visited,
     };
     var visitor = CirVisitor(CollectBindingsContext).init(&ctx, .{
         .visit_stmt_pre = CollectBindingsContext.visitStmtPre,
@@ -1352,7 +1382,7 @@ fn findPatternByAnnotationName(module_env: *ModuleEnv, offset: u32) ?CIR.Pattern
 /// Find the exact source occurrence that writes an existing local binding.
 /// A structural reassignment's surrounding pattern is not the written name.
 pub fn findWriteAtOffset(module_env: *const ModuleEnv, offset: u32) ?NodeStore.WriteOccurrence {
-    for (module_env.store.write_occurrences.items.items) |write| {
+    for (module_env.store.write_occurrences.items()) |write| {
         if (regionContainsOffset(write.region(), offset)) return write;
     }
     return null;

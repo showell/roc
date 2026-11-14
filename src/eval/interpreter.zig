@@ -363,9 +363,11 @@ pub const Interpreter = struct {
     /// Frame storage: each procedure activation's locals and `ptr_alloca`
     /// cells, released when the activation ends.
     frame_stack: ValueStack,
-    /// Owned copy of the values `pending_erased` reads, which outlive the
-    /// statement and frame that deferred the call.
-    pending_erased_storage: std.ArrayListAlignedUnmanaged(u8, .@"16") = .empty,
+    /// Owned copy of what the pending call (`pending_erased` or
+    /// `pending_dyn`) reads, which outlives the statement and frame that
+    /// deferred the call. Driving the call copies it out first, so the call
+    /// it leaves pending can replace it.
+    pending_storage: std.ArrayListAlignedUnmanaged(u8, .@"16") = .empty,
     /// The arguments of a frame-replacing call, between the frame that makes
     /// it ending and the callee's frame beginning.
     tail_call_storage: std.ArrayListAlignedUnmanaged(u8, .@"16") = .empty,
@@ -387,7 +389,7 @@ pub const Interpreter = struct {
     /// Resolved immutable values indexed directly by compact `StaticDataId`.
     static_data: []const usize,
     /// Direct slot lookup per entered procedure: a frame local's slot is
-    /// `slot_of[id - base]`, and ids outside the frame hold `FrameSlotIndex.none`.
+    /// `slot_of.get(id - base)`, absent for ids outside the frame.
     /// An index is built the first time a procedure is entered and is checked
     /// against the frame-local span it was built from, so a procedure whose
     /// frame locals are rewritten gets a fresh index.
@@ -403,7 +405,7 @@ pub const Interpreter = struct {
     pending_erased: ?PendingErasedCall = null,
     /// A dynamic erased call a deferred tail call left pending, as the
     /// native runtime records one: its closure, one reference to which it
-    /// owns, and an owned copy of its argument record.
+    /// owns, and a copy of its argument record in `pending_storage`.
     pending_dyn: ?PendingDynCall = null,
     /// Set while an erased call is entering its callee, so that callee can
     /// tell this caller, which makes pending calls, from any other.
@@ -458,7 +460,7 @@ pub const Interpreter = struct {
     /// Runs the static erased callables of one interpreter static-data image.
     /// A caller of the erased-callable ABI supplies only its own RocOps and the
     /// capture pointer, so each callable reaches its owner through the
-    /// `StaticCallableHeader` stored before its allocation, never through the
+    /// `StaticCallableHeader` stored in its capture, never through the
     /// caller's RocOps.
     pub const StaticCallableOwner = struct {
         context: ?*anyopaque,
@@ -525,8 +527,7 @@ pub const Interpreter = struct {
         }
     };
 
-    /// Interpreter-private header stored immediately before the allocation of
-    /// each static erased callable in an interpreter static-data image.
+    /// Interpreter-private ownership trailer inside a static callable's capture.
     pub const StaticCallableHeader = extern struct {
         owner: *const StaticCallableOwner,
         proc_id: u32,
@@ -539,8 +540,8 @@ pub const Interpreter = struct {
         std.mem.alignForward(usize, @sizeOf(usize), builtins.erased_callable.payload_alignment);
 
     pub fn staticCallableHeader(capture_ptr: [*]u8) *const StaticCallableHeader {
-        const payload = @intFromPtr(capture_ptr) - builtins.erased_callable.capture_offset;
-        return @ptrFromInt(payload - static_callable_payload_offset - @sizeOf(StaticCallableHeader));
+        const payload = builtins.erased_callable.payloadPtr(capture_ptr - builtins.erased_callable.capture_offset);
+        return @ptrCast(@alignCast(capture_ptr + payload.capture_size - @sizeOf(StaticCallableHeader)));
     }
 
     /// Native stack overflow is not caught here: see `max_call_depth`.
@@ -552,7 +553,7 @@ pub const Interpreter = struct {
     }
 
     const LocalSlot = struct {
-        /// `unassigned_value` until the local is assigned.
+        /// Runtime-safety builds use `unassigned_value` until the local is assigned.
         val: Value = unassigned_value,
 
         /// No allocation and no zero-sized sentinel offset is ever at this
@@ -565,10 +566,13 @@ pub const Interpreter = struct {
     };
 
     /// See `frame_slot_indexes`.
+    const FrameSlotId = enum(u32) { _ };
+    const FrameSlotColumn = collections.OptionalIndexColumn(FrameSlotId);
+
     const FrameSlotIndex = struct {
         span: LIR.LocalSpan,
         base: u32,
-        slot_of: []u32,
+        slot_of: FrameSlotColumn,
         /// The slots of the frame's zero-sized locals.
         zst_slots: []u32 = &.{},
         /// Per slot: where the local's bytes live in the frame's storage, and
@@ -581,10 +585,8 @@ pub const Interpreter = struct {
         /// bytes the procedure's `frame_alloc` places.
         dyn_frame_slots: []u32 = &.{},
 
-        const none = std.math.maxInt(u32);
-
-        fn deinit(self: FrameSlotIndex, allocator: Allocator) void {
-            allocator.free(self.slot_of);
+        fn deinit(self: *FrameSlotIndex, allocator: Allocator) void {
+            self.slot_of.deinit(allocator);
             allocator.free(self.zst_slots);
             allocator.free(self.dyn_frame_slots);
             allocator.free(self.storage_offsets);
@@ -602,7 +604,7 @@ pub const Interpreter = struct {
         locals: LirStore.StoreSpanBorrow(LocalId, "local_ids"),
         /// The proc's slot index (see `frame_slot_indexes`).
         slot_base: u32,
-        slot_of: []const u32,
+        slot_of: FrameSlotColumn.View,
         /// The proc's join points, sorted by id.
         join_points: LirStore.StoreSpanBorrow(LIR.JoinPoint, "join_points"),
         slots: []LocalSlot,
@@ -624,9 +626,8 @@ pub const Interpreter = struct {
             const id = @backingInt(local_id);
             if (id < self.slot_base) return null;
             const offset = id - self.slot_base;
-            if (offset >= self.slot_of.len) return null;
-            const slot = self.slot_of[offset];
-            return if (slot == FrameSlotIndex.none) null else slot;
+            if (offset >= self.slot_of.len()) return null;
+            return if (self.slot_of.get(offset)) |slot| @backingInt(slot) else null;
         }
 
         fn joinPoint(self: *const Frame, join_point_id: LIR.JoinPointId) ?LIR.JoinPoint {
@@ -915,10 +916,7 @@ pub const Interpreter = struct {
     pub fn deinit(self: *LirInterpreter) void {
         self.failed_call_stack.deinit(self.allocator);
         self.call_stack.deinit(self.allocator);
-        self.pending_erased_storage.deinit(self.allocator);
-        if (self.pending_dyn) |pending| {
-            if (pending.args) |args| self.allocator.free(args);
-        }
+        self.pending_storage.deinit(self.allocator);
         self.tail_call_storage.deinit(self.allocator);
         self.roc_env.deinit();
         self.allocator.destroy(self.roc_env);
@@ -960,6 +958,13 @@ pub const Interpreter = struct {
     }
 
     fn staticErasedCallableOnDrop(_: ?[*]u8, _: *RocOps) callconv(.c) void {}
+
+    /// Frozen captures name immortal allocations, so retaining them is a no-op.
+    pub fn staticErasedCallableOnCopyAddress() usize {
+        return @intFromPtr(&staticErasedCallableOnCopy);
+    }
+
+    fn staticErasedCallableOnCopy(_: ?[*]u8, _: isize) callconv(.c) void {}
 
     fn evalAllocator(self: *LirInterpreter) Allocator {
         return self.scratch.allocator();
@@ -1505,7 +1510,7 @@ pub const Interpreter = struct {
 
     fn getLocalChecked(self: *LirInterpreter, frame: *const Frame, local_id: LocalId) Error!Value {
         const slot = frame.slots[frame.slotIndex(local_id)];
-        if (!slot.assigned()) {
+        if (std.debug.runtime_safety and !slot.assigned()) {
             if (comptime builtin.target.os.tag != .freestanding) {
                 const proc = self.store.getProcSpec(frame.proc_id);
                 debugPrint(
@@ -2025,7 +2030,7 @@ pub const Interpreter = struct {
     ) Error!ProcStep {
         const dyn_result = self.pending_dyn_result;
         self.pending_dyn_result = null;
-        if ((proc_spec.dyn_result != null) != (dyn_result != null)) {
+        if ((proc_spec.dyn_result != .none) != (dyn_result != null)) {
             return self.invariantFailedError(
                 "LIR/interpreter invariant violated: proc {d} dynamic result storage presence differed from its caller's",
                 .{@backingInt(proc_id)},
@@ -2047,7 +2052,7 @@ pub const Interpreter = struct {
             );
         }
 
-        if (proc_spec.hosted) |hosted| {
+        if (proc_spec.hosted.get()) |hosted| {
             const param_layouts = try self.localLayouts(self.store.getLocalSpan(proc_spec.args));
             if (args.len != param_layouts.len) {
                 return self.invariantFailedError(
@@ -2082,7 +2087,7 @@ pub const Interpreter = struct {
         defer self.frame_stack.restore(frame.stack_mark);
         frame.caller_drives = self.erased_caller_drives;
         self.erased_caller_drives = false;
-        if (proc_spec.dyn_result) |result_local| {
+        if (proc_spec.dyn_result.get()) |result_local| {
             frame.dyn_result = dyn_result;
             bindDynAddress(&frame, result_local, dyn_result.?);
         }
@@ -2099,7 +2104,7 @@ pub const Interpreter = struct {
                 for (arg_layouts, 0..) |arg_layout, i| {
                     debugPrint("{d}:{d} ", .{ i, @backingInt(arg_layout) });
                 }
-                debugPrint(" abi={s} hosted={}\n", .{ @tagName(proc_spec.abi), proc_spec.hosted != null });
+                debugPrint(" abi={s} hosted={}\n", .{ @tagName(proc_spec.abi), proc_spec.hosted.get() != null });
                 self.debugDumpProc(proc_id);
             }
             return self.invariantFailedError(
@@ -2118,7 +2123,7 @@ pub const Interpreter = struct {
             const arg = args[i];
             const arg_layout = arg_layouts[i];
             const param_layout = self.store.getLocal(param).layout_idx;
-            const is_erased_reuse_arg = proc_spec.erased_reuse_arg == param;
+            const is_erased_reuse_arg = proc_spec.erased_reuse_arg.get() == param;
             if (proc_spec.abi == .erased_callable and i + 2 == params.len) {
                 if (param_layout != .opaque_ptr or arg_layout != .opaque_ptr) {
                     return self.invariantFailedError(
@@ -2194,7 +2199,7 @@ pub const Interpreter = struct {
                     // A procedure that left a call pending returns no value.
                     const returned = try self.localBytes(&frame, ret_local);
                     if (returned != result_storage and !self.hasPendingCall()) {
-                        boxy.walk.copy(try self.localDesc(&frame, proc_spec.dyn_result.?), result_storage, returned);
+                        boxy.walk.copy(try self.localDesc(&frame, proc_spec.dyn_result.get().?), result_storage, returned);
                     }
                     break :blk .{ .result = .{ .value = Value.zst, .layout = proc_spec.ret_layout } };
                 }
@@ -2248,7 +2253,7 @@ pub const Interpreter = struct {
             .of(LocalSlot),
         )));
         const slots = slots_ptr[0..locals.len];
-        @memset(slots, .{});
+        if (std.debug.runtime_safety) @memset(slots, .{});
         // A zero-sized local holds its only value from the start.
         for (slot_index.zst_slots) |slot| slots[slot].val = Value.zst;
         const storage = try self.frame_stack.alloc(
@@ -2261,7 +2266,7 @@ pub const Interpreter = struct {
             .ret_layout = proc_spec.ret_layout,
             .locals = locals,
             .slot_base = slot_index.base,
-            .slot_of = slot_index.slot_of,
+            .slot_of = slot_index.slot_of.view(),
             .join_points = self.store.getJoinPointSpan(proc_spec.join_points),
             .slots = slots,
             .storage = storage,
@@ -2287,21 +2292,20 @@ pub const Interpreter = struct {
         }
         // Until the index is built, the entry names a span no procedure has,
         // so a failed build is rebuilt on the next entry.
-        entry.value_ptr.* = .{ .span = .{ .start = std.math.maxInt(u32), .len = std.math.maxInt(u32) }, .base = 0, .slot_of = &.{} };
+        entry.value_ptr.* = .{ .span = .{ .start = std.math.maxInt(u32), .len = std.math.maxInt(u32) }, .base = 0, .slot_of = .{} };
         if (locals.len == 0) {
             entry.value_ptr.span = span;
             return entry.value_ptr.*;
         }
         const base_id = @backingInt(GuardedList.at(locals, 0));
         const last_id = @backingInt(GuardedList.at(locals, locals.len - 1));
-        const slot_of = try self.allocator.alloc(u32, @as(usize, last_id - base_id) + 1);
-        errdefer self.allocator.free(slot_of);
-        @memset(slot_of, FrameSlotIndex.none);
+        var slot_of = try FrameSlotColumn.initFilled(self.allocator, @as(usize, last_id - base_id) + 1);
+        errdefer slot_of.deinit(self.allocator);
         var zst_count: usize = 0;
         var dyn_frame_count: usize = 0;
         for (0..locals.len) |slot| {
             const local_id = GuardedList.at(locals, slot);
-            slot_of[@backingInt(local_id) - base_id] = @intCast(slot);
+            slot_of.set(@backingInt(local_id) - base_id, @fromBackingInt(@intCast(slot)));
             const local = self.store.getLocal(local_id);
             if (self.layout_store.getLayout(local.layout_idx).tag == .zst) zst_count += 1;
             if (local.dyn) |dyn| {
@@ -2355,7 +2359,7 @@ pub const Interpreter = struct {
     }
 
     fn requireProcBody(self: *LirInterpreter, proc_id: LirProcSpecId, proc_spec: LirProcSpec) CFStmtId {
-        return proc_spec.body orelse self.invariantFailed(
+        return proc_spec.body.get() orelse self.invariantFailed(
             "LIR/interpreter invariant violated: non-hosted proc {d} missing statement body",
             .{@backingInt(proc_id)},
         );
@@ -2430,14 +2434,14 @@ pub const Interpreter = struct {
                             .proc = assign.proc,
                             .args = arg_values,
                             .arg_layouts = arg_layouts,
-                            .dyn_result = if (callee.dyn_result == null) null else frame.dyn_result orelse return self.invariantFailedError(
+                            .dyn_result = if (callee.dyn_result == .none) null else frame.dyn_result orelse return self.invariantFailedError(
                                 "LIR/interpreter invariant violated: proc {d} replaces its frame with a dynamic-result call but has no result storage",
                                 .{@backingInt(frame.proc_id)},
                             ),
                             .relocations = call_args.relocations,
                         } };
                     }
-                    const result_storage: ?[*]u8 = if (callee.dyn_result == null) null else try self.callResultStorage(frame, assign.target);
+                    const result_storage: ?[*]u8 = if (callee.dyn_result == .none) null else try self.callResultStorage(frame, assign.target);
                     const call_loc = self.activeStmtLoc();
                     const call_region = self.activeStmtRegion();
                     const call_inline_scope = self.activeStmtInlineScope();
@@ -2982,7 +2986,7 @@ pub const Interpreter = struct {
     /// A dynamic erased call left pending (`pending_dyn`).
     const PendingDynCall = struct {
         closure: [*]u8,
-        args: ?[]align(16) u8,
+        args: ?[]const u8,
         /// The driven call passes the reference this record owns on to the
         /// callee as its reuse input (an owned deferred call).
         transfer: bool,
@@ -3025,8 +3029,14 @@ pub const Interpreter = struct {
             self.scratch.restore(chain_mark);
             if (self.pending_dyn) |pending| {
                 self.pending_dyn = null;
-                defer if (pending.args) |args| self.allocator.free(args);
-                try self.invokeErasedInto(pending.closure, if (ret_size == 0) null else ret, if (pending.args) |args| args.ptr else null, if (pending.transfer) pending.closure else null);
+                // The call may leave another pending, which replaces the
+                // owned copy, so it reads its arguments from scratch.
+                const args: ?[*]const u8 = if (pending.args) |owned| copy: {
+                    const copy = try self.evalAllocator().alignedAlloc(u8, .@"16", owned.len);
+                    @memcpy(copy, owned);
+                    break :copy copy.ptr;
+                } else null;
+                try self.invokeErasedInto(pending.closure, if (ret_size == 0) null else ret, args, if (pending.transfer) pending.closure else null);
                 // ARC explicitly transferred this reference to the pending
                 // call: an owned call's callee consumed it, and every other
                 // is released here.
@@ -3065,6 +3075,8 @@ pub const Interpreter = struct {
         builtins.erased_callable.payloadPtr(data_ptr).* = .{
             .callable_fn_ptr = &interpreterErasedCallableTrampoline,
             .on_drop = &interpreterErasedCallableOnDrop,
+            .on_copy = &interpreterErasedCallableOnCopy,
+            .capture_size = capture_size,
         };
         if (self.retained_owner) |owner| owner.retain();
         erasedCallableInterpreterContextFromPayload(data_ptr).* = .{
@@ -3097,12 +3109,12 @@ pub const Interpreter = struct {
     /// Copy the values a deferred erased call reads into storage that
     /// outlives the statement and frame deferring it.
     fn ownPendingErasedCall(self: *LirInterpreter, call: PendingErasedCall) Error!PendingErasedCall {
-        self.pending_erased_storage.clearRetainingCapacity();
+        self.pending_storage.clearRetainingCapacity();
         return try self.copyPendingErasedCall(call, null);
     }
 
     /// Copy a pending erased call's values into `allocator`, or into
-    /// `pending_erased_storage` when `allocator` is null.
+    /// `pending_storage` when `allocator` is null.
     fn copyPendingErasedCall(self: *LirInterpreter, call: PendingErasedCall, allocator: ?Allocator) Error!PendingErasedCall {
         const layouts_offset = call.args.len * @sizeOf(Value);
         const closure_sa = self.helper.sizeAlignOf(call.closure_layout);
@@ -3123,8 +3135,8 @@ pub const Interpreter = struct {
         const bytes: [*]align(16) u8 = if (allocator) |a|
             (try a.alignedAlloc(u8, .@"16", @max(end, 1))).ptr
         else blk: {
-            try self.pending_erased_storage.resize(self.allocator, end);
-            break :blk self.pending_erased_storage.items.ptr;
+            try self.pending_storage.resize(self.allocator, end);
+            break :blk self.pending_storage.items.ptr;
         };
         const args: [*]Value = @ptrCast(bytes);
         const layouts: [*]layout_mod.Idx = @ptrCast(@alignCast(bytes + layouts_offset));
@@ -3458,6 +3470,26 @@ pub const Interpreter = struct {
         leaveAndReleaseErasedCallableOwner(owner);
     }
 
+    fn interpreterErasedCallableOnCopy(capture: ?[*]u8, amount: isize) callconv(.c) void {
+        const context = erasedCallableInterpreterContextFromCapture(capture);
+        if (context.owner) |owner| {
+            owner.enter();
+            for (0..@intCast(amount)) |_| owner.retain();
+        }
+        defer if (context.owner) |owner| owner.leave();
+        const ptr = capture.? + context.capture_value_offset;
+        switch (@as(ErasedCallableCaptureDrop, @fromBackingInt(@intCast(context.drop_kind)))) {
+            .none => {},
+            .desc => boxy.walk.captureIncref(ptr, amount, &context.interpreter.roc_ops),
+            .rc_helper => context.interpreter.performRcHelperRequired(
+                .{ .op = .incref, .layout_idx = @fromBackingInt(@intCast(context.drop_layout_plus_one - 1)) },
+                .{ .ptr = ptr },
+                @intCast(amount),
+                .atomic,
+            ),
+        }
+    }
+
     fn dropInterpreterErasedCallableCapture(
         self: *LirInterpreter,
         context: *ErasedCallableInterpreterContext,
@@ -3538,7 +3570,7 @@ pub const Interpreter = struct {
         const explicit_arg_count = proc_arg_locals.len - 2;
         var proc_args = try self.evalAllocator().alloc(Value, proc_arg_locals.len);
         var proc_arg_layouts = try self.evalAllocator().alloc(layout_mod.Idx, proc_arg_locals.len);
-        const arg_plan = self.store.getErasedCallArgsPlan(proc_spec.erased_call_args orelse {
+        const arg_plan = self.store.getErasedCallArgsPlan(proc_spec.erased_call_args.get() orelse {
             return self.invariantFailedError(
                 "LIR/interpreter invariant violated: erased callable proc {d} has no argument plan",
                 .{@backingInt(proc_id)},
@@ -3651,13 +3683,13 @@ pub const Interpreter = struct {
                     .{@backingInt(proc_id)},
                 );
             }
-            const capture_param = proc_spec.erased_capture_arg orelse {
+            const capture_param = proc_spec.erased_capture_arg.get() orelse {
                 return self.invariantFailedError(
                     "LIR/interpreter invariant violated: erased callable proc {d} had no capture parameter metadata",
                     .{@backingInt(proc_id)},
                 );
             };
-            const explicit_arg_count = self.store.getErasedCallArgsPlan(proc_spec.erased_call_args.?).offsets.len;
+            const explicit_arg_count = self.store.getErasedCallArgsPlan(proc_spec.erased_call_args.get().?).offsets.len;
             if (proc_params.len != explicit_arg_count + 2) {
                 return self.invariantFailedError(
                     "LIR/interpreter invariant violated: erased callable proc {d} had {d} parameters for {d} explicit arguments plus capture/reuse",
@@ -3696,7 +3728,7 @@ pub const Interpreter = struct {
             proc_arg_layouts[explicit_arg_count] = .opaque_ptr;
 
             const reuse_index = explicit_arg_count + 1;
-            const reuse_param = proc_spec.erased_reuse_arg orelse return self.invariantFailedError(
+            const reuse_param = proc_spec.erased_reuse_arg.get() orelse return self.invariantFailedError(
                 "LIR/interpreter invariant violated: erased callable proc had no reuse parameter metadata",
                 .{},
             );
@@ -3792,7 +3824,9 @@ pub const Interpreter = struct {
         const data_ptr = if (assign.reuse) |reuse_local| blk: {
             const reuse_value = try self.getLocalChecked(frame, reuse_local);
             if (self.readBoxedDataPointer(reuse_value)) |reuse_ptr| {
-                if (assign.reuse_unique or builtins.utils.isUnique(reuse_ptr, &self.roc_ops)) {
+                if (builtins.erased_callable.payloadPtr(reuse_ptr).capture_size >= capture_size and
+                    (assign.reuse_unique or builtins.utils.isUnique(reuse_ptr, &self.roc_ops)))
+                {
                     self.layoutRuntime().performErasedCallableFinalDrop(reuse_ptr, .decref, 1);
                     break :blk reuse_ptr;
                 }
@@ -3833,6 +3867,8 @@ pub const Interpreter = struct {
         payload.* = .{
             .callable_fn_ptr = &interpreterErasedCallableTrampoline,
             .on_drop = on_drop,
+            .on_copy = &interpreterErasedCallableOnCopy,
+            .capture_size = capture_size,
         };
 
         const context = erasedCallableInterpreterContextFromPayload(data_ptr);
@@ -4868,9 +4904,11 @@ pub const Interpreter = struct {
         };
     }
 
-    /// The canonical allocation-free representation of a ZST list.
+    /// A list of `len` zero-sized items and no spare capacity. A list of
+    /// zero-sized items holds no allocation, so its capacity is a count alone
+    /// (design.md "Static Lists And Strings Keep Their Capacity").
     fn canonicalZstList(len: usize) RocList {
-        return .{ .bytes = null, .length = len, .capacity_or_alloc_ptr = 0 };
+        return RocList.zeroSized(len, len);
     }
 
     fn zstSublistLen(size: usize, start_u64: u64, len_u64: u64) usize {
@@ -5008,7 +5046,7 @@ pub const Interpreter = struct {
         const elems_rc = self.builtinListElemRc(list_elems);
         const list_val = self.listValue(list_elems, ll.args[0]);
         if (info.width == 0) {
-            return self.listResult(ll, canonicalZstList(list_val.len()));
+            return self.listResult(ll, list_val.zeroSizedReserving(ll.args[1].read(u64)));
         }
         var crash_boundary = self.enterCrashBoundary();
         defer crash_boundary.deinit();
@@ -5041,6 +5079,18 @@ pub const Interpreter = struct {
         const list_elems = listElemSource(ll, arg_layout);
 
         return switch (ll.op) {
+            .boxed_sequence_pack => blk: {
+                const result = try self.alloc(ll.ret_layout);
+                const handle = builtins.boxed_sequence.pack(args[0].ptr, self.helper.sizeOf(ll.arg_layouts[0]), args[1].read(u32), &self.roc_ops);
+                self.writeBoxedDataPointer(result, handle);
+                break :blk result;
+            },
+            .boxed_sequence_unpack => blk: {
+                const step = self.readBoxedDataPointer(args[0]) orelse self.invariantFailed("boxed sequence has a null step", .{});
+                const result = try self.alloc(ll.ret_layout);
+                builtins.boxed_sequence.unpack(result.ptr, step, self.helper.sizeOf(ll.ret_layout));
+                break :blk result;
+            },
             .num_plus, .num_minus, .num_times => unreachable, // lowering resolves source-policy arithmetic to a family member, and verifyArithmeticBoundary rejects it in LIR
             .list_prefetched => unreachable, // LIR lowering splits this into an alias and `list_prefetch`
             // ── String ops ──
@@ -5084,7 +5134,7 @@ pub const Interpreter = struct {
                 val.write(u8, if (result) 1 else 0);
                 break :blk val;
             },
-            .str_concat => self.callBuiltinStr2Mode(builtins.str.strConcatC, valueToRocStr(args[0]), valueToRocStr(args[1]), updateModeForArg0(ll.unique_args), ll.ret_layout),
+            .str_concat, .str_append => self.callBuiltinStr2Mode(builtins.str.strConcatC, valueToRocStr(args[0]), valueToRocStr(args[1]), updateModeForArg0(ll.unique_args), ll.ret_layout),
             .str_contains => blk: {
                 const result = builtins.str.strContains(valueToRocStr(args[0]), valueToRocStr(args[1]));
                 const val = try self.alloc(ll.ret_layout);
@@ -5393,9 +5443,6 @@ pub const Interpreter = struct {
             .list_capacity => blk: {
                 const rl = self.listValue(list_elems, args[0]);
                 const val = try self.alloc(ll.ret_layout);
-                // A list of zero-width elements never allocates, so its stored
-                // capacity is zero however many elements it holds. Report the
-                // stored capacity as it is.
                 val.write(u64, @intCast(rl.getCapacity()));
                 break :blk val;
             },
@@ -5425,7 +5472,7 @@ pub const Interpreter = struct {
                 const info = self.listElemInfo(list_elems);
                 const list_val = self.listValue(list_elems, args[0]);
                 if (info.width == 0) {
-                    break :blk self.listResult(ll, canonicalZstList(list_val.len() + 1));
+                    break :blk self.listResult(ll, list_val.zeroSizedKeeping(list_val.len() + 1));
                 }
                 const result = builtins.list.listAppendUnsafe(
                     list_val,
@@ -5442,7 +5489,7 @@ pub const Interpreter = struct {
                 const list_b = self.listValue(list_elems, args[1]);
                 if (info.width == 0) {
                     const total_len = list_a.len() + list_b.len();
-                    break :blk self.listResult(ll, canonicalZstList(total_len));
+                    break :blk self.listResult(ll, list_a.zeroSizedKeeping(total_len));
                 }
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();
@@ -5473,7 +5520,7 @@ pub const Interpreter = struct {
                 const list_val = self.listValue(list_elems, args[0]);
                 const count = args[2].read(u64);
                 if (info.width == 0) {
-                    break :blk self.listResult(ll, canonicalZstList(list_val.len() + @as(usize, @intCast(count))));
+                    break :blk self.listResult(ll, list_val.zeroSizedKeeping(list_val.len() + @as(usize, @intCast(count))));
                 }
                 if (count == 0) {
                     break :blk self.listResult(ll, list_val);
@@ -5532,7 +5579,7 @@ pub const Interpreter = struct {
                 const list_val = self.listValue(list_elems, args[0]);
                 const count = args[2].read(u64);
                 if (info.width == 0) {
-                    break :blk self.listResult(ll, canonicalZstList(list_val.len() + @as(usize, @intCast(count))));
+                    break :blk self.listResult(ll, list_val.zeroSizedKeeping(list_val.len() + @as(usize, @intCast(count))));
                 }
                 if (count == 0) {
                     break :blk self.listResult(ll, list_val);
@@ -5574,7 +5621,7 @@ pub const Interpreter = struct {
                 const src_val = self.listValue(list_elems, args[1]);
                 const count = args[3].read(u64);
                 if (info.width == 0) {
-                    break :blk self.listResult(ll, canonicalZstList(list_val.len() + @as(usize, @intCast(count))));
+                    break :blk self.listResult(ll, list_val.zeroSizedKeeping(list_val.len() + @as(usize, @intCast(count))));
                 }
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();
@@ -5602,7 +5649,7 @@ pub const Interpreter = struct {
                 const elems_rc = self.builtinListElemRc(list_elems);
                 const list_val = self.listValue(list_elems, args[0]);
                 if (info.width == 0) {
-                    break :blk self.listResult(ll, canonicalZstList(list_val.len() + 1));
+                    break :blk self.listResult(ll, list_val.zeroSizedKeeping(list_val.len() + 1));
                 }
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();
@@ -5630,7 +5677,7 @@ pub const Interpreter = struct {
                 const list_val = self.listValue(list_elems, args[0]);
                 if (info.width == 0) {
                     // ZST elements: swap is a no-op on observable contents; length unchanged.
-                    break :blk self.listResult(ll, canonicalZstList(list_val.len()));
+                    break :blk self.listResult(ll, list_val.zeroSizedKeeping(list_val.len()));
                 }
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();
@@ -5752,7 +5799,7 @@ pub const Interpreter = struct {
                     const len = source_list.len();
                     const drop_index = args[1].read(u64);
                     const result_len = if (drop_index >= @as(u64, @intCast(len))) len else len -| 1;
-                    break :blk self.listResult(ll, canonicalZstList(result_len));
+                    break :blk self.listResult(ll, source_list.zeroSizedKeeping(result_len));
                 }
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();
@@ -5786,7 +5833,7 @@ pub const Interpreter = struct {
                 if (info.width == 0) {
                     // ZST element: list is unchanged, value field is zero-sized so we don't write to it.
                     const source_list = self.listValue(list_elems, args[0]);
-                    const unchanged = canonicalZstList(source_list.len());
+                    const unchanged = source_list.zeroSizedKeeping(source_list.len());
                     @memcpy(val.offset(list_field_off).ptr[0..@sizeOf(RocList)], std.mem.asBytes(&unchanged));
                     break :blk val;
                 }
@@ -5836,7 +5883,7 @@ pub const Interpreter = struct {
                 const elems_rc = self.builtinListElemRc(list_elems);
                 if (info.width == 0) {
                     const source_list = self.listValue(list_elems, args[0]);
-                    break :blk self.listResult(ll, canonicalZstList(source_list.len()));
+                    break :blk self.listResult(ll, source_list.zeroSizedKeeping(source_list.len()));
                 }
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();
@@ -5879,7 +5926,7 @@ pub const Interpreter = struct {
                 const result_elems = listElemSource(ll, ll.ret_layout);
                 const info = self.listElemInfo(result_elems);
                 if (info.width == 0) {
-                    break :blk self.listResult(ll, canonicalZstList(0));
+                    break :blk self.listResult(ll, RocList.zeroSized(0, args[0].read(u64)));
                 }
                 const elems_rc = self.builtinListElemRc(result_elems);
                 var crash_boundary = self.enterCrashBoundary();
@@ -5903,19 +5950,17 @@ pub const Interpreter = struct {
                 const elems_rc = self.builtinListElemRc(list_elems);
                 const source_list = self.listValue(list_elems, args[0]);
                 if (info.width == 0) {
-                    break :blk self.listResult(ll, canonicalZstList(0));
+                    break :blk self.listResult(ll, source_list.zeroSizedKeeping(0));
                 }
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();
                 if (crash_boundary.set() != 0) return self.crashError();
                 var elem_rc_ctx = self.listElementRcContext(list_elems);
-                const result = builtins.list.listSublist(
+                const result = builtins.list.listClear(
                     source_list,
                     info.alignment,
                     info.width,
                     elems_rc,
-                    0,
-                    0,
                     if (elems_rc) @ptrCast(&elem_rc_ctx) else null,
                     if (elems_rc) &listElementDecref else &builtins.utils.rcNone,
                     updateModeForArg0(ll.unique_args),
@@ -7528,7 +7573,7 @@ pub const Interpreter = struct {
         const rl = self.listValue(list_elems, list_arg);
         const info = self.listElemInfo(list_elems);
         const elems_rc = self.builtinListElemRc(list_elems);
-        if (info.width == 0) return self.listResult(ll, canonicalZstList(rl.len()));
+        if (info.width == 0) return self.listResult(ll, rl.zeroSizedKeeping(rl.len()));
         var crash_boundary = self.enterCrashBoundary();
         defer crash_boundary.deinit();
         if (crash_boundary.set() != 0) return self.crashError();
@@ -8223,7 +8268,7 @@ pub const Interpreter = struct {
         reuse: ?[*]u8,
     ) Error!void {
         const params = self.store.getLocalSpan(proc_spec.args);
-        const capture_param = proc_spec.erased_capture_arg orelse return self.invariantFailedError(
+        const capture_param = proc_spec.erased_capture_arg.get() orelse return self.invariantFailedError(
             "LIR/interpreter invariant violated: erased_record proc {d} has no capture parameter",
             .{@backingInt(proc_id)},
         );
@@ -8240,7 +8285,7 @@ pub const Interpreter = struct {
                 proc_args[i] = cell;
                 continue;
             }
-            if (proc_spec.erased_reuse_arg != null and param_id == proc_spec.erased_reuse_arg.?) {
+            if (proc_spec.erased_reuse_arg != .none and param_id == proc_spec.erased_reuse_arg.get().?) {
                 const cell = try self.alloc(param.layout_idx);
                 cell.write(usize, @intFromPtr(reuse));
                 proc_args[i] = cell;
@@ -8267,7 +8312,7 @@ pub const Interpreter = struct {
                 .{ @backingInt(proc_id), explicit_count },
             );
         }
-        if (proc_spec.dyn_result != null) {
+        if (proc_spec.dyn_result != .none) {
             self.pending_dyn_result = ret orelse boxy.walk.zeroSizedPtr();
             _ = try self.evalProcById(proc_id, proc_args, proc_arg_layouts);
             return;
@@ -8482,16 +8527,7 @@ pub const Interpreter = struct {
             },
             .box_payload_addr => |b| {
                 const payload = try self.descAt(frame, b.desc);
-                // A box of a function is the callable itself.
-                if (payload.kind == .erased_callable) {
-                    try self.setComponentTarget(frame, stmt_id, target, try self.localBytes(frame, b.box));
-                    return;
-                }
-                // The box word lives in the box local's bytes, which a dynamic local
-                // holds by address.
-                const word = @as(*const usize, @ptrCast(@alignCast(try self.localBytes(frame, b.box)))).* & ~builtins.utils.DATA_PTR_TAG_MASK;
-                // A box of a zero-sized payload holds no allocation.
-                const address: [*]u8 = if (payload.size == 0 or word == 0) boxy.walk.zeroSizedPtr() else @ptrFromInt(word);
+                const address = boxy.compiled.boxPayloadAddr(payload, @ptrCast(@alignCast(try self.localBytes(frame, b.box))));
                 try self.setComponentTarget(frame, stmt_id, target, address);
             },
             .tag_discriminant => |t| {
@@ -8587,17 +8623,8 @@ pub const Interpreter = struct {
             },
             .box => |b| {
                 const payload = try self.descAt(frame, b.desc);
-                // A box of a function is the callable itself, which the box
-                // takes over.
-                const word: usize = if (payload.kind == .erased_callable)
-                    @as(*align(1) const usize, @ptrCast(try self.localBytes(frame, b.payload))).*
-                else if (payload.size == 0) 0 else blk: {
-                    const data = try self.allocRocDataWithRc(payload.size, payload.alignment, payload.containsRefcounted());
-                    @memcpy(data[0..payload.size], (try self.localBytes(frame, b.payload))[0..payload.size]);
-                    break :blk @intFromPtr(data);
-                };
                 const dst = try self.targetStorage(frame, target);
-                @as(*align(1) usize, @ptrCast(dst)).* = word;
+                boxy.compiled.buildBox(payload, @ptrCast(@alignCast(dst)), try self.localBytes(frame, b.payload), &self.roc_ops);
                 try self.finishResultStorage(frame, stmt_id, target, dst);
             },
             .eq => |e| {
@@ -8687,11 +8714,11 @@ pub const Interpreter = struct {
                     if (self.hasPendingCall()) {
                         return self.invariantFailedError("LIR/interpreter invariant violated: deferred an erased call while another was pending", .{});
                     }
-                    const owned_args: ?[]align(16) u8 = if (c.args) |args_local| owned: {
+                    const owned_args: ?[]const u8 = if (c.args) |args_local| owned: {
                         const size = try self.targetSize(frame, args_local);
-                        const copy = try self.allocator.alignedAlloc(u8, .@"16", @max(size, 1));
-                        @memcpy(copy[0..size], args.?[0..size]);
-                        break :owned copy;
+                        try self.pending_storage.resize(self.allocator, size);
+                        @memcpy(self.pending_storage.items, args.?[0..size]);
+                        break :owned self.pending_storage.items;
                     } else null;
                     self.pending_dyn = .{ .closure = closure, .args = owned_args, .transfer = c.reuse_closure };
                     // The target holds no value until whoever makes the
@@ -8736,7 +8763,7 @@ test "interpreter float NaN mode preserves runtime payloads and normalizes compi
         .name = store.freshSyntheticSymbol(),
         .identity = LIR.ProcIdentity.forTest(2),
         .args = LIR.LocalSpan.empty(),
-        .body = f32_body,
+        .body = .some(f32_body),
         .ret_layout = .f32,
         .frame_locals = try store.addLocalSpan(&.{f32_local}),
     }, .none);
@@ -8752,7 +8779,7 @@ test "interpreter float NaN mode preserves runtime payloads and normalizes compi
         .name = store.freshSyntheticSymbol(),
         .identity = LIR.ProcIdentity.forTest(1),
         .args = LIR.LocalSpan.empty(),
-        .body = f64_body,
+        .body = .some(f64_body),
         .ret_layout = .f64,
         .frame_locals = try store.addLocalSpan(&.{f64_local}),
     }, .none);
@@ -8797,7 +8824,7 @@ test "interpreter evaluates explicit static data by compact id" {
         .name = store.freshSyntheticSymbol(),
         .identity = LIR.ProcIdentity.forTest(1),
         .args = LIR.LocalSpan.empty(),
-        .body = body,
+        .body = .some(body),
         .ret_layout = .u64,
         .frame_locals = frame_locals,
     }, .none);
@@ -8841,7 +8868,7 @@ test "interpreter turns a compiler host allocation failure into a Roc crash" {
         .name = store.freshSyntheticSymbol(),
         .identity = LIR.ProcIdentity.forTest(1),
         .args = LIR.LocalSpan.empty(),
-        .body = body,
+        .body = .some(body),
         .ret_layout = list_layout,
         .frame_locals = try store.addLocalSpan(&.{ capacity, list }),
     }, .none);

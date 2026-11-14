@@ -9,6 +9,7 @@
 //! on first demand for the definition that contains it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const base = @import("base");
 const can = @import("can");
 const types = @import("types");
@@ -409,6 +410,9 @@ pub const Binder = struct {
     reassignable: bool,
     /// A generalized callable lookup binding.
     is_scheme_alias: bool,
+    /// The binder of a promoted local procedure, which names a top-level
+    /// procedure rather than a value of the body declaring it.
+    is_promoted: bool,
     /// Bound by a recursive value declaration.
     recursive_value: bool,
 };
@@ -468,8 +472,20 @@ pub const CheckedBodies = struct {
     analyses: *body_analyses.BodyAnalyses,
     tables: Tables = .{},
 
+    /// The module index (`body_analyses.ModuleIndex`), which the reader's
+    /// consumer demanded (`demandIndex`) before reading the bodies.
     pub fn index(self: CheckedBodies) *const body_analyses.ModuleIndex {
-        return &self.analyses.index;
+        return self.analyses.index();
+    }
+
+    /// Build the module index if no consumer has yet.
+    pub fn demandIndex(self: CheckedBodies) Allocator.Error!void {
+        _ = try self.analyses.demandIndex();
+    }
+
+    /// The number of `defaultExprs`, counted without the module index.
+    pub fn defaultExprCount(self: CheckedBodies, allocator: Allocator) Allocator.Error!usize {
+        return body_analyses.defaultExprCount(allocator, self.env);
     }
 
     /// The number of nodes of the module, which bounds every node id.
@@ -790,9 +806,17 @@ pub const CheckedBodies = struct {
 
     /// Whether an interpolation's target is concretely the builtin `Str`, so
     /// it concatenates its parts directly. An open target can instantiate at
-    /// a custom `from_interpolation` type and keeps its dispatch.
+    /// a custom `from_interpolation` type and keeps its dispatch. Checking
+    /// retires every interpolation whose builtin `Str` dispatch it rejects, so
+    /// one that reaches a checked body was accepted.
     pub fn interpolationIsBuiltinStr(self: CheckedBodies, id: ExprId) bool {
-        return checked_artifact.checkedConcreteBuiltinForLiteralTarget(self.types, self.typeOfVar(ModuleEnv.varFrom(id))) == .str;
+        const is_str = checked_artifact.checkedConcreteBuiltinForLiteralTarget(self.types, self.typeOfVar(ModuleEnv.varFrom(id))) == .str;
+        if (builtin.mode == .debug and is_str) {
+            const constraint_fn_var = self.store().getExpr(id).e_interpolation.constraint_fn_var orelse
+                invariant("a checked interpolation had no constraint function variable");
+            if (self.env.types.varStaticDispatchRejected(constraint_fn_var)) invariant("a rejected builtin Str interpolation reached a checked body");
+        }
+        return is_str;
     }
 
     /// The tag a structural equality compares by discriminant alone: a
@@ -959,7 +983,7 @@ pub const CheckedBodies = struct {
     /// The checker-selected defaults of fields omitted at record
     /// construction sites, by site, in checking order.
     pub fn recordOmittedDefaults(self: CheckedBodies) []const ModuleEnv.RecordOmittedDefault {
-        return self.env.record_omitted_defaults.items.items;
+        return self.env.record_omitted_defaults.items();
     }
 
     /// One omitted default in the checked module's names.
@@ -1131,6 +1155,7 @@ pub const CheckedBodies = struct {
             .pattern = pattern_id,
             .reassignable = self.store().getPattern(pattern_id) == .var_assign,
             .is_scheme_alias = module_index.isSchemeAlias(pattern_id),
+            .is_promoted = module_index.isPromotedPattern(pattern_id),
             .recursive_value = module_index.isRecursiveBinder(pattern_id),
         };
     }

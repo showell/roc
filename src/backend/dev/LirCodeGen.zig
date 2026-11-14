@@ -1882,6 +1882,33 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const args = self.store.getLocalSpan(ll.args);
 
             switch (ll.op) {
+                .boxed_sequence_pack => {
+                    const record = GuardedList.at(args, 0);
+                    const size = self.getLayoutSize(self.localLayout(record));
+                    const slot = try self.ensureOnStack(try self.emitValueLocal(record), size);
+                    const offset = try self.ensureInGeneralReg(try self.emitValueLocal(GuardedList.at(args, 1)));
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    defer builder.deinit();
+                    try builder.addLeaArg(frame_ptr, slot);
+                    try builder.addImmArg(size);
+                    try builder.addRegArg(offset);
+                    try self.callBuiltin(&builder, .boxed_sequence_pack);
+                    self.codegen.freeGeneral(offset);
+                    return self.scalarRetReg();
+                },
+                .boxed_sequence_unpack => {
+                    const step = try self.ensureInGeneralReg(try self.emitValueLocal(GuardedList.at(args, 0)));
+                    const size = self.getLayoutSize(ll.ret_layout);
+                    const slot = self.codegen.allocStackSlot(size);
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    defer builder.deinit();
+                    try builder.addLeaArg(frame_ptr, slot);
+                    try builder.addRegArg(step);
+                    try builder.addImmArg(size);
+                    try self.callBuiltin(&builder, .boxed_sequence_unpack);
+                    self.codegen.freeGeneral(step);
+                    return self.stackLocationForLayout(ll.ret_layout, slot);
+                },
                 .num_plus, .num_minus, .num_times => unreachable, // source-policy markers that LIR lowering commits through CheckedArithmetic.lowerOp
                 .list_prefetched => unreachable, // LIR lowering splits this into an alias and `list_prefetch`
                 // A hint only; this backend emits no code for it.
@@ -1972,9 +1999,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const list_abi = builtinInternalListAbi(ls, "dev.list_with_capacity.builtin_list_abi", ll.ret_layout);
 
                     // Zero-width elements need no storage, so a reservation
-                    // allocates nothing and the result stays the empty list.
+                    // allocates nothing and the capacity alone records it.
                     if (list_abi.elem_size_align.size == 0) {
-                        return self.emitZstList(null);
+                        const count_off = try self.ensureOnStack(capacity_loc, 8);
+                        const count_reg = try self.allocTempGeneral();
+                        defer self.codegen.freeGeneral(count_reg);
+                        try self.emitLoad(.w64, count_reg, frame_ptr, count_off);
+                        try self.emitBoundZstCapacity(count_reg);
+                        return self.emitZstListWithCapacity(null, .{ .at_least = count_reg });
                     }
 
                     // Allocate stack space for result (RocList)
@@ -2089,11 +2121,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         => unexpectedLocation("list_append_unsafe list", list_loc),
                     };
 
-                    // Ensure element is on stack
-                    const elem_offset: i32 = if (is_zst)
-                        self.codegen.allocStackSlot(1)
-                    else
-                        try self.ensureOnStack(elem_loc, elem_size_align.size);
+                    // A zero-width element has no bytes to write, so appending
+                    // one only bumps the length.
+                    if (is_zst) return self.emitZstListOneLonger(list_offset);
+
+                    const elem_offset: i32 = try self.ensureOnStack(elem_loc, elem_size_align.size);
 
                     // Allocate result slot (RocList)
                     const result_offset = self.codegen.allocStackSlot(roc_list_size);
@@ -2104,7 +2136,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try builder.addLeaArg(frame_ptr, result_offset);
                     try builder.addListBytesLenCapMemArgs(frame_ptr, list_offset);
                     try builder.addLeaArg(frame_ptr, elem_offset);
-                    try builder.addImmArg(if (is_zst) 0 else @as(i64, @intCast(elem_size_align.size)));
+                    try builder.addImmArg(@as(i64, @intCast(elem_size_align.size)));
                     try self.callBuiltin(&builder, LowLevelBuiltins.listOp(.list_append_unsafe));
 
                     // Return as .list_stack so recursive calls properly detect this as a list argument
@@ -2452,20 +2484,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const list_b_off = try self.ensureOnStack(list_b_loc, roc_list_size);
 
                     // Zero-sized elements have no bytes to concatenate, so the
-                    // result carries only the summed length and owns no
-                    // allocation: null data pointer and a stored capacity of zero.
+                    // result is the first list grown in place by the length
+                    // of the second.
                     if (list_abi.elem_size_align.size == 0) {
-                        const zst_result_offset = self.codegen.allocStackSlot(roc_list_size);
-                        const zst_len_reg, const zst_rhs_len_reg, const zst_zero_reg = try self.allocTempGenerals(3);
-                        try self.emitLoad(.w64, zst_len_reg, frame_ptr, list_a_off + list_len_offset);
-                        try self.emitLoad(.w64, zst_rhs_len_reg, frame_ptr, list_b_off + list_len_offset);
-                        try self.codegen.emitAdd(.w64, zst_len_reg, zst_len_reg, zst_rhs_len_reg);
-                        try self.codegen.emitLoadImm(zst_zero_reg, 0);
-                        try self.emitStore(.w64, frame_ptr, zst_result_offset + list_bytes_offset, zst_zero_reg);
-                        try self.emitStore(.w64, frame_ptr, zst_result_offset + list_len_offset, zst_len_reg);
-                        try self.emitStore(.w64, frame_ptr, zst_result_offset + list_capacity_offset, zst_zero_reg);
-                        self.freeGenerals(.{ zst_zero_reg, zst_rhs_len_reg, zst_len_reg });
-                        return .{ .list_stack = .{ .struct_offset = zst_result_offset, .data_offset = 0, .num_elements = 0 } };
+                        return self.emitZstListGrownBy(list_a_off, list_b_off + list_len_offset);
                     }
 
                     const result_offset = self.codegen.allocStackSlot(roc_list_size);
@@ -2489,6 +2511,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const list_off = try self.ensureOnStack(list_loc, roc_list_size);
                     const start_off = try self.ensureOnStack(start_loc, 8);
                     const count_off = try self.ensureOnStack(count_loc, 8);
+                    // Zero-width elements have no bytes to copy, so the list
+                    // only grows by the count.
+                    if (list_abi.elem_size_align.size == 0) {
+                        return self.emitZstListGrownBy(list_off, count_off);
+                    }
                     const result_offset = self.codegen.allocStackSlot(roc_list_size);
                     try self.callListBuiltin(list_abi, try self.listElemCallbacks(list_abi, .incref_and_decref), &.{
                         .{ .lea = result_offset }, .{ .list = list_off }, .{ .mem = start_off },                            .{ .mem = count_off },
@@ -2528,6 +2555,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const list_off = try self.ensureOnStack(list_loc, roc_list_size);
                     const start_off = try self.ensureOnStack(start_loc, 8);
                     const count_off = try self.ensureOnStack(count_loc, 8);
+                    // Zero-width elements have no bytes to copy, so the list
+                    // only grows by the count.
+                    if (list_abi.elem_size_align.size == 0) {
+                        return self.emitZstListGrownBy(list_off, count_off);
+                    }
                     const result_offset = self.codegen.allocStackSlot(roc_list_size);
                     try self.callListBuiltin(list_abi, try self.listElemCallbacks(list_abi, .incref), &.{
                         .{ .lea = result_offset },                           .{ .list = list_off }, .{ .mem = start_off }, .{ .mem = count_off },
@@ -2607,6 +2639,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const src_off = try self.ensureOnStack(src_loc, roc_list_size);
                     const start_off = try self.ensureOnStack(start_loc, 8);
                     const len_off = try self.ensureOnStack(len_loc, 8);
+                    // Zero-width elements have no bytes to copy, so the list
+                    // only grows by the count.
+                    if (list_abi.elem_size_align.size == 0) {
+                        return self.emitZstListGrownBy(list_off, len_off);
+                    }
                     const result_offset = self.codegen.allocStackSlot(roc_list_size);
                     const rc = try self.listElemCallbacks(list_abi, .incref_and_decref);
                     try self.callListBuiltin(list_abi, rc, &.{
@@ -3322,18 +3359,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const eq_reg = try self.ensureInGeneralReg(eq_loc);
                     return .{ .general_reg = eq_reg };
                 },
-                .str_concat => {
+                .str_concat, .str_append => {
                     expectArgCount(ll.op, args, 2);
                     const a_loc, const b_loc = try self.emitValueLocals(2, args);
                     if (builtin.mode == .debug and (a_loc != .stack_str or b_loc != .stack_str)) {
                         base.invariant(
-                            "LIR/codegen invariant violated: str_concat expects stack_str args, got lhs={s} rhs={s}",
-                            .{ @tagName(a_loc), @tagName(b_loc) },
+                            "LIR/codegen invariant violated: {s} expects stack_str args, got lhs={s} rhs={s}",
+                            .{ @tagName(ll.op), @tagName(a_loc), @tagName(b_loc) },
                         );
                     }
                     const a_off = try self.ensureOnStack(a_loc, roc_str_size);
                     const b_off = try self.ensureOnStack(b_loc, roc_str_size);
-                    return try self.callStr2RocOpsToStr(a_off, b_off, LowLevelBuiltins.strOp(.str_concat), updateModeImmForArg0(ll.unique_args));
+                    return try self.callStr2RocOpsToStr(a_off, b_off, LowLevelBuiltins.strOp(ll.op), updateModeImmForArg0(ll.unique_args));
                 },
                 .str_contains => {
                     expectArgCount(ll.op, args, 2);
@@ -3798,7 +3835,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     // Zero-width elements are indistinguishable, so swapping two
                     // of them leaves the list exactly as it was.
                     if (list_abi.elem_size_align.size == 0) {
-                        return self.emitZstListWithSameLen(list_off);
+                        return self.emitZstListUnchanged(list_off);
                     }
 
                     const index_1_off = try self.ensureOnStack(index_1_loc, 8);
@@ -7993,15 +8030,19 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return try self.callListSublistWindow(ll, list_abi, list_off, .{ .mem = record_off + start_field_off }, .{ .mem = record_off + len_field_off });
         }
 
-        /// Call the sublist builtin with the zero-length window from index
-        /// zero: `List.clear`.
+        /// Call the clear builtin: `List.clear`.
         fn callListClear(self: *Self, ll: anytype, list_loc: ValueLocation) Allocator.Error!ValueLocation {
             const ls = self.layout_store;
             const list_abi = builtinInternalListAbi(ls, "dev.callListClear.builtin_list_abi", ll.ret_layout);
             const list_off = try self.ensureOnStack(list_loc, roc_list_size);
-            if (list_abi.elem_size_align.size == 0) return self.emitZstList(null);
+            if (list_abi.elem_size_align.size == 0) return self.emitZstListKeeping(list_off, null);
 
-            return try self.callListSublistWindow(ll, list_abi, list_off, .{ .imm = 0 }, .{ .imm = 0 });
+            const result_offset = self.codegen.allocStackSlot(roc_list_size);
+            const rc = try self.listElemCallbacks(list_abi, .decref);
+            try self.callListBuiltin(list_abi, rc, &.{
+                .{ .lea = result_offset }, .{ .list = list_off }, .elem_abi, .elem_rc, .{ .imm = updateModeImmForArg0(ll.unique_args) },
+            }, LowLevelBuiltins.listOp(.list_clear));
+            return listStackAt(result_offset);
         }
 
         fn callListDropAt(self: *Self, ll: anytype, list_loc: ValueLocation, index_loc: ValueLocation) Allocator.Error!ValueLocation {
@@ -8094,13 +8135,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
             const list_off = try self.ensureOnStack(list_loc, roc_list_size);
 
-            // Zero-width elements need no storage, so there is nothing to
-            // reserve and the list passes through unchanged.
+            const spare_off = try self.ensureOnStack(spare_loc, 8);
+
+            // Zero-width elements need no storage, so a reservation allocates
+            // nothing and the capacity alone records it.
             if (list_abi.elem_size_align.size == 0) {
-                return self.emitZstListWithSameLen(list_off);
+                return self.emitZstListReserving(list_off, spare_off);
             }
 
-            const spare_off = try self.ensureOnStack(spare_loc, 8);
             const result_offset = self.codegen.allocStackSlot(roc_list_size);
             const rc = try self.listElemCallbacks(list_abi, .incref_and_decref);
             try self.callListBuiltin(list_abi, rc, &.{
@@ -13672,9 +13714,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const list_struct_offset: i32 = self.codegen.allocStackSlot(roc_list_size);
             const ptr_reg, const len_reg, const cap_reg = try self.allocTempGenerals(3);
 
-            // A list of zero-sized elements holds no allocation, so its stored
-            // capacity is zero however many elements it carries.
-            const encoded_capacity: u64 = if (elem_size == 0) 0 else @as(u64, num_elems) << RocList.capacity_shift;
+            const encoded_capacity: u64 = @as(u64, num_elems) << RocList.capacity_shift;
 
             try self.emitLoad(.w64, ptr_reg, frame_ptr, heap_ptr_slot);
             try self.codegen.emitLoadImm(len_reg, @intCast(num_elems));
@@ -13990,7 +14030,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 );
             }
 
-            if (proc_spec.hosted) |hosted| {
+            if (proc_spec.hosted.get()) |hosted| {
                 return try self.generateCAbiCall(.{ .hosted = hosted }, arg_locs, arg_layouts, call.ret_layout);
             }
             if (proc_spec.linked) {
@@ -14005,7 +14045,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// has a dynamic parameter or result, or the target is dynamic.
         fn callIsDynamic(self: *Self, proc_id: lir.LIR.LirProcSpecId, target_local: LocalId) bool {
             const callee = self.store.getProcSpec(proc_id);
-            if (callee.dyn_result != null or callee.takesPendingCell() or self.localDyn(target_local) != null) return true;
+            if (callee.dyn_result != .none or callee.takesPendingCell() or self.localDyn(target_local) != null) return true;
             const params = self.store.getLocalSpan(callee.args);
             for (0..params.len) |i| {
                 if (self.localDyn(GuardedList.at(params, i)) != null) return true;
@@ -14021,7 +14061,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         fn generateDynCall(self: *Self, proc_id: lir.LIR.LirProcSpecId, args: LocalSpan, target_local: LocalId, drive: lir.LIR.PendingDrive) Allocator.Error!void {
             try self.spillAllVectorLocals();
             const callee = self.store.getProcSpec(proc_id);
-            if (callee.hosted != null) base.invariant("LIR/codegen invariant violated: a call with dynamic operands targets a C-ABI procedure", .{});
+            if (callee.hosted.get() != null) base.invariant("LIR/codegen invariant violated: a call with dynamic operands targets a C-ABI procedure", .{});
             const arg_refs = self.store.getLocalSpan(args);
             const param_refs = self.store.getLocalSpan(callee.args);
             if (arg_refs.len != param_refs.len) base.invariant(
@@ -14030,7 +14070,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             );
             const carries = procCarriesTailArgs(self.store, callee);
             const takes_pending = callee.takesPendingCell();
-            const count = arg_refs.len + @intFromBool(callee.dyn_result != null) + @intFromBool(carries) + @intFromBool(takes_pending);
+            const count = arg_refs.len + @intFromBool(callee.dyn_result != .none) + @intFromBool(carries) + @intFromBool(takes_pending);
             const arg_locs = try self.allocator.alloc(ValueLocation, count);
             defer self.allocator.free(arg_locs);
             const arg_layouts = try self.allocator.alloc(layout.Idx, count);
@@ -14063,7 +14103,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
 
             var result_target: ?DynTarget = null;
-            if (callee.dyn_result) |callee_result| {
+            if (callee.dyn_result.get()) |callee_result| {
                 const dst = try self.dynTarget(target_local);
                 result_target = dst;
                 const slot = self.codegen.allocStackSlot(8);
@@ -14123,7 +14163,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const param_refs = self.store.getLocalSpan(proc_spec.args);
             if (proc_spec.linked) base.invariant("LIR/codegen invariant violated: a frame-replacing call targets a procedure another object defines", .{});
             if (param_refs.len != arg_refs.len or
-                proc_spec.hosted != null or
+                proc_spec.hosted.get() != null or
                 proc_spec.abi != .roc or
                 proc_spec.ret_layout != call.ret_layout or
                 self.early_return_ret_layout != call.ret_layout)
@@ -14164,7 +14204,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     .num_regs = self.calcArgRegCount(arg_loc, expected_layout),
                 });
             }
-            if (proc_spec.dyn_result) |callee_result| {
+            if (proc_spec.dyn_result.get()) |callee_result| {
                 // The callee writes its result where this procedure's caller
                 // asked for this procedure's.
                 const own_result = self.current_dyn_result orelse base.invariant("LIR/codegen invariant violated: frame-replacing call with a dynamic result from a procedure without one", .{});
@@ -14531,11 +14571,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// runtime makes the calls left in it.
         fn emitOwnPendingCell(self: *Self, invocation: ?i32) Allocator.Error!void {
             const word = @sizeOf(u64);
-            const cell = self.codegen.allocStackSlot(builtins.native_callable.pending_words * word);
+            const cell = self.codegen.allocStackSlot(builtins.native_callable.pendingByteSize(word));
             const slot = self.codegen.allocStackSlot(word);
             const reg = try self.allocTempGeneral();
             try self.codegen.emitLoadImm(reg, 0);
-            try self.emitStore(.w64, frame_ptr, cell, reg);
+            for (0..builtins.native_callable.zeroed_words) |i| {
+                try self.emitStore(.w64, frame_ptr, cell + @as(i32, @intCast(i * word)), reg);
+            }
             try self.emitLeaStack(reg, cell);
             try self.emitStore(.w64, frame_ptr, slot, reg);
             self.codegen.freeGeneral(reg);
@@ -14608,6 +14650,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             target_layout: layout.Idx,
             capture_layout: ?layout.Idx,
             on_drop: lir.LIR.ErasedCallableOnDrop,
+            on_copy: lir.LIR.ErasedCallableOnDrop,
             reuse: ?LocalId,
             reuse_unique: bool,
         ) Allocator.Error!ValueLocation {
@@ -14669,6 +14712,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         original_on_drop_reg,
                     );
                     self.codegen.freeGeneral(original_on_drop_reg);
+                    const original_on_copy_reg = try self.materializeErasedCallableOnDrop(on_copy);
+                    try self.emitStore(.w64, frame_ptr, capture_src_slot + @as(i32, @intCast(@offsetOf(builtins.erased_callable.HotReloadCaptureHeader, "original_on_copy"))), original_on_copy_reg);
+                    self.codegen.freeGeneral(original_on_copy_reg);
                 }
 
                 if (capture) |capture_local| {
@@ -14744,7 +14790,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try builder.addImmArg(@backingInt(update_mode));
                     try self.callBuiltin(&builder, .erased_callable_repack);
                 }
-                return try self.scalarRetReg();
+                const result = try self.scalarRetReg();
+                try self.writeErasedCaptureMetadata(try self.ensureInGeneralReg(result), base_capture_size, on_copy);
+                return result;
             }
 
             const payload_size = builtins.erased_callable.payloadSize(base_capture_size);
@@ -14808,12 +14856,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     original_on_drop_reg,
                 );
                 self.codegen.freeGeneral(original_on_drop_reg);
+                const original_on_copy_reg = try self.materializeErasedCallableOnDrop(on_copy);
+                try self.emitStore(.w64, heap_ptr, @intCast(builtins.erased_callable.capture_offset + @offsetOf(builtins.erased_callable.HotReloadCaptureHeader, "original_on_copy")), original_on_copy_reg);
+                self.codegen.freeGeneral(original_on_copy_reg);
             } else {
                 const on_drop_reg = try self.materializeErasedCallableOnDrop(on_drop);
                 try self.emitStore(.w64, heap_ptr, @intCast(@sizeOf(usize)), on_drop_reg);
                 self.codegen.freeGeneral(on_drop_reg);
             }
 
+            try self.writeErasedCaptureMetadata(heap_ptr, base_capture_size, on_copy);
             if (capture) |capture_local| {
                 const layout_idx = capture_layout orelse unreachable; // the presence check at the top of generatePackedErasedFn pairs capture with capture_layout
                 const capture_loc = self.requireExactValueLocationToLayout(
@@ -14842,6 +14894,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const result_reg = try self.allocTempGeneral();
             try self.emitLoad(.w64, result_reg, frame_ptr, heap_ptr_slot);
             return .{ .general_reg = result_reg };
+        }
+
+        fn writeErasedCaptureMetadata(self: *Self, ptr: GeneralReg, size: u32, on_copy: lir.LIR.ErasedCallableOnDrop) Allocator.Error!void {
+            const reg = if (self.hotReloadEnabled()) blk: {
+                const result = try self.allocTempGeneral();
+                try self.emitBuiltinAddress(result, .hot_reload_erased_callable_copy);
+                break :blk result;
+            } else try self.materializeErasedCallableOnDrop(on_copy);
+            try self.emitStore(.w64, ptr, @intCast(@offsetOf(builtins.erased_callable.Payload, "on_copy")), reg);
+            try self.codegen.emitLoadImm(reg, size);
+            try self.emitStore(.w64, ptr, @intCast(@offsetOf(builtins.erased_callable.Payload, "capture_size")), reg);
+            self.codegen.freeGeneral(reg);
         }
 
         fn materializeErasedCallableOnDrop(
@@ -15686,31 +15750,121 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return true;
         }
 
-        /// Allocate a short-lived general register used only during instruction selection.
-        /// Semantic values are materialized to `local_locations`; exhausting this pool
-        /// therefore indicates an internal lifetime bug rather than source-level pressure.
-        /// Emit the canonical value for a list of zero-width elements: such a
-        /// list owns no allocation, so its data pointer is null and its stored
-        /// capacity is zero, and it carries nothing but a length. `len_reg` is
-        /// null for a length of zero.
-        fn emitZstList(self: *Self, len_reg: ?GeneralReg) Allocator.Error!ValueLocation {
+        /// The capacity a list of zero-width items is built with.
+        const ZstCapacity = union(enum) {
+            /// No more than its length.
+            exact,
+            /// The count in this register, or its length when that is larger.
+            /// The count never exceeds `RocList.max_zero_sized_capacity`.
+            at_least: GeneralReg,
+        };
+
+        /// Emit a list of zero-width items: a null data pointer, the length in
+        /// `len_reg` (zero when null) and `capacity`. Such a list holds no
+        /// allocation, so its capacity is a count alone.
+        fn emitZstListWithCapacity(self: *Self, len_reg: ?GeneralReg, capacity: ZstCapacity) Allocator.Error!ValueLocation {
             const slot = self.codegen.allocStackSlot(roc_list_size);
-            const zero_reg = try self.allocTempGeneral();
+            const zero_reg, const cap_reg = try self.allocTempGenerals(2);
             try self.codegen.emitLoadImm(zero_reg, 0);
             try self.emitStore(.w64, frame_ptr, slot + list_bytes_offset, zero_reg);
             try self.emitStore(.w64, frame_ptr, slot + list_len_offset, len_reg orelse zero_reg);
-            try self.emitStore(.w64, frame_ptr, slot + list_capacity_offset, zero_reg);
-            self.codegen.freeGeneral(zero_reg);
+            switch (capacity) {
+                .exact => try self.emitShiftImm(.shl, .w64, cap_reg, len_reg orelse zero_reg, RocList.capacity_shift),
+                .at_least => |count_reg| {
+                    if (len_reg) |len| {
+                        // max(count, len) is len + (count -| len).
+                        try self.emitSaturatingSub(cap_reg, count_reg, len);
+                        try self.codegen.emitAdd(.w64, cap_reg, cap_reg, len);
+                        try self.emitShiftImm(.shl, .w64, cap_reg, cap_reg, RocList.capacity_shift);
+                    } else {
+                        try self.emitShiftImm(.shl, .w64, cap_reg, count_reg, RocList.capacity_shift);
+                    }
+                },
+            }
+            try self.emitStore(.w64, frame_ptr, slot + list_capacity_offset, cap_reg);
+            self.freeGenerals(.{ cap_reg, zero_reg });
             return .{ .list_stack = .{ .struct_offset = slot, .data_offset = 0, .num_elements = 0 } };
         }
 
-        /// Emit the canonical zero-width list one element longer than the list
-        /// value at `list_off`.
+        /// Emit a list of zero-width items with the length in `len_reg` (zero
+        /// when null) and no spare capacity.
+        fn emitZstList(self: *Self, len_reg: ?GeneralReg) Allocator.Error!ValueLocation {
+            return self.emitZstListWithCapacity(len_reg, .exact);
+        }
+
+        /// Emit the list of zero-width items an operation makes in place of
+        /// the list value at `list_off`: the length in `len_reg` (zero when
+        /// null) and the capacity that list has.
+        fn emitZstListKeeping(self: *Self, list_off: i32, len_reg: ?GeneralReg) Allocator.Error!ValueLocation {
+            const count_reg = try self.allocTempGeneral();
+            defer self.codegen.freeGeneral(count_reg);
+            try self.emitLoad(.w64, count_reg, frame_ptr, list_off + list_capacity_offset);
+            try self.emitShiftImm(.shr, .w64, count_reg, count_reg, RocList.capacity_shift);
+            return self.emitZstListWithCapacity(len_reg, .{ .at_least = count_reg });
+        }
+
+        /// Bound the capacity count in `count_reg` by
+        /// `RocList.max_zero_sized_capacity`, the most a capacity word encodes.
+        fn emitBoundZstCapacity(self: *Self, count_reg: GeneralReg) Allocator.Error!void {
+            const max_reg, const over_reg = try self.allocTempGenerals(2);
+            try self.codegen.emitLoadImm(max_reg, @intCast(RocList.max_zero_sized_capacity));
+            // min(count, max) is max -| (max -| count).
+            try self.emitSaturatingSub(over_reg, max_reg, count_reg);
+            try self.emitSaturatingSub(count_reg, max_reg, over_reg);
+            self.freeGenerals(.{ over_reg, max_reg });
+        }
+
+        /// Emit the list of zero-width items at `list_off` with room for the
+        /// `spare` more items counted at `spare_at`.
+        fn emitZstListReserving(self: *Self, list_off: i32, spare_at: i32) Allocator.Error!ValueLocation {
+            const len_reg, const wanted_reg = try self.allocTempGenerals(2);
+            try self.emitLoad(.w64, len_reg, frame_ptr, list_off + list_len_offset);
+            try self.emitLoad(.w64, wanted_reg, frame_ptr, spare_at);
+            {
+                // len +| spare: spare is first cut down to the room left above len.
+                const room_reg, const over_reg = try self.allocTempGenerals(2);
+                try self.codegen.emitLoadImm(over_reg, -1);
+                try self.emitSaturatingSub(room_reg, over_reg, len_reg);
+                try self.emitSaturatingSub(over_reg, room_reg, wanted_reg);
+                try self.emitSaturatingSub(wanted_reg, room_reg, over_reg);
+                try self.codegen.emitAdd(.w64, wanted_reg, wanted_reg, len_reg);
+                self.freeGenerals(.{ over_reg, room_reg });
+            }
+            try self.emitBoundZstCapacity(wanted_reg);
+            {
+                // The capacity the list already has, when that is larger.
+                const held_reg = try self.allocTempGeneral();
+                try self.emitLoad(.w64, held_reg, frame_ptr, list_off + list_capacity_offset);
+                try self.emitShiftImm(.shr, .w64, held_reg, held_reg, RocList.capacity_shift);
+                try self.emitSaturatingSub(held_reg, held_reg, wanted_reg);
+                try self.codegen.emitAdd(.w64, wanted_reg, wanted_reg, held_reg);
+                self.codegen.freeGeneral(held_reg);
+            }
+            const result = try self.emitZstListWithCapacity(len_reg, .{ .at_least = wanted_reg });
+            self.freeGenerals(.{ wanted_reg, len_reg });
+            return result;
+        }
+
+        /// Emit the list of zero-width items at `list_off` grown in place by
+        /// the count at `count_at`.
+        fn emitZstListGrownBy(self: *Self, list_off: i32, count_at: i32) Allocator.Error!ValueLocation {
+            const len_reg, const count_reg = try self.allocTempGenerals(2);
+            try self.emitLoad(.w64, len_reg, frame_ptr, list_off + list_len_offset);
+            try self.emitLoad(.w64, count_reg, frame_ptr, count_at);
+            try self.codegen.emitAdd(.w64, len_reg, len_reg, count_reg);
+            self.codegen.freeGeneral(count_reg);
+            const result = try self.emitZstListKeeping(list_off, len_reg);
+            self.codegen.freeGeneral(len_reg);
+            return result;
+        }
+
+        /// Emit the list of zero-width items one longer than the list value
+        /// at `list_off`, grown in place.
         fn emitZstListOneLonger(self: *Self, list_off: i32) Allocator.Error!ValueLocation {
             const len_reg = try self.allocTempGeneral();
             try self.emitLoad(.w64, len_reg, frame_ptr, list_off + list_len_offset);
             try self.emitAddImm(len_reg, len_reg, 1);
-            const result = try self.emitZstList(len_reg);
+            const result = try self.emitZstListKeeping(list_off, len_reg);
             self.codegen.freeGeneral(len_reg);
             return result;
         }
@@ -15747,18 +15901,28 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.emitSaturatingSub(flag_reg, one_reg, index_reg);
             try self.emitSaturatingSub(size_reg, size_reg, flag_reg);
             self.freeGenerals(.{ flag_reg, one_reg, index_reg });
-            const result = try self.emitZstList(size_reg);
+            const result = try self.emitZstListKeeping(list_off, size_reg);
             self.codegen.freeGeneral(size_reg);
             return result;
         }
 
-        /// Emit the canonical zero-width list carrying the length held in the
-        /// list value at `list_off`, unchanged.
+        /// Emit the list of zero-width items at `list_off` with its length
+        /// and no spare capacity.
         fn emitZstListWithSameLen(self: *Self, list_off: i32) Allocator.Error!ValueLocation {
             const len_reg = try self.allocTempGeneral();
             defer self.codegen.freeGeneral(len_reg);
             try self.emitLoad(.w64, len_reg, frame_ptr, list_off + list_len_offset);
             return self.emitZstList(len_reg);
+        }
+
+        /// Emit the list of zero-width items at `list_off` unchanged: an
+        /// operation that rearranges or overwrites items in place leaves a
+        /// list of zero-width items exactly as it was.
+        fn emitZstListUnchanged(self: *Self, list_off: i32) Allocator.Error!ValueLocation {
+            const len_reg = try self.allocTempGeneral();
+            defer self.codegen.freeGeneral(len_reg);
+            try self.emitLoad(.w64, len_reg, frame_ptr, list_off + list_len_offset);
+            return self.emitZstListKeeping(list_off, len_reg);
         }
 
         /// Allocate `n` temporary general registers, in order.
@@ -15773,6 +15937,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             inline for (regs) |reg| self.codegen.freeGeneral(reg);
         }
 
+        /// Allocate a short-lived general register used only during instruction selection.
+        /// Semantic values are materialized to `local_locations`; exhausting this pool
+        /// therefore indicates an internal lifetime bug rather than source-level pressure.
         fn allocTempGeneral(self: *Self) Allocator.Error!GeneralReg {
             return self.codegen.allocGeneral() orelse base.invariant(
                 "LirCodeGen invariant violated: bounded instruction selection exhausted the general-register pool",
@@ -17376,13 +17543,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         // A dynamic local's slot holds the address of its bytes, which its
         // descriptor describes. Descriptor, name, and dictionary locals hold
         // one pointer-sized word. Copies, list item and record field
-        // addresses, discriminant reads, and unsafe list reads read the
+        // addresses, discriminant reads, unsafe list reads and writes, and
+        // the test for a descriptor without refcounted content read the
         // descriptor inline (design.md "Dynamic Values In LIR"); every other
         // operation the descriptor decides is a call to the Boxy runtime's
         // `roc_desc_*` entry points.
 
         const desc_size_offset: i32 = @offsetOf(boxy_runtime.TypeDesc, "size");
         const desc_alignment_offset: i32 = @offsetOf(boxy_runtime.TypeDesc, "alignment");
+        const desc_flags_offset: i32 = @offsetOf(boxy_runtime.TypeDesc, "flags");
+        const desc_contains_refcounted_mask: i64 = 1 << @bitOffsetOf(boxy_runtime.Flags, "contains_refcounted");
         /// The descriptor format at this backend's 64-bit targets.
         const target_desc_layout = boxy_runtime.TypeDesc.layout(.u64);
         const target_field_layout = boxy_runtime.Field.layout(.u64);
@@ -17398,6 +17568,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         comptime {
             std.debug.assert(field_entry_size == 24);
             std.debug.assert(desc_size_offset == target_desc_layout.of(.size));
+            std.debug.assert(desc_flags_offset == target_desc_layout.of(.flags));
         }
 
         fn localDyn(self: *Self, local: LocalId) ?LIR.DynLocal {
@@ -17614,12 +17785,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         /// Copy `size` bytes from the address in `src` to the address in
-        /// `dst` with one load and one store when `size` is 1, 2, 4, 8, or 16,
-        /// and nothing when it is 0, loading every byte before storing any, as
-        /// the runtime's `walk.copyBytes` does. A copy of another size jumps
-        /// to a location appended to `other`, every finished copy to one
-        /// appended to `done`. `size` is clobbered; `scratch` is a further
-        /// register.
+        /// `dst` with loads and then stores when `size` is 1, 2, 4, 8, 16, or
+        /// 24, and nothing when it is 0, loading every byte before storing
+        /// any, as the runtime's `walk.copyBytes` does. A copy of another size
+        /// jumps to a location appended to `other`, every finished copy to one
+        /// appended to `done`. `size` is clobbered, and so is `src` by a
+        /// 24-byte copy; `scratch` is a further register.
         fn emitSizedCopy(self: *Self, size: GeneralReg, src: GeneralReg, dst: GeneralReg, scratch: GeneralReg, other: *std.ArrayList(usize), done: *std.ArrayList(usize)) Allocator.Error!void {
             const value = size;
             try self.emitCmpImm(size, 8);
@@ -17650,11 +17821,21 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try done.append(self.allocator, try self.codegen.emitJump());
             try self.codegen.patchJump(to_16, self.codegen.currentOffset());
             try self.emitCmpImm(size, 16);
-            try other.append(self.allocator, try self.codegen.emitCondJump(condCode(.not_equal)));
+            const to_24 = try self.codegen.emitCondJump(condCode(.not_equal));
             try self.emitLoad(.w64, value, src, 0);
             try self.emitLoad(.w64, scratch, src, 8);
             try self.emitStore(.w64, dst, 0, value);
             try self.emitStore(.w64, dst, 8, scratch);
+            try done.append(self.allocator, try self.codegen.emitJump());
+            try self.codegen.patchJump(to_24, self.codegen.currentOffset());
+            try self.emitCmpImm(size, 24);
+            try other.append(self.allocator, try self.codegen.emitCondJump(condCode(.not_equal)));
+            try self.emitLoad(.w64, value, src, 0);
+            try self.emitLoad(.w64, scratch, src, 8);
+            try self.emitLoad(.w64, src, src, 16);
+            try self.emitStore(.w64, dst, 0, value);
+            try self.emitStore(.w64, dst, 8, scratch);
+            try self.emitStore(.w64, dst, 16, src);
             try done.append(self.allocator, try self.codegen.emitJump());
         }
 
@@ -17767,6 +17948,86 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.finishTarget(dst_local, dst);
         }
 
+        /// `list_append_unsafe` and `list_map_write_unsafe` with an element
+        /// descriptor (`compiled.listOp`): copy `element` into the list's
+        /// bytes at `index`, or at the list's length when `index` is null,
+        /// then write the list to the target, one item longer when `index` is
+        /// null. A zero-sized item copies nothing, and appending one writes
+        /// the list of zero-sized items of that length, which keeps the
+        /// capacity the list has. The sizes
+        /// `emitSizedCopy` handles copy inline; others copy through the
+        /// runtime's `roc_desc_copy`.
+        fn emitDynListWriteUnsafe(self: *Self, dst_local: LocalId, elem_desc: LocalId, list: LocalId, element: LocalId, index: ?LocalId) Allocator.Error!void {
+            try self.spillAllVectorLocals();
+            const dst = try self.dynTarget(dst_local);
+            const item_slot = self.codegen.allocStackSlot(8);
+            var other: std.ArrayList(usize) = .empty;
+            defer other.deinit(self.allocator);
+            var copied: std.ArrayList(usize) = .empty;
+            defer copied.deinit(self.allocator);
+            var zero_sized: usize = undefined;
+            {
+                const size, const from, const to, const scratch = try self.allocTempGenerals(4);
+                defer self.freeGenerals(.{ scratch, to, from, size });
+                try self.emitLoad(.w64, size, frame_ptr, self.localSlot(elem_desc));
+                try self.emitLoad(.w32, size, size, desc_size_offset);
+                try self.emitCmpImm(size, 0);
+                zero_sized = try self.codegen.emitCondJump(condCode(.equal));
+                try self.emitBytesAddress(list, to);
+                if (index) |index_local| {
+                    try self.emitBytesAddress(index_local, from);
+                    try self.emitLoad(.w64, from, from, 0);
+                } else {
+                    try self.emitLoad(.w64, from, to, list_len_offset);
+                }
+                try self.emitLoad(.w64, to, to, list_bytes_offset);
+                try self.codegen.emitMul(.w64, from, from, size);
+                try self.codegen.emitAdd(.w64, to, to, from);
+                try self.emitStore(.w64, frame_ptr, item_slot, to);
+                try self.emitBytesAddress(element, from);
+                try self.emitSizedCopy(size, from, to, scratch, &other, &copied);
+            }
+            try self.patchJumpsHere(other.items);
+            {
+                var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                defer builder.deinit();
+                try self.addWordArg(&builder, elem_desc);
+                try builder.addMemArg(frame_ptr, item_slot);
+                try self.addBytesArg(&builder, element);
+                try self.callBoxyRuntime(&builder, "roc_desc_copy");
+            }
+            try self.patchJumpsHere(copied.items);
+            const from, const to, const bytes, const len = try self.allocTempGenerals(4);
+            defer self.freeGenerals(.{ len, bytes, to, from });
+            try self.emitBytesAddress(list, from);
+            try self.emitLoad(.w64, bytes, from, list_bytes_offset);
+            try self.emitLoad(.w64, len, from, list_len_offset);
+            try self.emitLoad(.w64, from, from, list_capacity_offset);
+            const written = try self.codegen.emitJump();
+            try self.codegen.patchJump(zero_sized, self.codegen.currentOffset());
+            try self.emitBytesAddress(list, from);
+            try self.emitLoad(.w64, bytes, from, list_bytes_offset);
+            try self.emitLoad(.w64, len, from, list_len_offset);
+            try self.emitLoad(.w64, from, from, list_capacity_offset);
+            if (index == null) {
+                // `RocList.zeroSizedKeeping`: no bytes, and the capacity the
+                // list has, or its new length when that is larger.
+                try self.codegen.emitLoadImm(bytes, 0);
+                try self.emitShiftImm(.shr, .w64, from, from, RocList.capacity_shift);
+                try self.emitAddImm(to, len, 1);
+                try self.emitSaturatingSub(from, from, to);
+                try self.codegen.emitAdd(.w64, from, from, to);
+                try self.emitShiftImm(.shl, .w64, from, from, RocList.capacity_shift);
+            }
+            try self.codegen.patchJump(written, self.codegen.currentOffset());
+            if (index == null) try self.emitAddImm(len, len, 1);
+            try self.emitTargetAddress(dst, to);
+            try self.emitStore(.w64, to, list_bytes_offset, bytes);
+            try self.emitStore(.w64, to, list_len_offset, len);
+            try self.emitStore(.w64, to, list_capacity_offset, from);
+            try self.finishTarget(dst_local, dst);
+        }
+
         /// `dyn_field_addr` (`compiled.fieldAddr`): the record's address plus
         /// the field's offset, read from the descriptor's field table. A field
         /// whose slot is a recursion box is addressed by the runtime.
@@ -17860,21 +18121,44 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.finishTarget(dst_local, dst);
         }
 
+        /// Emit a jump taken when `desc` reports no refcounted content: the
+        /// case in which `roc_desc_incref` and `roc_desc_decref` return
+        /// without touching the value (`walk.incref`, `walk.decref`). This is
+        /// the one reference-counting fact a backend reads for itself
+        /// (design.md "Ownership" under "Dynamic Values In LIR").
+        fn emitJumpIfDescHoldsNoRefcounted(self: *Self, desc: LocalId) Allocator.Error!usize {
+            try self.spillAllVectorLocals();
+            const flags, const mask = try self.allocTempGenerals(2);
+            defer self.freeGenerals(.{ mask, flags });
+            try self.emitLoad(.w64, flags, frame_ptr, self.localSlot(desc));
+            try self.emitLoadW8(flags, flags, desc_flags_offset);
+            try self.codegen.emitLoadImm(mask, desc_contains_refcounted_mask);
+            try self.codegen.emitAnd(.w64, flags, flags, mask);
+            try self.emitCmpImm(flags, 0);
+            return self.codegen.emitCondJump(condCode(.equal));
+        }
+
         fn generateDynIncref(self: *Self, local: LocalId, count: u32) Allocator.Error!void {
+            const desc = self.localDyn(local).?.desc;
+            const skip = try self.emitJumpIfDescHoldsNoRefcounted(desc);
             var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
             defer builder.deinit();
-            try self.addWordArg(&builder, self.localDyn(local).?.desc);
+            try self.addWordArg(&builder, desc);
             try self.addBytesArg(&builder, local);
             try builder.addImmArg(count);
             try self.callBoxyRuntime(&builder, "roc_desc_incref");
+            try self.codegen.patchJump(skip, self.codegen.currentOffset());
         }
 
         fn generateDynDecref(self: *Self, local: LocalId) Allocator.Error!void {
+            const desc = self.localDyn(local).?.desc;
+            const skip = try self.emitJumpIfDescHoldsNoRefcounted(desc);
             var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
             defer builder.deinit();
-            try self.addWordArg(&builder, self.localDyn(local).?.desc);
+            try self.addWordArg(&builder, desc);
             try self.addBytesArg(&builder, local);
             try self.callBoxyRuntime(&builder, "roc_desc_decref");
+            try self.codegen.patchJump(skip, self.codegen.currentOffset());
         }
 
         /// The return of a procedure whose result is dynamic: the value's
@@ -18169,7 +18453,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         self.codegen.freeGeneral(reg);
                         try builder.addMemArg(frame_ptr, slot);
                         try builder.addMemArg(frame_ptr, drop_slot);
+                        const copy_slot = self.codegen.allocStackSlot(8);
+                        const copy_reg = try self.allocTempGeneral();
+                        try self.emitBuiltinAddress(copy_reg, .hot_reload_erased_callable_copy);
+                        try self.emitStore(.w64, frame_ptr, copy_slot, copy_reg);
+                        self.codegen.freeGeneral(copy_reg);
+                        try builder.addMemArg(frame_ptr, copy_slot);
                     } else {
+                        try builder.addImmArg(0);
                         try builder.addImmArg(0);
                         try builder.addImmArg(0);
                     }
@@ -18245,6 +18536,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// list operation.
         fn boxyListOp(op: lir.LowLevel) ?BoxyListOp {
             return switch (op) {
+                .boxed_sequence_pack, .boxed_sequence_unpack => null,
                 .list_capacity => .capacity,
                 .list_slack_unique => .slack_unique,
                 .list_owned_unique => .owned_unique,
@@ -18276,7 +18568,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 .list_take_first => .take_first,
                 .list_take_last => .take_last,
                 .list_reverse => .reverse,
-                .str_is_eq, .str_is_eq_static_small, .str_static_small_word_eq, .str_static_small_word_caseless_eq, .str_concat, .str_contains, .str_trim, .str_trim_start, .str_trim_end, .str_caseless_ascii_equals, .str_with_ascii_lowercased, .str_with_ascii_uppercased, .str_starts_with, .str_ends_with, .str_repeat, .str_drop_prefix, .str_drop_prefix_caseless_ascii, .str_drop_suffix, .str_split_first, .str_split_last, .str_count_utf8_bytes, .str_get_utf8_byte_unsafe, .str_substring_unsafe, .str_with_capacity, .str_reserve, .str_release_excess_capacity, .str_to_utf8, .str_from_utf8_lossy, .str_from_utf8_validated, .str_from_utf16_le_short, .str_from_utf16_be_short, .str_from_utf32_le_short, .str_from_utf32_be_short, .str_from_utf8, .str_split_on, .str_join_with, .str_from_parts, .str_inspect, .u8_to_str, .i8_to_str, .u16_to_str, .i16_to_str, .u32_to_str, .i32_to_str, .u64_to_str, .i64_to_str, .u128_to_str, .i128_to_str, .dec_to_str, .f32_to_str, .f64_to_str, .list_len, .list_prefetched, .list_prefetch, .list_append_le_bytes, .list_append_le_bytes_unsafe, .list_map_prepare_reuse, .bool_not, .bool_likely, .dict_pseudo_seed, .hasher_finish, .hasher_write_bool, .hasher_write_u8, .hasher_write_u16, .hasher_write_u32, .hasher_write_u64, .hasher_write_u128, .hasher_write_i8, .hasher_write_i16, .hasher_write_i32, .hasher_write_i64, .hasher_write_i128, .hasher_write_f32, .hasher_write_f64, .hasher_write_dec, .hasher_write_bytes, .hasher_write_str, .crypto_sha256_hash_bytes, .crypto_sha256_hasher_empty, .crypto_sha256_hasher_write, .crypto_sha256_hasher_finish, .crypto_blake3_hash_bytes, .crypto_blake3_hasher_empty, .crypto_blake3_hasher_write, .crypto_blake3_hasher_finish, .num_is_eq, .num_is_gt, .num_is_gte, .num_is_lt, .num_is_lte, .num_negate, .num_abs, .num_abs_diff, .num_plus, .num_minus, .num_times, .num_int_add_wrap, .num_int_add_crash_on_overflow, .num_int_add_overflows, .num_int_add_proven_cannot_overflow, .num_int_sub_wrap, .num_int_sub_crash_on_overflow, .num_int_sub_overflows, .num_int_sub_proven_cannot_overflow, .num_int_mul_wrap, .num_int_mul_crash_on_overflow, .num_int_mul_overflows, .num_int_mul_proven_cannot_overflow, .num_float_add, .num_float_sub, .num_float_mul, .dec_mul, .num_div_by, .num_div_by_checked, .num_div_trunc_by, .num_div_trunc_by_checked, .num_rem_by, .num_rem_by_checked, .num_mod_by, .num_mod_by_checked, .num_negate_checked, .num_abs_checked, .num_pow, .num_atan2, .num_sqrt, .num_sin, .num_cos, .num_tan, .num_asin, .num_acos, .num_atan, .num_floor, .num_ceiling, .f32_to_bits, .f32_from_bits, .f64_to_bits, .f64_from_bits, .num_shift_left_by, .num_shift_right_by, .num_shift_right_zf_by, .num_bitwise_and, .num_bitwise_or, .num_bitwise_xor, .num_bitwise_not, .num_count_one_bits, .num_count_leading_zero_bits, .num_count_trailing_zero_bits, .num_from_le_bytes_unchecked, .simd_load_16_unchecked, .simd_store_16_unchecked, .simd_append_16, .simd_splat, .simd_get_lane_unchecked, .simd_with_lane_unchecked, .simd_to_u128_bits, .simd_from_u128_bits, .simd_add_wrap, .simd_sub_wrap, .simd_add_sat, .simd_sub_sat, .simd_neg_wrap, .simd_abs_wrap, .simd_min, .simd_max, .simd_abs_diff, .simd_avg_rounded, .simd_mul_wrap, .simd_mul_high, .simd_mul_q15_sat, .simd_mul_wide_lo, .simd_mul_wide_hi, .simd_dot_pairs, .simd_dot_pairs_sat, .simd_sad, .simd_and, .simd_or, .simd_xor, .simd_not, .simd_bit_select, .simd_eq_lanes, .simd_gt_lanes, .simd_gte_lanes, .simd_bitmask, .simd_shl_wrap, .simd_shr_wrap, .simd_shr_zf_wrap, .simd_shr_rounded, .simd_interleave_lo, .simd_interleave_hi, .simd_even_lanes, .simd_odd_lanes, .simd_reverse_lanes, .simd_table_lookup, .simd_concat_shift_bytes, .simd_widen_lo, .simd_widen_hi, .simd_pairwise_add_widen, .simd_narrow_wrap, .simd_narrow_sat, .simd_sum_lanes, .simd_sum_lanes_wrap, .simd_clmul_lo, .simd_clmul_hi, .u8_from_str, .i8_from_str, .u16_from_str, .i16_from_str, .u32_from_str, .i32_from_str, .u64_from_str, .i64_from_str, .u128_from_str, .i128_from_str, .dec_from_str, .dec_to_attos, .dec_from_attos, .f32_from_str, .f64_from_str, .u8_from_str_prefix, .u8_from_utf8_prefix, .i8_from_str_prefix, .i8_from_utf8_prefix, .u16_from_str_prefix, .u16_from_utf8_prefix, .i16_from_str_prefix, .i16_from_utf8_prefix, .u32_from_str_prefix, .u32_from_utf8_prefix, .i32_from_str_prefix, .i32_from_utf8_prefix, .u64_from_str_prefix, .u64_from_utf8_prefix, .i64_from_str_prefix, .i64_from_utf8_prefix, .u128_from_str_prefix, .u128_from_utf8_prefix, .i128_from_str_prefix, .i128_from_utf8_prefix, .dec_from_str_prefix, .dec_from_utf8_prefix, .f32_from_str_prefix, .f32_from_utf8_prefix, .f64_from_str_prefix, .f64_from_utf8_prefix, .u8_to_i8_wrap, .u8_to_i8_try, .u8_to_i16, .u8_to_i32, .u8_to_i64, .u8_to_i128, .u8_to_u16, .u8_to_u32, .u8_to_u64, .u8_to_u128, .u8_to_f32, .u8_to_f64, .u8_to_dec, .i8_to_i16, .i8_to_i32, .i8_to_i64, .i8_to_i128, .i8_to_u8_wrap, .i8_to_u8_try, .i8_to_u16_wrap, .i8_to_u16_try, .i8_to_u32_wrap, .i8_to_u32_try, .i8_to_u64_wrap, .i8_to_u64_try, .i8_to_u128_wrap, .i8_to_u128_try, .i8_to_f32, .i8_to_f64, .i8_to_dec, .u16_to_i8_wrap, .u16_to_i8_try, .u16_to_i16_wrap, .u16_to_i16_try, .u16_to_i32, .u16_to_i64, .u16_to_i128, .u16_to_u8_wrap, .u16_to_u8_try, .u16_to_u32, .u16_to_u64, .u16_to_u128, .u16_to_f32, .u16_to_f64, .u16_to_dec, .i16_to_i8_wrap, .i16_to_i8_try, .i16_to_i32, .i16_to_i64, .i16_to_i128, .i16_to_u8_wrap, .i16_to_u8_try, .i16_to_u16_wrap, .i16_to_u16_try, .i16_to_u32_wrap, .i16_to_u32_try, .i16_to_u64_wrap, .i16_to_u64_try, .i16_to_u128_wrap, .i16_to_u128_try, .i16_to_f32, .i16_to_f64, .i16_to_dec, .u32_to_i8_wrap, .u32_to_i8_try, .u32_to_i16_wrap, .u32_to_i16_try, .u32_to_i32_wrap, .u32_to_i32_try, .u32_to_i64, .u32_to_i128, .u32_to_u8_wrap, .u32_to_u8_try, .u32_to_u16_wrap, .u32_to_u16_try, .u32_to_u64, .u32_to_u128, .u32_to_f32, .u32_to_f64, .u32_to_dec, .i32_to_i8_wrap, .i32_to_i8_try, .i32_to_i16_wrap, .i32_to_i16_try, .i32_to_i64, .i32_to_i128, .i32_to_u8_wrap, .i32_to_u8_try, .i32_to_u16_wrap, .i32_to_u16_try, .i32_to_u32_wrap, .i32_to_u32_try, .i32_to_u64_wrap, .i32_to_u64_try, .i32_to_u128_wrap, .i32_to_u128_try, .i32_to_f32, .i32_to_f64, .i32_to_dec, .u64_to_i8_wrap, .u64_to_i8_try, .u64_to_i16_wrap, .u64_to_i16_try, .u64_to_i32_wrap, .u64_to_i32_try, .u64_to_i64_wrap, .u64_to_i64_try, .u64_to_i128, .u64_to_u8_wrap, .u64_to_u8_try, .u64_to_u16_wrap, .u64_to_u16_try, .u64_to_u32_wrap, .u64_to_u32_try, .u64_to_u128, .u64_to_f32, .u64_to_f64, .u64_to_dec, .i64_to_i8_wrap, .i64_to_i8_try, .i64_to_i16_wrap, .i64_to_i16_try, .i64_to_i32_wrap, .i64_to_i32_try, .i64_to_i128, .i64_to_u8_wrap, .i64_to_u8_try, .i64_to_u16_wrap, .i64_to_u16_try, .i64_to_u32_wrap, .i64_to_u32_try, .i64_to_u64_wrap, .i64_to_u64_try, .i64_to_u128_wrap, .i64_to_u128_try, .i64_to_f32, .i64_to_f64, .i64_to_dec, .u128_to_i8_wrap, .u128_to_i8_try, .u128_to_i16_wrap, .u128_to_i16_try, .u128_to_i32_wrap, .u128_to_i32_try, .u128_to_i64_wrap, .u128_to_i64_try, .u128_to_i128_wrap, .u128_to_i128_try, .u128_to_u8_wrap, .u128_to_u8_try, .u128_to_u16_wrap, .u128_to_u16_try, .u128_to_u32_wrap, .u128_to_u32_try, .u128_to_u64_wrap, .u128_to_u64_try, .u128_to_f32, .u128_to_f64, .u128_to_dec_try_unsafe, .i128_to_i8_wrap, .i128_to_i8_try, .i128_to_i16_wrap, .i128_to_i16_try, .i128_to_i32_wrap, .i128_to_i32_try, .i128_to_i64_wrap, .i128_to_i64_try, .i128_to_u8_wrap, .i128_to_u8_try, .i128_to_u16_wrap, .i128_to_u16_try, .i128_to_u32_wrap, .i128_to_u32_try, .i128_to_u64_wrap, .i128_to_u64_try, .i128_to_u128_wrap, .i128_to_u128_try, .i128_to_f32, .i128_to_f64, .i128_to_dec_try_unsafe, .f32_to_i8_trunc, .f32_to_i8_try_unsafe, .f32_to_i16_trunc, .f32_to_i16_try_unsafe, .f32_to_i32_trunc, .f32_to_i32_try_unsafe, .f32_to_i64_trunc, .f32_to_i64_try_unsafe, .f32_to_i128_trunc, .f32_to_i128_try_unsafe, .f32_to_u8_trunc, .f32_to_u8_try_unsafe, .f32_to_u16_trunc, .f32_to_u16_try_unsafe, .f32_to_u32_trunc, .f32_to_u32_try_unsafe, .f32_to_u64_trunc, .f32_to_u64_try_unsafe, .f32_to_u128_trunc, .f32_to_u128_try_unsafe, .f32_to_f64, .f64_to_i8_trunc, .f64_to_i8_try_unsafe, .f64_to_i16_trunc, .f64_to_i16_try_unsafe, .f64_to_i32_trunc, .f64_to_i32_try_unsafe, .f64_to_i64_trunc, .f64_to_i64_try_unsafe, .f64_to_i128_trunc, .f64_to_i128_try_unsafe, .f64_to_u8_trunc, .f64_to_u8_try_unsafe, .f64_to_u16_trunc, .f64_to_u16_try_unsafe, .f64_to_u32_trunc, .f64_to_u32_try_unsafe, .f64_to_u64_trunc, .f64_to_u64_try_unsafe, .f64_to_u128_trunc, .f64_to_u128_try_unsafe, .f64_to_f32_wrap, .f64_to_f32_try_unsafe, .dec_to_i8_trunc, .dec_to_i8_try_unsafe, .dec_to_i16_trunc, .dec_to_i16_try_unsafe, .dec_to_i32_trunc, .dec_to_i32_try_unsafe, .dec_to_i64_trunc, .dec_to_i64_try_unsafe, .dec_to_i128_trunc, .dec_to_u8_trunc, .dec_to_u8_try_unsafe, .dec_to_u16_trunc, .dec_to_u16_try_unsafe, .dec_to_u32_trunc, .dec_to_u32_try_unsafe, .dec_to_u64_trunc, .dec_to_u64_try_unsafe, .dec_to_u128_trunc, .dec_to_u128_try_unsafe, .dec_to_f32_wrap, .dec_to_f32_try_unsafe, .dec_to_f64, .box_box, .box_unbox, .box_unbox_borrowed, .box_prepare_update, .erased_capture_load, .ptr_alloca, .box_alloc_zeroed, .ptr_store, .ptr_load, .ptr_cast, .compare, .crash => null,
+                .str_is_eq, .str_is_eq_static_small, .str_static_small_word_eq, .str_static_small_word_caseless_eq, .str_concat, .str_append, .str_contains, .str_trim, .str_trim_start, .str_trim_end, .str_caseless_ascii_equals, .str_with_ascii_lowercased, .str_with_ascii_uppercased, .str_starts_with, .str_ends_with, .str_repeat, .str_drop_prefix, .str_drop_prefix_caseless_ascii, .str_drop_suffix, .str_split_first, .str_split_last, .str_count_utf8_bytes, .str_get_utf8_byte_unsafe, .str_substring_unsafe, .str_with_capacity, .str_reserve, .str_release_excess_capacity, .str_to_utf8, .str_from_utf8_lossy, .str_from_utf8_validated, .str_from_utf16_le_short, .str_from_utf16_be_short, .str_from_utf32_le_short, .str_from_utf32_be_short, .str_from_utf8, .str_split_on, .str_join_with, .str_from_parts, .str_inspect, .u8_to_str, .i8_to_str, .u16_to_str, .i16_to_str, .u32_to_str, .i32_to_str, .u64_to_str, .i64_to_str, .u128_to_str, .i128_to_str, .dec_to_str, .f32_to_str, .f64_to_str, .list_len, .list_prefetched, .list_prefetch, .list_append_le_bytes, .list_append_le_bytes_unsafe, .list_map_prepare_reuse, .bool_not, .bool_likely, .dict_pseudo_seed, .hasher_finish, .hasher_write_bool, .hasher_write_u8, .hasher_write_u16, .hasher_write_u32, .hasher_write_u64, .hasher_write_u128, .hasher_write_i8, .hasher_write_i16, .hasher_write_i32, .hasher_write_i64, .hasher_write_i128, .hasher_write_f32, .hasher_write_f64, .hasher_write_dec, .hasher_write_bytes, .hasher_write_str, .crypto_sha256_hash_bytes, .crypto_sha256_hasher_empty, .crypto_sha256_hasher_write, .crypto_sha256_hasher_finish, .crypto_blake3_hash_bytes, .crypto_blake3_hasher_empty, .crypto_blake3_hasher_write, .crypto_blake3_hasher_finish, .num_is_eq, .num_is_gt, .num_is_gte, .num_is_lt, .num_is_lte, .num_negate, .num_abs, .num_abs_diff, .num_plus, .num_minus, .num_times, .num_int_add_wrap, .num_int_add_crash_on_overflow, .num_int_add_overflows, .num_int_add_proven_cannot_overflow, .num_int_sub_wrap, .num_int_sub_crash_on_overflow, .num_int_sub_overflows, .num_int_sub_proven_cannot_overflow, .num_int_mul_wrap, .num_int_mul_crash_on_overflow, .num_int_mul_overflows, .num_int_mul_proven_cannot_overflow, .num_float_add, .num_float_sub, .num_float_mul, .dec_mul, .num_div_by, .num_div_by_checked, .num_div_trunc_by, .num_div_trunc_by_checked, .num_rem_by, .num_rem_by_checked, .num_mod_by, .num_mod_by_checked, .num_negate_checked, .num_abs_checked, .num_pow, .num_atan2, .num_sqrt, .num_sin, .num_cos, .num_tan, .num_asin, .num_acos, .num_atan, .num_floor, .num_ceiling, .f32_to_bits, .f32_from_bits, .f64_to_bits, .f64_from_bits, .num_shift_left_by, .num_shift_right_by, .num_shift_right_zf_by, .num_bitwise_and, .num_bitwise_or, .num_bitwise_xor, .num_bitwise_not, .num_count_one_bits, .num_count_leading_zero_bits, .num_count_trailing_zero_bits, .num_from_le_bytes_unchecked, .simd_load_16_unchecked, .simd_store_16_unchecked, .simd_append_16, .simd_splat, .simd_get_lane_unchecked, .simd_with_lane_unchecked, .simd_to_u128_bits, .simd_from_u128_bits, .simd_add_wrap, .simd_sub_wrap, .simd_add_sat, .simd_sub_sat, .simd_neg_wrap, .simd_abs_wrap, .simd_min, .simd_max, .simd_abs_diff, .simd_avg_rounded, .simd_mul_wrap, .simd_mul_high, .simd_mul_q15_sat, .simd_mul_wide_lo, .simd_mul_wide_hi, .simd_dot_pairs, .simd_dot_pairs_sat, .simd_sad, .simd_and, .simd_or, .simd_xor, .simd_not, .simd_bit_select, .simd_eq_lanes, .simd_gt_lanes, .simd_gte_lanes, .simd_bitmask, .simd_shl_wrap, .simd_shr_wrap, .simd_shr_zf_wrap, .simd_shr_rounded, .simd_interleave_lo, .simd_interleave_hi, .simd_even_lanes, .simd_odd_lanes, .simd_reverse_lanes, .simd_table_lookup, .simd_concat_shift_bytes, .simd_widen_lo, .simd_widen_hi, .simd_pairwise_add_widen, .simd_narrow_wrap, .simd_narrow_sat, .simd_sum_lanes, .simd_sum_lanes_wrap, .simd_clmul_lo, .simd_clmul_hi, .u8_from_str, .i8_from_str, .u16_from_str, .i16_from_str, .u32_from_str, .i32_from_str, .u64_from_str, .i64_from_str, .u128_from_str, .i128_from_str, .dec_from_str, .dec_to_attos, .dec_from_attos, .f32_from_str, .f64_from_str, .u8_from_str_prefix, .u8_from_utf8_prefix, .i8_from_str_prefix, .i8_from_utf8_prefix, .u16_from_str_prefix, .u16_from_utf8_prefix, .i16_from_str_prefix, .i16_from_utf8_prefix, .u32_from_str_prefix, .u32_from_utf8_prefix, .i32_from_str_prefix, .i32_from_utf8_prefix, .u64_from_str_prefix, .u64_from_utf8_prefix, .i64_from_str_prefix, .i64_from_utf8_prefix, .u128_from_str_prefix, .u128_from_utf8_prefix, .i128_from_str_prefix, .i128_from_utf8_prefix, .dec_from_str_prefix, .dec_from_utf8_prefix, .f32_from_str_prefix, .f32_from_utf8_prefix, .f64_from_str_prefix, .f64_from_utf8_prefix, .u8_to_i8_wrap, .u8_to_i8_try, .u8_to_i16, .u8_to_i32, .u8_to_i64, .u8_to_i128, .u8_to_u16, .u8_to_u32, .u8_to_u64, .u8_to_u128, .u8_to_f32, .u8_to_f64, .u8_to_dec, .i8_to_i16, .i8_to_i32, .i8_to_i64, .i8_to_i128, .i8_to_u8_wrap, .i8_to_u8_try, .i8_to_u16_wrap, .i8_to_u16_try, .i8_to_u32_wrap, .i8_to_u32_try, .i8_to_u64_wrap, .i8_to_u64_try, .i8_to_u128_wrap, .i8_to_u128_try, .i8_to_f32, .i8_to_f64, .i8_to_dec, .u16_to_i8_wrap, .u16_to_i8_try, .u16_to_i16_wrap, .u16_to_i16_try, .u16_to_i32, .u16_to_i64, .u16_to_i128, .u16_to_u8_wrap, .u16_to_u8_try, .u16_to_u32, .u16_to_u64, .u16_to_u128, .u16_to_f32, .u16_to_f64, .u16_to_dec, .i16_to_i8_wrap, .i16_to_i8_try, .i16_to_i32, .i16_to_i64, .i16_to_i128, .i16_to_u8_wrap, .i16_to_u8_try, .i16_to_u16_wrap, .i16_to_u16_try, .i16_to_u32_wrap, .i16_to_u32_try, .i16_to_u64_wrap, .i16_to_u64_try, .i16_to_u128_wrap, .i16_to_u128_try, .i16_to_f32, .i16_to_f64, .i16_to_dec, .u32_to_i8_wrap, .u32_to_i8_try, .u32_to_i16_wrap, .u32_to_i16_try, .u32_to_i32_wrap, .u32_to_i32_try, .u32_to_i64, .u32_to_i128, .u32_to_u8_wrap, .u32_to_u8_try, .u32_to_u16_wrap, .u32_to_u16_try, .u32_to_u64, .u32_to_u128, .u32_to_f32, .u32_to_f64, .u32_to_dec, .i32_to_i8_wrap, .i32_to_i8_try, .i32_to_i16_wrap, .i32_to_i16_try, .i32_to_i64, .i32_to_i128, .i32_to_u8_wrap, .i32_to_u8_try, .i32_to_u16_wrap, .i32_to_u16_try, .i32_to_u32_wrap, .i32_to_u32_try, .i32_to_u64_wrap, .i32_to_u64_try, .i32_to_u128_wrap, .i32_to_u128_try, .i32_to_f32, .i32_to_f64, .i32_to_dec, .u64_to_i8_wrap, .u64_to_i8_try, .u64_to_i16_wrap, .u64_to_i16_try, .u64_to_i32_wrap, .u64_to_i32_try, .u64_to_i64_wrap, .u64_to_i64_try, .u64_to_i128, .u64_to_u8_wrap, .u64_to_u8_try, .u64_to_u16_wrap, .u64_to_u16_try, .u64_to_u32_wrap, .u64_to_u32_try, .u64_to_u128, .u64_to_f32, .u64_to_f64, .u64_to_dec, .i64_to_i8_wrap, .i64_to_i8_try, .i64_to_i16_wrap, .i64_to_i16_try, .i64_to_i32_wrap, .i64_to_i32_try, .i64_to_i128, .i64_to_u8_wrap, .i64_to_u8_try, .i64_to_u16_wrap, .i64_to_u16_try, .i64_to_u32_wrap, .i64_to_u32_try, .i64_to_u64_wrap, .i64_to_u64_try, .i64_to_u128_wrap, .i64_to_u128_try, .i64_to_f32, .i64_to_f64, .i64_to_dec, .u128_to_i8_wrap, .u128_to_i8_try, .u128_to_i16_wrap, .u128_to_i16_try, .u128_to_i32_wrap, .u128_to_i32_try, .u128_to_i64_wrap, .u128_to_i64_try, .u128_to_i128_wrap, .u128_to_i128_try, .u128_to_u8_wrap, .u128_to_u8_try, .u128_to_u16_wrap, .u128_to_u16_try, .u128_to_u32_wrap, .u128_to_u32_try, .u128_to_u64_wrap, .u128_to_u64_try, .u128_to_f32, .u128_to_f64, .u128_to_dec_try_unsafe, .i128_to_i8_wrap, .i128_to_i8_try, .i128_to_i16_wrap, .i128_to_i16_try, .i128_to_i32_wrap, .i128_to_i32_try, .i128_to_i64_wrap, .i128_to_i64_try, .i128_to_u8_wrap, .i128_to_u8_try, .i128_to_u16_wrap, .i128_to_u16_try, .i128_to_u32_wrap, .i128_to_u32_try, .i128_to_u64_wrap, .i128_to_u64_try, .i128_to_u128_wrap, .i128_to_u128_try, .i128_to_f32, .i128_to_f64, .i128_to_dec_try_unsafe, .f32_to_i8_trunc, .f32_to_i8_try_unsafe, .f32_to_i16_trunc, .f32_to_i16_try_unsafe, .f32_to_i32_trunc, .f32_to_i32_try_unsafe, .f32_to_i64_trunc, .f32_to_i64_try_unsafe, .f32_to_i128_trunc, .f32_to_i128_try_unsafe, .f32_to_u8_trunc, .f32_to_u8_try_unsafe, .f32_to_u16_trunc, .f32_to_u16_try_unsafe, .f32_to_u32_trunc, .f32_to_u32_try_unsafe, .f32_to_u64_trunc, .f32_to_u64_try_unsafe, .f32_to_u128_trunc, .f32_to_u128_try_unsafe, .f32_to_f64, .f64_to_i8_trunc, .f64_to_i8_try_unsafe, .f64_to_i16_trunc, .f64_to_i16_try_unsafe, .f64_to_i32_trunc, .f64_to_i32_try_unsafe, .f64_to_i64_trunc, .f64_to_i64_try_unsafe, .f64_to_i128_trunc, .f64_to_i128_try_unsafe, .f64_to_u8_trunc, .f64_to_u8_try_unsafe, .f64_to_u16_trunc, .f64_to_u16_try_unsafe, .f64_to_u32_trunc, .f64_to_u32_try_unsafe, .f64_to_u64_trunc, .f64_to_u64_try_unsafe, .f64_to_u128_trunc, .f64_to_u128_try_unsafe, .f64_to_f32_wrap, .f64_to_f32_try_unsafe, .dec_to_i8_trunc, .dec_to_i8_try_unsafe, .dec_to_i16_trunc, .dec_to_i16_try_unsafe, .dec_to_i32_trunc, .dec_to_i32_try_unsafe, .dec_to_i64_trunc, .dec_to_i64_try_unsafe, .dec_to_i128_trunc, .dec_to_u8_trunc, .dec_to_u8_try_unsafe, .dec_to_u16_trunc, .dec_to_u16_try_unsafe, .dec_to_u32_trunc, .dec_to_u32_try_unsafe, .dec_to_u64_trunc, .dec_to_u64_try_unsafe, .dec_to_u128_trunc, .dec_to_u128_try_unsafe, .dec_to_f32_wrap, .dec_to_f32_try_unsafe, .dec_to_f64, .box_box, .box_unbox, .box_unbox_borrowed, .box_prepare_update, .erased_capture_load, .ptr_alloca, .box_alloc_zeroed, .ptr_store, .ptr_load, .ptr_cast, .compare, .crash => null,
             };
         }
 
@@ -18293,6 +18585,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const extra = self.store.stmtRowOrDefault(assign.extra);
 
             switch (assign.op) {
+                .boxed_sequence_pack, .boxed_sequence_unpack => unreachable, // these operations never carry a list element descriptor
                 .list_prefetch => return,
                 .list_len => {
                     const reg = try self.allocTempGeneral();
@@ -18313,7 +18606,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     self.freeGenerals(.{ temp, to, from });
                     return self.finishTarget(dst_local, dst);
                 },
-                .str_is_eq, .str_is_eq_static_small, .str_static_small_word_eq, .str_static_small_word_caseless_eq, .str_concat, .str_contains, .str_trim, .str_trim_start, .str_trim_end, .str_caseless_ascii_equals, .str_with_ascii_lowercased, .str_with_ascii_uppercased, .str_starts_with, .str_ends_with, .str_repeat, .str_drop_prefix, .str_drop_prefix_caseless_ascii, .str_drop_suffix, .str_split_first, .str_split_last, .str_count_utf8_bytes, .str_get_utf8_byte_unsafe, .str_substring_unsafe, .str_with_capacity, .str_reserve, .str_release_excess_capacity, .str_to_utf8, .str_from_utf8_lossy, .str_from_utf8_validated, .str_from_utf16_le_short, .str_from_utf16_be_short, .str_from_utf32_le_short, .str_from_utf32_be_short, .str_from_utf8, .str_split_on, .str_join_with, .str_from_parts, .str_inspect, .u8_to_str, .i8_to_str, .u16_to_str, .i16_to_str, .u32_to_str, .i32_to_str, .u64_to_str, .i64_to_str, .u128_to_str, .i128_to_str, .dec_to_str, .f32_to_str, .f64_to_str, .list_capacity, .list_get_unsafe, .list_prefetched, .list_append_unsafe, .list_concat, .list_append_range_within, .list_copy_range_within, .list_append_range_within_unsafe, .list_append_sublist, .list_append_le_bytes, .list_append_le_bytes_unsafe, .list_slack_unique, .list_owned_unique, .list_set_in_place_unsafe, .list_with_capacity, .list_drop_at, .list_sublist, .list_sublist_borrowed, .list_set, .list_replace_unsafe, .list_swap, .list_prepend, .list_take_first, .list_take_last, .list_reverse, .list_reserve, .list_reserve_for_append, .list_release_excess_capacity, .list_clear, .list_map_can_reuse, .list_map_cast_unsafe, .list_map_extract_unsafe, .list_move_out_unsafe, .list_map_write_unsafe, .list_item_size_at_most, .bool_not, .bool_likely, .dict_pseudo_seed, .hasher_finish, .hasher_write_bool, .hasher_write_u8, .hasher_write_u16, .hasher_write_u32, .hasher_write_u64, .hasher_write_u128, .hasher_write_i8, .hasher_write_i16, .hasher_write_i32, .hasher_write_i64, .hasher_write_i128, .hasher_write_f32, .hasher_write_f64, .hasher_write_dec, .hasher_write_bytes, .hasher_write_str, .crypto_sha256_hash_bytes, .crypto_sha256_hasher_empty, .crypto_sha256_hasher_write, .crypto_sha256_hasher_finish, .crypto_blake3_hash_bytes, .crypto_blake3_hasher_empty, .crypto_blake3_hasher_write, .crypto_blake3_hasher_finish, .num_is_eq, .num_is_gt, .num_is_gte, .num_is_lt, .num_is_lte, .num_negate, .num_abs, .num_abs_diff, .num_plus, .num_minus, .num_times, .num_int_add_wrap, .num_int_add_crash_on_overflow, .num_int_add_overflows, .num_int_add_proven_cannot_overflow, .num_int_sub_wrap, .num_int_sub_crash_on_overflow, .num_int_sub_overflows, .num_int_sub_proven_cannot_overflow, .num_int_mul_wrap, .num_int_mul_crash_on_overflow, .num_int_mul_overflows, .num_int_mul_proven_cannot_overflow, .num_float_add, .num_float_sub, .num_float_mul, .dec_mul, .num_div_by, .num_div_by_checked, .num_div_trunc_by, .num_div_trunc_by_checked, .num_rem_by, .num_rem_by_checked, .num_mod_by, .num_mod_by_checked, .num_negate_checked, .num_abs_checked, .num_pow, .num_atan2, .num_sqrt, .num_sin, .num_cos, .num_tan, .num_asin, .num_acos, .num_atan, .num_floor, .num_ceiling, .f32_to_bits, .f32_from_bits, .f64_to_bits, .f64_from_bits, .num_shift_left_by, .num_shift_right_by, .num_shift_right_zf_by, .num_bitwise_and, .num_bitwise_or, .num_bitwise_xor, .num_bitwise_not, .num_count_one_bits, .num_count_leading_zero_bits, .num_count_trailing_zero_bits, .num_from_le_bytes_unchecked, .simd_load_16_unchecked, .simd_store_16_unchecked, .simd_append_16, .simd_splat, .simd_get_lane_unchecked, .simd_with_lane_unchecked, .simd_to_u128_bits, .simd_from_u128_bits, .simd_add_wrap, .simd_sub_wrap, .simd_add_sat, .simd_sub_sat, .simd_neg_wrap, .simd_abs_wrap, .simd_min, .simd_max, .simd_abs_diff, .simd_avg_rounded, .simd_mul_wrap, .simd_mul_high, .simd_mul_q15_sat, .simd_mul_wide_lo, .simd_mul_wide_hi, .simd_dot_pairs, .simd_dot_pairs_sat, .simd_sad, .simd_and, .simd_or, .simd_xor, .simd_not, .simd_bit_select, .simd_eq_lanes, .simd_gt_lanes, .simd_gte_lanes, .simd_bitmask, .simd_shl_wrap, .simd_shr_wrap, .simd_shr_zf_wrap, .simd_shr_rounded, .simd_interleave_lo, .simd_interleave_hi, .simd_even_lanes, .simd_odd_lanes, .simd_reverse_lanes, .simd_table_lookup, .simd_concat_shift_bytes, .simd_widen_lo, .simd_widen_hi, .simd_pairwise_add_widen, .simd_narrow_wrap, .simd_narrow_sat, .simd_sum_lanes, .simd_sum_lanes_wrap, .simd_clmul_lo, .simd_clmul_hi, .u8_from_str, .i8_from_str, .u16_from_str, .i16_from_str, .u32_from_str, .i32_from_str, .u64_from_str, .i64_from_str, .u128_from_str, .i128_from_str, .dec_from_str, .dec_to_attos, .dec_from_attos, .f32_from_str, .f64_from_str, .u8_from_str_prefix, .u8_from_utf8_prefix, .i8_from_str_prefix, .i8_from_utf8_prefix, .u16_from_str_prefix, .u16_from_utf8_prefix, .i16_from_str_prefix, .i16_from_utf8_prefix, .u32_from_str_prefix, .u32_from_utf8_prefix, .i32_from_str_prefix, .i32_from_utf8_prefix, .u64_from_str_prefix, .u64_from_utf8_prefix, .i64_from_str_prefix, .i64_from_utf8_prefix, .u128_from_str_prefix, .u128_from_utf8_prefix, .i128_from_str_prefix, .i128_from_utf8_prefix, .dec_from_str_prefix, .dec_from_utf8_prefix, .f32_from_str_prefix, .f32_from_utf8_prefix, .f64_from_str_prefix, .f64_from_utf8_prefix, .u8_to_i8_wrap, .u8_to_i8_try, .u8_to_i16, .u8_to_i32, .u8_to_i64, .u8_to_i128, .u8_to_u16, .u8_to_u32, .u8_to_u64, .u8_to_u128, .u8_to_f32, .u8_to_f64, .u8_to_dec, .i8_to_i16, .i8_to_i32, .i8_to_i64, .i8_to_i128, .i8_to_u8_wrap, .i8_to_u8_try, .i8_to_u16_wrap, .i8_to_u16_try, .i8_to_u32_wrap, .i8_to_u32_try, .i8_to_u64_wrap, .i8_to_u64_try, .i8_to_u128_wrap, .i8_to_u128_try, .i8_to_f32, .i8_to_f64, .i8_to_dec, .u16_to_i8_wrap, .u16_to_i8_try, .u16_to_i16_wrap, .u16_to_i16_try, .u16_to_i32, .u16_to_i64, .u16_to_i128, .u16_to_u8_wrap, .u16_to_u8_try, .u16_to_u32, .u16_to_u64, .u16_to_u128, .u16_to_f32, .u16_to_f64, .u16_to_dec, .i16_to_i8_wrap, .i16_to_i8_try, .i16_to_i32, .i16_to_i64, .i16_to_i128, .i16_to_u8_wrap, .i16_to_u8_try, .i16_to_u16_wrap, .i16_to_u16_try, .i16_to_u32_wrap, .i16_to_u32_try, .i16_to_u64_wrap, .i16_to_u64_try, .i16_to_u128_wrap, .i16_to_u128_try, .i16_to_f32, .i16_to_f64, .i16_to_dec, .u32_to_i8_wrap, .u32_to_i8_try, .u32_to_i16_wrap, .u32_to_i16_try, .u32_to_i32_wrap, .u32_to_i32_try, .u32_to_i64, .u32_to_i128, .u32_to_u8_wrap, .u32_to_u8_try, .u32_to_u16_wrap, .u32_to_u16_try, .u32_to_u64, .u32_to_u128, .u32_to_f32, .u32_to_f64, .u32_to_dec, .i32_to_i8_wrap, .i32_to_i8_try, .i32_to_i16_wrap, .i32_to_i16_try, .i32_to_i64, .i32_to_i128, .i32_to_u8_wrap, .i32_to_u8_try, .i32_to_u16_wrap, .i32_to_u16_try, .i32_to_u32_wrap, .i32_to_u32_try, .i32_to_u64_wrap, .i32_to_u64_try, .i32_to_u128_wrap, .i32_to_u128_try, .i32_to_f32, .i32_to_f64, .i32_to_dec, .u64_to_i8_wrap, .u64_to_i8_try, .u64_to_i16_wrap, .u64_to_i16_try, .u64_to_i32_wrap, .u64_to_i32_try, .u64_to_i64_wrap, .u64_to_i64_try, .u64_to_i128, .u64_to_u8_wrap, .u64_to_u8_try, .u64_to_u16_wrap, .u64_to_u16_try, .u64_to_u32_wrap, .u64_to_u32_try, .u64_to_u128, .u64_to_f32, .u64_to_f64, .u64_to_dec, .i64_to_i8_wrap, .i64_to_i8_try, .i64_to_i16_wrap, .i64_to_i16_try, .i64_to_i32_wrap, .i64_to_i32_try, .i64_to_i128, .i64_to_u8_wrap, .i64_to_u8_try, .i64_to_u16_wrap, .i64_to_u16_try, .i64_to_u32_wrap, .i64_to_u32_try, .i64_to_u64_wrap, .i64_to_u64_try, .i64_to_u128_wrap, .i64_to_u128_try, .i64_to_f32, .i64_to_f64, .i64_to_dec, .u128_to_i8_wrap, .u128_to_i8_try, .u128_to_i16_wrap, .u128_to_i16_try, .u128_to_i32_wrap, .u128_to_i32_try, .u128_to_i64_wrap, .u128_to_i64_try, .u128_to_i128_wrap, .u128_to_i128_try, .u128_to_u8_wrap, .u128_to_u8_try, .u128_to_u16_wrap, .u128_to_u16_try, .u128_to_u32_wrap, .u128_to_u32_try, .u128_to_u64_wrap, .u128_to_u64_try, .u128_to_f32, .u128_to_f64, .u128_to_dec_try_unsafe, .i128_to_i8_wrap, .i128_to_i8_try, .i128_to_i16_wrap, .i128_to_i16_try, .i128_to_i32_wrap, .i128_to_i32_try, .i128_to_i64_wrap, .i128_to_i64_try, .i128_to_u8_wrap, .i128_to_u8_try, .i128_to_u16_wrap, .i128_to_u16_try, .i128_to_u32_wrap, .i128_to_u32_try, .i128_to_u64_wrap, .i128_to_u64_try, .i128_to_u128_wrap, .i128_to_u128_try, .i128_to_f32, .i128_to_f64, .i128_to_dec_try_unsafe, .f32_to_i8_trunc, .f32_to_i8_try_unsafe, .f32_to_i16_trunc, .f32_to_i16_try_unsafe, .f32_to_i32_trunc, .f32_to_i32_try_unsafe, .f32_to_i64_trunc, .f32_to_i64_try_unsafe, .f32_to_i128_trunc, .f32_to_i128_try_unsafe, .f32_to_u8_trunc, .f32_to_u8_try_unsafe, .f32_to_u16_trunc, .f32_to_u16_try_unsafe, .f32_to_u32_trunc, .f32_to_u32_try_unsafe, .f32_to_u64_trunc, .f32_to_u64_try_unsafe, .f32_to_u128_trunc, .f32_to_u128_try_unsafe, .f32_to_f64, .f64_to_i8_trunc, .f64_to_i8_try_unsafe, .f64_to_i16_trunc, .f64_to_i16_try_unsafe, .f64_to_i32_trunc, .f64_to_i32_try_unsafe, .f64_to_i64_trunc, .f64_to_i64_try_unsafe, .f64_to_i128_trunc, .f64_to_i128_try_unsafe, .f64_to_u8_trunc, .f64_to_u8_try_unsafe, .f64_to_u16_trunc, .f64_to_u16_try_unsafe, .f64_to_u32_trunc, .f64_to_u32_try_unsafe, .f64_to_u64_trunc, .f64_to_u64_try_unsafe, .f64_to_u128_trunc, .f64_to_u128_try_unsafe, .f64_to_f32_wrap, .f64_to_f32_try_unsafe, .dec_to_i8_trunc, .dec_to_i8_try_unsafe, .dec_to_i16_trunc, .dec_to_i16_try_unsafe, .dec_to_i32_trunc, .dec_to_i32_try_unsafe, .dec_to_i64_trunc, .dec_to_i64_try_unsafe, .dec_to_i128_trunc, .dec_to_u8_trunc, .dec_to_u8_try_unsafe, .dec_to_u16_trunc, .dec_to_u16_try_unsafe, .dec_to_u32_trunc, .dec_to_u32_try_unsafe, .dec_to_u64_trunc, .dec_to_u64_try_unsafe, .dec_to_u128_trunc, .dec_to_u128_try_unsafe, .dec_to_f32_wrap, .dec_to_f32_try_unsafe, .dec_to_f64, .box_box, .box_unbox, .box_unbox_borrowed, .box_prepare_update, .erased_capture_load, .ptr_alloca, .box_alloc_zeroed, .ptr_store, .ptr_load, .ptr_cast, .compare, .crash => {},
+                .str_is_eq, .str_is_eq_static_small, .str_static_small_word_eq, .str_static_small_word_caseless_eq, .str_concat, .str_append, .str_contains, .str_trim, .str_trim_start, .str_trim_end, .str_caseless_ascii_equals, .str_with_ascii_lowercased, .str_with_ascii_uppercased, .str_starts_with, .str_ends_with, .str_repeat, .str_drop_prefix, .str_drop_prefix_caseless_ascii, .str_drop_suffix, .str_split_first, .str_split_last, .str_count_utf8_bytes, .str_get_utf8_byte_unsafe, .str_substring_unsafe, .str_with_capacity, .str_reserve, .str_release_excess_capacity, .str_to_utf8, .str_from_utf8_lossy, .str_from_utf8_validated, .str_from_utf16_le_short, .str_from_utf16_be_short, .str_from_utf32_le_short, .str_from_utf32_be_short, .str_from_utf8, .str_split_on, .str_join_with, .str_from_parts, .str_inspect, .u8_to_str, .i8_to_str, .u16_to_str, .i16_to_str, .u32_to_str, .i32_to_str, .u64_to_str, .i64_to_str, .u128_to_str, .i128_to_str, .dec_to_str, .f32_to_str, .f64_to_str, .list_capacity, .list_get_unsafe, .list_prefetched, .list_append_unsafe, .list_concat, .list_append_range_within, .list_copy_range_within, .list_append_range_within_unsafe, .list_append_sublist, .list_append_le_bytes, .list_append_le_bytes_unsafe, .list_slack_unique, .list_owned_unique, .list_set_in_place_unsafe, .list_with_capacity, .list_drop_at, .list_sublist, .list_sublist_borrowed, .list_set, .list_replace_unsafe, .list_swap, .list_prepend, .list_take_first, .list_take_last, .list_reverse, .list_reserve, .list_reserve_for_append, .list_release_excess_capacity, .list_clear, .list_map_can_reuse, .list_map_cast_unsafe, .list_map_extract_unsafe, .list_move_out_unsafe, .list_map_write_unsafe, .list_item_size_at_most, .bool_not, .bool_likely, .dict_pseudo_seed, .hasher_finish, .hasher_write_bool, .hasher_write_u8, .hasher_write_u16, .hasher_write_u32, .hasher_write_u64, .hasher_write_u128, .hasher_write_i8, .hasher_write_i16, .hasher_write_i32, .hasher_write_i64, .hasher_write_i128, .hasher_write_f32, .hasher_write_f64, .hasher_write_dec, .hasher_write_bytes, .hasher_write_str, .crypto_sha256_hash_bytes, .crypto_sha256_hasher_empty, .crypto_sha256_hasher_write, .crypto_sha256_hasher_finish, .crypto_blake3_hash_bytes, .crypto_blake3_hasher_empty, .crypto_blake3_hasher_write, .crypto_blake3_hasher_finish, .num_is_eq, .num_is_gt, .num_is_gte, .num_is_lt, .num_is_lte, .num_negate, .num_abs, .num_abs_diff, .num_plus, .num_minus, .num_times, .num_int_add_wrap, .num_int_add_crash_on_overflow, .num_int_add_overflows, .num_int_add_proven_cannot_overflow, .num_int_sub_wrap, .num_int_sub_crash_on_overflow, .num_int_sub_overflows, .num_int_sub_proven_cannot_overflow, .num_int_mul_wrap, .num_int_mul_crash_on_overflow, .num_int_mul_overflows, .num_int_mul_proven_cannot_overflow, .num_float_add, .num_float_sub, .num_float_mul, .dec_mul, .num_div_by, .num_div_by_checked, .num_div_trunc_by, .num_div_trunc_by_checked, .num_rem_by, .num_rem_by_checked, .num_mod_by, .num_mod_by_checked, .num_negate_checked, .num_abs_checked, .num_pow, .num_atan2, .num_sqrt, .num_sin, .num_cos, .num_tan, .num_asin, .num_acos, .num_atan, .num_floor, .num_ceiling, .f32_to_bits, .f32_from_bits, .f64_to_bits, .f64_from_bits, .num_shift_left_by, .num_shift_right_by, .num_shift_right_zf_by, .num_bitwise_and, .num_bitwise_or, .num_bitwise_xor, .num_bitwise_not, .num_count_one_bits, .num_count_leading_zero_bits, .num_count_trailing_zero_bits, .num_from_le_bytes_unchecked, .simd_load_16_unchecked, .simd_store_16_unchecked, .simd_append_16, .simd_splat, .simd_get_lane_unchecked, .simd_with_lane_unchecked, .simd_to_u128_bits, .simd_from_u128_bits, .simd_add_wrap, .simd_sub_wrap, .simd_add_sat, .simd_sub_sat, .simd_neg_wrap, .simd_abs_wrap, .simd_min, .simd_max, .simd_abs_diff, .simd_avg_rounded, .simd_mul_wrap, .simd_mul_high, .simd_mul_q15_sat, .simd_mul_wide_lo, .simd_mul_wide_hi, .simd_dot_pairs, .simd_dot_pairs_sat, .simd_sad, .simd_and, .simd_or, .simd_xor, .simd_not, .simd_bit_select, .simd_eq_lanes, .simd_gt_lanes, .simd_gte_lanes, .simd_bitmask, .simd_shl_wrap, .simd_shr_wrap, .simd_shr_zf_wrap, .simd_shr_rounded, .simd_interleave_lo, .simd_interleave_hi, .simd_even_lanes, .simd_odd_lanes, .simd_reverse_lanes, .simd_table_lookup, .simd_concat_shift_bytes, .simd_widen_lo, .simd_widen_hi, .simd_pairwise_add_widen, .simd_narrow_wrap, .simd_narrow_sat, .simd_sum_lanes, .simd_sum_lanes_wrap, .simd_clmul_lo, .simd_clmul_hi, .u8_from_str, .i8_from_str, .u16_from_str, .i16_from_str, .u32_from_str, .i32_from_str, .u64_from_str, .i64_from_str, .u128_from_str, .i128_from_str, .dec_from_str, .dec_to_attos, .dec_from_attos, .f32_from_str, .f64_from_str, .u8_from_str_prefix, .u8_from_utf8_prefix, .i8_from_str_prefix, .i8_from_utf8_prefix, .u16_from_str_prefix, .u16_from_utf8_prefix, .i16_from_str_prefix, .i16_from_utf8_prefix, .u32_from_str_prefix, .u32_from_utf8_prefix, .i32_from_str_prefix, .i32_from_utf8_prefix, .u64_from_str_prefix, .u64_from_utf8_prefix, .i64_from_str_prefix, .i64_from_utf8_prefix, .u128_from_str_prefix, .u128_from_utf8_prefix, .i128_from_str_prefix, .i128_from_utf8_prefix, .dec_from_str_prefix, .dec_from_utf8_prefix, .f32_from_str_prefix, .f32_from_utf8_prefix, .f64_from_str_prefix, .f64_from_utf8_prefix, .u8_to_i8_wrap, .u8_to_i8_try, .u8_to_i16, .u8_to_i32, .u8_to_i64, .u8_to_i128, .u8_to_u16, .u8_to_u32, .u8_to_u64, .u8_to_u128, .u8_to_f32, .u8_to_f64, .u8_to_dec, .i8_to_i16, .i8_to_i32, .i8_to_i64, .i8_to_i128, .i8_to_u8_wrap, .i8_to_u8_try, .i8_to_u16_wrap, .i8_to_u16_try, .i8_to_u32_wrap, .i8_to_u32_try, .i8_to_u64_wrap, .i8_to_u64_try, .i8_to_u128_wrap, .i8_to_u128_try, .i8_to_f32, .i8_to_f64, .i8_to_dec, .u16_to_i8_wrap, .u16_to_i8_try, .u16_to_i16_wrap, .u16_to_i16_try, .u16_to_i32, .u16_to_i64, .u16_to_i128, .u16_to_u8_wrap, .u16_to_u8_try, .u16_to_u32, .u16_to_u64, .u16_to_u128, .u16_to_f32, .u16_to_f64, .u16_to_dec, .i16_to_i8_wrap, .i16_to_i8_try, .i16_to_i32, .i16_to_i64, .i16_to_i128, .i16_to_u8_wrap, .i16_to_u8_try, .i16_to_u16_wrap, .i16_to_u16_try, .i16_to_u32_wrap, .i16_to_u32_try, .i16_to_u64_wrap, .i16_to_u64_try, .i16_to_u128_wrap, .i16_to_u128_try, .i16_to_f32, .i16_to_f64, .i16_to_dec, .u32_to_i8_wrap, .u32_to_i8_try, .u32_to_i16_wrap, .u32_to_i16_try, .u32_to_i32_wrap, .u32_to_i32_try, .u32_to_i64, .u32_to_i128, .u32_to_u8_wrap, .u32_to_u8_try, .u32_to_u16_wrap, .u32_to_u16_try, .u32_to_u64, .u32_to_u128, .u32_to_f32, .u32_to_f64, .u32_to_dec, .i32_to_i8_wrap, .i32_to_i8_try, .i32_to_i16_wrap, .i32_to_i16_try, .i32_to_i64, .i32_to_i128, .i32_to_u8_wrap, .i32_to_u8_try, .i32_to_u16_wrap, .i32_to_u16_try, .i32_to_u32_wrap, .i32_to_u32_try, .i32_to_u64_wrap, .i32_to_u64_try, .i32_to_u128_wrap, .i32_to_u128_try, .i32_to_f32, .i32_to_f64, .i32_to_dec, .u64_to_i8_wrap, .u64_to_i8_try, .u64_to_i16_wrap, .u64_to_i16_try, .u64_to_i32_wrap, .u64_to_i32_try, .u64_to_i64_wrap, .u64_to_i64_try, .u64_to_i128, .u64_to_u8_wrap, .u64_to_u8_try, .u64_to_u16_wrap, .u64_to_u16_try, .u64_to_u32_wrap, .u64_to_u32_try, .u64_to_u128, .u64_to_f32, .u64_to_f64, .u64_to_dec, .i64_to_i8_wrap, .i64_to_i8_try, .i64_to_i16_wrap, .i64_to_i16_try, .i64_to_i32_wrap, .i64_to_i32_try, .i64_to_i128, .i64_to_u8_wrap, .i64_to_u8_try, .i64_to_u16_wrap, .i64_to_u16_try, .i64_to_u32_wrap, .i64_to_u32_try, .i64_to_u64_wrap, .i64_to_u64_try, .i64_to_u128_wrap, .i64_to_u128_try, .i64_to_f32, .i64_to_f64, .i64_to_dec, .u128_to_i8_wrap, .u128_to_i8_try, .u128_to_i16_wrap, .u128_to_i16_try, .u128_to_i32_wrap, .u128_to_i32_try, .u128_to_i64_wrap, .u128_to_i64_try, .u128_to_i128_wrap, .u128_to_i128_try, .u128_to_u8_wrap, .u128_to_u8_try, .u128_to_u16_wrap, .u128_to_u16_try, .u128_to_u32_wrap, .u128_to_u32_try, .u128_to_u64_wrap, .u128_to_u64_try, .u128_to_f32, .u128_to_f64, .u128_to_dec_try_unsafe, .i128_to_i8_wrap, .i128_to_i8_try, .i128_to_i16_wrap, .i128_to_i16_try, .i128_to_i32_wrap, .i128_to_i32_try, .i128_to_i64_wrap, .i128_to_i64_try, .i128_to_u8_wrap, .i128_to_u8_try, .i128_to_u16_wrap, .i128_to_u16_try, .i128_to_u32_wrap, .i128_to_u32_try, .i128_to_u64_wrap, .i128_to_u64_try, .i128_to_u128_wrap, .i128_to_u128_try, .i128_to_f32, .i128_to_f64, .i128_to_dec_try_unsafe, .f32_to_i8_trunc, .f32_to_i8_try_unsafe, .f32_to_i16_trunc, .f32_to_i16_try_unsafe, .f32_to_i32_trunc, .f32_to_i32_try_unsafe, .f32_to_i64_trunc, .f32_to_i64_try_unsafe, .f32_to_i128_trunc, .f32_to_i128_try_unsafe, .f32_to_u8_trunc, .f32_to_u8_try_unsafe, .f32_to_u16_trunc, .f32_to_u16_try_unsafe, .f32_to_u32_trunc, .f32_to_u32_try_unsafe, .f32_to_u64_trunc, .f32_to_u64_try_unsafe, .f32_to_u128_trunc, .f32_to_u128_try_unsafe, .f32_to_f64, .f64_to_i8_trunc, .f64_to_i8_try_unsafe, .f64_to_i16_trunc, .f64_to_i16_try_unsafe, .f64_to_i32_trunc, .f64_to_i32_try_unsafe, .f64_to_i64_trunc, .f64_to_i64_try_unsafe, .f64_to_i128_trunc, .f64_to_i128_try_unsafe, .f64_to_u8_trunc, .f64_to_u8_try_unsafe, .f64_to_u16_trunc, .f64_to_u16_try_unsafe, .f64_to_u32_trunc, .f64_to_u32_try_unsafe, .f64_to_u64_trunc, .f64_to_u64_try_unsafe, .f64_to_u128_trunc, .f64_to_u128_try_unsafe, .f64_to_f32_wrap, .f64_to_f32_try_unsafe, .dec_to_i8_trunc, .dec_to_i8_try_unsafe, .dec_to_i16_trunc, .dec_to_i16_try_unsafe, .dec_to_i32_trunc, .dec_to_i32_try_unsafe, .dec_to_i64_trunc, .dec_to_i64_try_unsafe, .dec_to_i128_trunc, .dec_to_u8_trunc, .dec_to_u8_try_unsafe, .dec_to_u16_trunc, .dec_to_u16_try_unsafe, .dec_to_u32_trunc, .dec_to_u32_try_unsafe, .dec_to_u64_trunc, .dec_to_u64_try_unsafe, .dec_to_u128_trunc, .dec_to_u128_try_unsafe, .dec_to_f32_wrap, .dec_to_f32_try_unsafe, .dec_to_f64, .box_box, .box_unbox, .box_unbox_borrowed, .box_prepare_update, .erased_capture_load, .ptr_alloca, .box_alloc_zeroed, .ptr_store, .ptr_load, .ptr_cast, .compare, .crash => {},
             }
             const list_op = boxyListOp(assign.op) orelse base.invariant(
                 "LIR/codegen invariant violated: low-level {s} has no element-descriptor form",
@@ -18330,6 +18623,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
             if (list_op == .get_unsafe or list_op == .map_extract_unsafe) {
                 return self.emitDynListGetUnsafe(dst_local, elem_desc, GuardedList.at(all_args, 0), GuardedList.at(all_args, 1));
+            }
+            if (list_op == .append_unsafe) {
+                return self.emitDynListWriteUnsafe(dst_local, elem_desc, GuardedList.at(all_args, 0), GuardedList.at(all_args, 1), null);
+            }
+            if (list_op == .map_write_unsafe) {
+                return self.emitDynListWriteUnsafe(dst_local, elem_desc, GuardedList.at(all_args, 0), GuardedList.at(all_args, 2), GuardedList.at(all_args, 1));
             }
 
             const Request = BoxyListOpRequest;
@@ -18448,14 +18747,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.saveIncomingPointerArg(capture_slot, 3);
             try self.saveIncomingPointerArg(reuse_slot, 4);
 
-            if (proc.dyn_result) |result| {
+            if (proc.dyn_result.get()) |result| {
                 try self.setLocalLocation(localKey(result), self.stackLocationForLayout(self.localLayout(result), ret_slot));
                 self.ret_ptr_slot = null;
             } else {
                 self.ret_ptr_slot = ret_slot;
             }
 
-            const capture_param = proc.erased_capture_arg orelse base.invariant("LIR/codegen invariant violated: erased_record proc has no capture parameter", .{});
+            const capture_param = proc.erased_capture_arg.get() orelse base.invariant("LIR/codegen invariant violated: erased_record proc has no capture parameter", .{});
             const params = self.store.getLocalSpan(proc.args);
             var explicit_count: usize = 0;
             for (0..params.len) |i| {
@@ -18471,7 +18770,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try self.setLocalLocation(localKey(param), self.stackLocationForLayout(.opaque_ptr, capture_slot));
                     continue;
                 }
-                if (proc.erased_reuse_arg != null and param == proc.erased_reuse_arg.?) {
+                if (proc.erased_reuse_arg != .none and param == proc.erased_reuse_arg.get().?) {
                     try self.setLocalLocation(localKey(param), self.stackLocationForLayout(self.localLayout(param), reuse_slot));
                     continue;
                 }
@@ -18880,7 +19179,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.uses_caller_stack_arg_base = false;
             self.current_proc_arg_pop = 0;
             self.caller_drives_slot = null;
-            self.current_dyn_result = proc.dyn_result;
+            self.current_dyn_result = proc.dyn_result.get();
             self.proc_has_dyn_region = false;
             self.carry_slot = null;
             self.pending_cell_slot = null;
@@ -18993,7 +19292,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.ret_ptr_slot = self.codegen.allocStackSlot(8);
                 const ret_ptr_reg = self.getArgumentRegister(1);
                 try self.codegen.emitStoreStack(.w64, self.ret_ptr_slot.?, ret_ptr_reg);
-                try self.bindErasedCallableAdapterParams(proc, proc.erased_call_args orelse base.invariant("LIR/codegen invariant violated: erased-callable proc has no erased call args", .{}));
+                try self.bindErasedCallableAdapterParams(proc, proc.erased_call_args.get() orelse base.invariant("LIR/codegen invariant violated: erased-callable proc has no erased call args", .{}));
                 hot_reload_code_ref_slot = try self.emitHotReloadEnterForHostCallable();
             } else if (proc.abi == .erased_record) {
                 try self.bindErasedRecordParams(proc);
@@ -19010,11 +19309,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 // Bind parameters to argument registers. Large returns use a hidden
                 // first argument register for the return buffer.
                 const initial_param_reg_idx: u8 = if (needs_ret_ptr) 1 else 0;
-                try self.bindProcParams(proc.args, initial_param_reg_idx, proc.dyn_result, procCarriesTailArgs(self.store, proc), proc.takesPendingCell());
+                try self.bindProcParams(proc.args, initial_param_reg_idx, proc.dyn_result.get(), procCarriesTailArgs(self.store, proc), proc.takesPendingCell());
             }
             if (proc.uses_pending_cell and !proc.takesPendingCell()) try self.emitOwnPendingCell(invocation_slot);
 
-            if (proc.hosted) |hosted| {
+            if (proc.hosted.get()) |hosted| {
                 try self.generateCAbiProcWrapper(.{ .hosted = hosted }, proc);
             } else {
                 const body = requireProcBody(proc_id, proc);
@@ -19210,7 +19509,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// calls; it releases its carry when it returns or replaces its own
         /// frame. Every other caller passes none.
         fn procCarriesTailArgs(store: *const LirStore, proc: LirProcSpec) bool {
-            if (proc.abi != .roc or proc.tail_group == null) return false;
+            if (proc.abi != .roc or proc.tail_group == .none) return false;
             const params = store.getLocalSpan(proc.args);
             for (0..params.len) |i| {
                 if (store.getLocal(GuardedList.at(params, i)).dyn != null) return true;
@@ -19239,7 +19538,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         fn requireProcBody(proc_id: lir.LIR.LirProcSpecId, proc: LirProcSpec) lir.LIR.CFStmtId {
-            return proc.body orelse base.invariant(
+            return proc.body.get() orelse base.invariant(
                 "Dev/codegen invariant violated: non-hosted proc {d} (symbol {d}) missing statement body",
                 .{ @backingInt(proc_id), proc.name.raw() },
             );
@@ -19250,7 +19549,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             callee: CAbiCallee,
             proc: LirProcSpec,
         ) Allocator.Error!void {
-            if (builtin.mode == .debug and proc.body != null) {
+            if (builtin.mode == .debug and proc.body != .none) {
                 base.invariant(
                     "Dev/codegen invariant violated: C-ABI proc {d} unexpectedly carried a statement body",
                     .{proc.name.raw()},
@@ -19988,7 +20287,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.saveIncomingPointerArg(capture_ptr_slot, 3);
             try self.saveIncomingPointerArg(reuse_ptr_slot, 4);
 
-            const capture_arg = proc.erased_capture_arg orelse base.invariant("Dev/codegen invariant violated: erased callable proc had no capture argument", .{});
+            const capture_arg = proc.erased_capture_arg.get() orelse base.invariant("Dev/codegen invariant violated: erased callable proc had no capture argument", .{});
             const explicit_count = locals.len - 2;
             if (builtin.mode == .debug and GuardedList.at(locals, explicit_count) != capture_arg) {
                 base.invariant("Dev/codegen invariant violated: erased callable capture argument was not the first hidden parameter", .{});
@@ -20948,6 +21247,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 self.localLayout(assign_stmt.target),
                                 assign.capture_layout,
                                 assign.on_drop,
+                                assign.on_copy,
                                 assign.reuse,
                                 assign.reuse_unique,
                             );
@@ -23835,7 +24135,7 @@ fn addNoArgProc(store: *LirStore, body: CFStmtId, ret_layout: layout.Idx) Alloca
         .name = store.freshSyntheticSymbol(),
         .identity = lir.LIR.ProcIdentity.forTest(1),
         .args = LocalSpan.empty(),
-        .body = body,
+        .body = .some(body),
         .ret_layout = ret_layout,
     }, .none);
 }
@@ -23845,7 +24145,7 @@ fn addProc(store: *LirStore, args: []const LocalId, body: CFStmtId, ret_layout: 
         .name = store.freshSyntheticSymbol(),
         .identity = lir.LIR.ProcIdentity.forTest(2),
         .args = try store.addLocalSpan(args),
-        .body = body,
+        .body = .some(body),
         .ret_layout = ret_layout,
     }, .none);
 }
@@ -24904,9 +25204,9 @@ test "Windows erased callable ABI reads reuse pointer from caller stack" {
         .name = store.freshSyntheticSymbol(),
         .identity = lir.LIR.ProcIdentity.forTest(3),
         .args = args,
-        .erased_reuse_arg = reuse_arg,
-        .erased_call_args = arg_plan,
-        .erased_capture_arg = capture_arg,
+        .erased_reuse_arg = .of(reuse_arg),
+        .erased_call_args = .of(arg_plan),
+        .erased_capture_arg = .of(capture_arg),
         .ret_layout = .u64,
     };
     try codegen.bindErasedCallableAdapterParams(proc, arg_plan);
@@ -25913,7 +26213,7 @@ fn addHostedCallRoot(
         .identity = lir.LIR.ProcIdentity.forTest(4),
         .args = try store.addLocalSpan(params),
         .ret_layout = .i64,
-        .hosted = .{ .symbol = try store.insertString(symbol_name), .dispatch_index = 0 },
+        .hosted = .some(.{ .symbol = try store.insertString(symbol_name), .dispatch_index = 0 }),
     }, .none);
 
     const args = try allocator.alloc(LocalId, arg_layouts.len);
@@ -26011,7 +26311,7 @@ test "symbol producer caches reuse identities and reset with generated code" {
     const local = try store.addLocal(.{ .layout_idx = .str });
     const end = try store.addCFStmt(.{ .ret = .{ .value = local } }, .test_fixture);
     const body = try store.addCFStmt(.{ .assign_literal = .{ .target = local, .value = .{ .str_literal = .{ .backing = literal, .offset = 0, .len = @intCast(store.getString(literal).len) } }, .next = end } }, .test_fixture);
-    _ = try store.addProcSpec(.{ .name = store.freshSyntheticSymbol(), .identity = lir.LIR.ProcIdentity.forTest(11), .args = .empty(), .body = body, .ret_layout = .str }, .none);
+    _ = try store.addProcSpec(.{ .name = store.freshSyntheticSymbol(), .identity = lir.LIR.ProcIdentity.forTest(11), .args = .empty(), .body = .some(body), .ret_layout = .str }, .none);
     var test_state = try TestLayoutState.init(allocator);
     defer test_state.deinit();
     inline for (.{ RocTarget.x64linux, RocTarget.arm64linux }) |target| {
@@ -26082,7 +26382,7 @@ test "independent fragment emits only requested procedure with unresolved self a
             .name = store.freshSyntheticSymbol(),
             .identity = LIR.ProcIdentity.forTest(81),
             .args = .empty(),
-            .body = call,
+            .body = .some(call),
             .ret_layout = .i64,
         }, .none);
         var cg = try LirCodeGen(target).init(allocator, &store, &layouts.layout_store, .{}, .default);
@@ -26155,7 +26455,7 @@ test "independent fragment symbolic calls resolve after all procedures are place
             .name = store.freshSyntheticSymbol(),
             .identity = LIR.ProcIdentity.forTest(99),
             .args = .empty(),
-            .body = call,
+            .body = .some(call),
             .ret_layout = .i64,
         }, .none);
         var image = try CG.init(allocator, &store, &layouts.layout_store, .{}, .default);

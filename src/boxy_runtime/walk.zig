@@ -147,8 +147,8 @@ pub fn copy(desc: *const TypeDesc, dst: [*]u8, src: [*]const u8) void {
 }
 
 /// Copy `size` bytes from `src` to `dst`, which may overlap. A 1-, 2-, 4-,
-/// 8-, or 16-byte value is one load and one store; other sizes move through
-/// `@memmove`.
+/// 8-, 16-, or 24-byte value is loaded whole and then stored; other sizes
+/// move through `@memmove`.
 pub inline fn copyBytes(dst: [*]u8, src: [*]const u8, size: usize) void {
     switch (size) {
         0 => {},
@@ -157,6 +157,7 @@ pub inline fn copyBytes(dst: [*]u8, src: [*]const u8, size: usize) void {
         4 => copyScalar(u32, dst, src),
         8 => copyScalar(u64, dst, src),
         16 => copyScalar(u128, dst, src),
+        24 => copyScalar([3]u64, dst, src),
         else => @memmove(dst[0..size], src[0..size]),
     }
 }
@@ -249,10 +250,10 @@ noinline fn increfComposite(desc: *const TypeDesc, ptr: [*]u8, count: isize, ops
 
 const DecrefWork = union(enum) {
     value: Value,
-    /// Release a unique box whose payload was released before it.
-    release_box: struct { alloc: ?[*]u8, alignment: u32 },
-    /// Release a unique list whose elements were released before it.
-    release_list: struct { list: RocList, alignment: u32 },
+    /// Free a box whose last reference was released, after its payload.
+    free_box: struct { alloc: ?[*]u8, alignment: u32 },
+    /// Free a list whose last reference was released, after its elements.
+    free_list: struct { list: RocList, alignment: u32 },
 };
 
 const DecrefWalker = struct {
@@ -309,8 +310,8 @@ noinline fn decrefComposite(desc: *const TypeDesc, ptr: [*]u8, ops: *RocOps) voi
     defer walker.stack.deinit(ops);
     walker.stack.push(.{ .value = .at(desc, ptr) }, ops);
     while (walker.stack.pop()) |work| switch (work) {
-        .release_box => |box| utils.decrefDataPtr(box.alloc, box.alignment, true, .atomic, ops),
-        .release_list => |list| utils.decref(list.list.getAllocationDataPtr(ops), list.list.capacity_or_alloc_ptr, list.alignment, true, .atomic, ops),
+        .free_box => |box| utils.freeDataPtrC(box.alloc, box.alignment, true, ops),
+        .free_list => |list| list.list.freeAllocation(list.alignment, true, ops),
         .value => |pending| {
             var value = pending;
             // Keep cleanup sentinels and siblings pending while following a child.
@@ -323,25 +324,29 @@ noinline fn decrefComposite(desc: *const TypeDesc, ptr: [*]u8, ops: *RocOps) voi
                         const elem = d.child.?;
                         const list = value.rocList().*;
                         const alignment: u32 = if (elem.size == 0) 1 else elem.alignment;
-                        if (elem.flags.contains_refcounted and list.isUnique(ops)) {
-                            walker.stack.push(.{ .release_list = .{ .list = list, .alignment = alignment } }, ops);
-                            walker.element_desc = elem;
-                            const start = walker.stack.len;
-                            list.decrefElements(elem.size, @ptrCast(&walker), &DecrefWalker.pushElement, ops);
-                            walker.stack.reverseFrom(start);
-                        } else {
-                            list.decref(alignment, elem.size, elem.flags.contains_refcounted, null, &builtins.list.rcNone, ops);
+                        if (list.releaseAllocation(.atomic, ops)) {
+                            if (elem.flags.contains_refcounted) {
+                                walker.stack.push(.{ .free_list = .{ .list = list, .alignment = alignment } }, ops);
+                                walker.element_desc = elem;
+                                const start = walker.stack.len;
+                                list.decrefElements(elem.size, @ptrCast(&walker), &DecrefWalker.pushElement, ops);
+                                walker.stack.reverseFrom(start);
+                            } else {
+                                list.freeAllocation(alignment, false, ops);
+                            }
                         }
                     },
                     .box, .recursive_box => {
                         const payload = d.child.?;
                         if (payload.size == 0) break;
                         const alloc = value.word();
-                        if (payload.flags.contains_refcounted and alloc != null and utils.isUnique(alloc, ops)) {
-                            walker.stack.push(.{ .release_box = .{ .alloc = alloc, .alignment = payload.alignment } }, ops);
-                            walker.stack.push(.{ .value = value.boxPayload() }, ops);
-                        } else {
-                            utils.decrefDataPtr(alloc, payload.alignment, payload.flags.contains_refcounted, .atomic, ops);
+                        if (utils.releaseDataPtr(alloc, .atomic, ops)) {
+                            if (payload.flags.contains_refcounted) {
+                                walker.stack.push(.{ .free_box = .{ .alloc = alloc, .alignment = payload.alignment } }, ops);
+                                walker.stack.push(.{ .value = value.boxPayload() }, ops);
+                            } else {
+                                utils.freeDataPtrC(alloc, payload.alignment, false, ops);
+                            }
                         }
                     },
                     .erased_callable => erased_callable.decref(value.word(), ops),
@@ -384,6 +389,13 @@ pub fn captureDrop(capture: ?[*]u8, ops: *RocOps) callconv(.c) void {
     const record = capture.?;
     const record_desc: *const TypeDesc = @ptrCast(@alignCast(@as(*const ?*const anyopaque, @ptrCast(@alignCast(record))).*.?));
     decref(record_desc, record, ops);
+}
+
+/// Retain the independently copied references of a dynamic capture record.
+pub fn captureIncref(capture: ?[*]u8, count: isize, ops: *RocOps) void {
+    const record = capture.?;
+    const record_desc: *const TypeDesc = @ptrCast(@alignCast(@as(*const ?*const anyopaque, @ptrCast(@alignCast(record))).*.?));
+    incref(record_desc, record, count, ops);
 }
 
 // Builtin list element callbacks. The context is the element descriptor; the
@@ -773,8 +785,9 @@ const InspectCtx = struct {
             .record => .{ .record = named },
             .tuple => .{ .tuple = named },
             .tag_union => if (d.flags.presence_slot) .{ .presence_slot = named } else .{ .tag_union = named },
-            // A box of a function is the callable itself (design.md "Function Values").
-            .erased_callable => if (d.child) |function| .{ .box = .at(function, value.ptr, null) } else .function,
+            // Boxed sequences and functions share the erased allocation but
+            // only sequences carry a separate record view.
+            .erased_callable => if (d.child) |child_desc| .{ .box = .at(child_desc, if (child_desc.flags.sequence) builtins.boxed_sequence.recordPtr(value.word().?) else value.ptr, null) } else .function,
             .nominal => .{ .nominal = .{
                 .override = if (override(d, .to_inspect) != null) named else null,
                 .backing = if (d.flags.inspect_opaque) null else .at(d.child.?, value.ptr, named.childNames()),

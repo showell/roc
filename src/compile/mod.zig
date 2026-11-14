@@ -171,6 +171,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_10940_test.zig"));
     std.testing.refAllDecls(@import("test/issue_10977_test.zig"));
     std.testing.refAllDecls(@import("test/issue_10980_test.zig"));
+    std.testing.refAllDecls(@import("test/llvm_inline_policy_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11004_test.zig"));
     std.testing.refAllDecls(@import("test/issue_10991_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11103_test.zig"));
@@ -191,7 +192,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_11158_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11199_test.zig"));
     std.testing.refAllDecls(@import("test/structural_codec_worker_test.zig"));
-    std.testing.refAllDecls(@import("test/boxy_list_u8_worker_test.zig"));
+    std.testing.refAllDecls(@import("test/boxy_list_int_worker_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11175_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11233_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11259_test.zig"));
@@ -226,6 +227,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_12727_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12717_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12787_test.zig"));
+    std.testing.refAllDecls(@import("test/issue_12988_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12617_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12682_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12722_test.zig"));
@@ -260,6 +262,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_12039_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12393_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12434_test.zig"));
+    std.testing.refAllDecls(@import("test/dispatch_lowering_visibility_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11471_test.zig"));
     std.testing.refAllDecls(@import("test/interface_summary_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11525_test.zig"));

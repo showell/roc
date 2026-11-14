@@ -380,7 +380,7 @@ fn printParseErrors(gpa: std.mem.Allocator, source: []const u8, parse_ast: AST, 
     var line_offsets = try SafeList(u32).initCapacity(gpa, 256);
     defer line_offsets.deinit(gpa);
     {
-        const expected_idx = line_offsets.items.items.len;
+        const expected_idx = line_offsets.items().len;
         const idx = try line_offsets.append(gpa, 0);
         if (@backingInt(idx) != expected_idx) {
             base.invariant("fmt invariant violated: line offset appended at index {d}, expected {d}", .{ @backingInt(idx), expected_idx });
@@ -388,7 +388,7 @@ fn printParseErrors(gpa: std.mem.Allocator, source: []const u8, parse_ast: AST, 
     }
     for (source, 0..) |c, i| {
         if (c == '\n') {
-            const expected_idx = line_offsets.items.items.len;
+            const expected_idx = line_offsets.items().len;
             const idx = try line_offsets.append(gpa, @intCast(i));
             if (@backingInt(idx) != expected_idx) {
                 base.invariant("fmt invariant violated: line offset appended at index {d}, expected {d}", .{ @backingInt(idx), expected_idx });
@@ -404,8 +404,8 @@ fn printParseErrors(gpa: std.mem.Allocator, source: []const u8, parse_ast: AST, 
     try stderr.print("Errors:\n", .{});
     for (parse_ast.parse_diagnostics.items) |err| {
         const region = parse_ast.tokens.resolve(@intCast(err.region.start));
-        const line = binarySearch(line_offsets.items.items, region.start.offset) orelse unreachable; // line_offsets starts with offset 0, which is at most every needle
-        const column = region.start.offset - line_offsets.items.items[line];
+        const line = binarySearch(line_offsets.items(), region.start.offset) orelse unreachable; // line_offsets starts with offset 0, which is at most every needle
+        const column = region.start.offset - line_offsets.items()[line];
         const token = parse_ast.tokens.tokens.items(.tag)[err.region.start];
         // TODO: pretty print the parse failures.
         try stderr.print("\t{s}, at token {s} at {d}:{d}\n", .{ @tagName(err.tag), @tagName(token), line + 1, column });
@@ -598,7 +598,7 @@ const Formatter = struct {
         fmt.ast.store.emptyScratch();
         const file = fmt.ast.store.getFile();
         const header = fmt.ast.store.getHeader(file.header);
-        const header_region = fmt.ast.store.nodes.items.items(.region)[@backingInt(file.header)];
+        const header_region = fmt.ast.store.nodes.field(.region)[@backingInt(file.header)];
         // Only flush comments before the header if it has its own tokens.
         // type_module, default_app, and malformed headers share the first statement's token,
         // so flushing here would duplicate the whitespace handling.
@@ -2038,9 +2038,12 @@ const Formatter = struct {
     };
 
     fn ifCondition(fmt: *Formatter, condition: AST.Expr.Idx, then: AST.Expr.Idx) IfCondition {
-        if (fmt.ast.store.getExpr(condition) == .malformed) return .as_written;
+        const condition_expr = fmt.ast.store.getExpr(condition);
+        if (condition_expr == .malformed) return .as_written;
         if (fmt.ast.store.getExpr(then) != .block) {
-            return if (fmt.groupedInner(condition) == null) .parenthesized else .as_written;
+            // Tuples already delimit the condition, even when comments prevent
+            // removing their parentheses.
+            return if (condition_expr == .tuple) .as_written else .parenthesized;
         }
         var inner = fmt.groupedInner(condition) orelse return .as_written;
         while (fmt.groupedInner(inner)) |next| inner = next;
@@ -4025,7 +4028,7 @@ const Formatter = struct {
     }
 
     fn nodeRegion(fmt: *Formatter, idx: u32) AST.TokenizedRegion {
-        return fmt.ast.store.nodes.items.items(.region)[idx];
+        return fmt.ast.store.nodes.field(.region)[idx];
     }
 
     /// Mark the redundant `..` in one statement list's type annotations before
@@ -9861,6 +9864,48 @@ test "if condition is parenthesized unless the then branch is a block" {
             "commented = |n| if (\n\tn < 0 # why\n) {\n\t-n\n} else n\n",
         result,
     );
+}
+
+test "issue 12916: commented if conditions do not gain parentheses" {
+    const cases = [_]struct { input: []const u8, expected: []const u8 }{
+        .{
+            .input = "x = if (True # comment\n) True else False\n\nmain! = |_| Ok({})\n",
+            .expected = "x = if (\n\tTrue # comment\n) True else False\n\nmain! = |_| Ok({})\n",
+        },
+        .{
+            .input = "x = if (# before\nTrue) True else False\n",
+            .expected = "x = if ( # before\n\tTrue\n) True else False\n",
+        },
+        .{
+            .input = "x = if (True and # inside\nFalse) True else False\n",
+            .expected = "x = if (\n\tTrue and # inside\n\t\tFalse\n) True else False\n",
+        },
+        .{
+            .input = "x = if ((True # nested\n)) True else False\n",
+            .expected = "x = if (\n\t(\n\t\tTrue # nested\n\t)\n) True else False\n",
+        },
+        .{
+            .input = "main! = |_| if (True # comment\n) Ok({})\n",
+            .expected = "main! = |_| if (\n\tTrue # comment\n) Ok({})\n",
+        },
+        .{
+            .input = "x = if False True else if (True # comment\n) True else False\n",
+            .expected = "x = if (False) True else if (\n\tTrue # comment\n) True else False\n",
+        },
+        .{
+            .input = "x = if (True # comment\n) { value: 1 } else { value: 2 }\n",
+            .expected = "x = if (\n\tTrue # comment\n) { value: 1 } else { value: 2 }\n",
+        },
+        .{
+            .input = "x = if (True # comment\n) { True } else False\n",
+            .expected = "x = if (\n\tTrue # comment\n) {\n\tTrue\n} else False\n",
+        },
+    };
+    for (cases) |case| {
+        const result = try moduleFmtsStable(std.testing.allocator, case.input, false);
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings(case.expected, result);
+    }
 }
 
 test "else block aligns with if when only the else branch has braces" {

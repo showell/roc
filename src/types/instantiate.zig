@@ -380,11 +380,13 @@ pub const Instantiator = struct {
 
     /// A rank-1 scheme can contain quantified leaves below monomorphic
     /// structural nodes. While instantiating such a scheme, copy exactly the
-    /// monomorphic nodes from which a generalized variable is reachable (as
-    /// recorded in `Scratch.reach_state`) so the walk reaches every
-    /// generalized descendant. Every other monomorphic node stays shared: it
-    /// is not quantified, so each use must see the same node, including a
-    /// function node's effect kind and effect dependencies.
+    /// monomorphic nodes from which a generalized variable or per-use
+    /// structure (`DescriptorFlags.per_use_structure`) is reachable,
+    /// per-use structure included (as recorded in `Scratch.reach_state`), so
+    /// the walk reaches every node each use must own. Every other monomorphic
+    /// node stays shared: it is not quantified, so each use must see the same
+    /// node, including a function node's effect kind and effect
+    /// dependencies.
     copy_scheme_structure: bool = false,
     /// Set by a caller that knows the next scheme root it instantiates has no
     /// monomorphic structural node from which a generalized variable is
@@ -411,11 +413,12 @@ pub const Instantiator = struct {
     /// variables—every use constrains the same var the body's annotation
     /// regeneration constrains—instead of an independent unconstrained copy.
     share_vars: []const Var = &.{},
-    /// Source subtrees this instantiation reads from an earlier copy: each
-    /// source var maps to that copy in `var_map` before the walk starts, so
-    /// the walk shares the copy instead of copying the subtree again. Only
-    /// sound for a subtree whose copy is a ground type identical to what a
-    /// fresh copy would produce (see `Check.instantiateVarPolarized`).
+    /// Source vars this instantiation maps to given vars: each source var
+    /// maps to its copy in `var_map` before the walk starts. Either a
+    /// subtree read from an earlier copy, sound only for a subtree whose
+    /// copy is a ground type identical to what a fresh copy would produce
+    /// (see `Check.instantiateVarPolarized`), or a variable substituted by
+    /// variable (`Check.openNominalBackingFromTemplate`).
     shared_subtrees: []const SharedSubtree = &.{},
     /// Share every leaf (flex, rigid, field presence, error) whatever its
     /// rank, copying only structure and resolving polarity markers. This is
@@ -698,7 +701,8 @@ pub const Instantiator = struct {
     }
 
     /// Fill `Scratch.reach_state` for every node reachable from `root`: true
-    /// when a generalized variable is reachable from that node. The walk
+    /// when a generalized variable, or structure every use copies
+    /// (`schemeCopiesNode`), is reachable from that node. The walk
     /// follows exactly the child edges the copy follows, stops at monomorphic
     /// flex and rigid leaves (shared, so their constraints are shared too),
     /// and records every edge by its child. Reachability then propagates from
@@ -715,7 +719,7 @@ pub const Instantiator = struct {
         reach_state.clearRetainingCapacity();
 
         const root_resolved = self.store.resolveVar(root);
-        try reach_state.put(root_resolved.var_, root_resolved.desc.rank == .generalized);
+        try reach_state.put(root_resolved.var_, schemeCopiesNode(root_resolved.desc));
         try machine.reach_stack.append(self.store.gpa, root_resolved.var_);
 
         while (machine.reach_stack.pop()) |parent| {
@@ -730,7 +734,7 @@ pub const Instantiator = struct {
                     arg_span.dropFirstElem();
                     var i: u32 = 0;
                     while (i < arg_span.count) : (i += 1) {
-                        try self.visitReachChild(parent, self.store.vars.items.items[@backingInt(arg_span.start) + i]);
+                        try self.visitReachChild(parent, self.store.vars.items[@backingInt(arg_span.start) + i]);
                     }
                     try self.visitReachChild(parent, self.store.getAliasBackingVar(alias));
                 },
@@ -796,7 +800,7 @@ pub const Instantiator = struct {
     fn visitReachVars(self: *Self, parent: Var, vars: Var.SafeList.Range) std.mem.Allocator.Error!void {
         var i: u32 = 0;
         while (i < vars.count) : (i += 1) {
-            try self.visitReachChild(parent, self.store.vars.items.items[@backingInt(vars.start) + i]);
+            try self.visitReachChild(parent, self.store.vars.items[@backingInt(vars.start) + i]);
         }
     }
 
@@ -814,7 +818,7 @@ pub const Instantiator = struct {
     fn visitReachConstraints(self: *Self, parent: Var, constraints: StaticDispatchConstraint.SafeList.Range) std.mem.Allocator.Error!void {
         var i: u32 = 0;
         while (i < constraints.len()) : (i += 1) {
-            const constraint = self.store.static_dispatch_constraints.items.items[@backingInt(constraints.start) + i];
+            const constraint = self.store.static_dispatch_constraints.items()[@backingInt(constraints.start) + i];
             try self.visitReachChild(parent, constraint.fn_var);
             if (constraint.interpolation.isPresent()) {
                 const metadata = self.store.getInterpolationMetadata(constraint.interpolation);
@@ -840,8 +844,16 @@ pub const Instantiator = struct {
         head.value_ptr.* = edge_idx;
         const entry = try machine.reach_state.?.getOrPut(resolved.var_);
         if (entry.found_existing) return;
-        entry.value_ptr.* = resolved.desc.rank == .generalized;
+        entry.value_ptr.* = schemeCopiesNode(resolved.desc);
         try machine.reach_stack.append(self.store.gpa, resolved.var_);
+    }
+
+    /// Whether every instantiation of a scheme copies this node itself: a
+    /// generalized variable, or anonymous structure made in the scheme's own
+    /// scope, which a use may lift into a nominal type
+    /// (`DescriptorFlags.per_use_structure`).
+    fn schemeCopiesNode(desc: types_mod.Descriptor) bool {
+        return desc.rank == .generalized or desc.flags.per_use_structure;
     }
 
     /// Resolve shared declaration binders before copying. Every semantic
@@ -988,7 +1000,7 @@ pub const Instantiator = struct {
         const allocator = self.store.gpa;
         var i: u32 = 0;
         while (i < constraints.len()) : (i += 1) {
-            const constraint = self.store.static_dispatch_constraints.items.items[@backingInt(constraints.start) + i];
+            const constraint = self.store.static_dispatch_constraints.items()[@backingInt(constraints.start) + i];
             // A method signature is its own annotation root, generated at the
             // output polarity whatever position its dispatcher occupies.
             try pending.append(allocator, .{ .var_ = constraint.fn_var, .polarity = .pos, .reach = .nested });
@@ -1094,10 +1106,11 @@ pub const Instantiator = struct {
         }
 
         // Ordinary instantiation shares every non-generalized var. A binding
-        // explicitly classified as a scheme instead copies the non-generalized
-        // structural nodes from which a generalized leaf is reachable, so
-        // generalized leaves at arbitrary depth remain reachable while every
-        // monomorphic node and leaf keeps its identity. A polarity marker is
+        // explicitly classified as a scheme instead copies its per-use
+        // structure and the non-generalized structural nodes from which a
+        // generalized leaf or per-use structure is reachable, so those stay
+        // reachable at arbitrary depth while every other monomorphic node and
+        // leaf keeps its identity. A polarity marker is
         // never shared: it stands for "decided by this instantiation" whatever
         // its rank (a where-method signature is instantiated per body use
         // before the enclosing scheme generalizes).
@@ -1487,20 +1500,20 @@ pub const Instantiator = struct {
     /// Append a copy of the constraint run `source` for a flex-like frame to
     /// rewrite in place, returning its raw base index.
     fn appendConstraintRunCopy(self: *Self, source: StaticDispatchConstraint.SafeList.Range) std.mem.Allocator.Error!u32 {
-        const constraints = &self.store.static_dispatch_constraints.items;
-        const fresh_start = std.math.cast(u32, constraints.items.len) orelse return error.OutOfMemory;
+        const constraints = &self.store.static_dispatch_constraints;
+        const fresh_start = std.math.cast(u32, constraints.items().len) orelse return error.OutOfMemory;
         try constraints.ensureUnusedCapacity(self.store.gpa, source.count);
         // The source run lives in the same list, so it is sliced only once
         // the list can no longer move.
         const source_start: usize = @backingInt(source.start);
-        constraints.appendSliceAssumeCapacity(constraints.items[source_start..][0..source.count]);
+        _ = constraints.appendSliceAssumeCapacity(constraints.items()[source_start..][0..source.count]);
         return fresh_start;
     }
 
     /// The fresh copy of the frame's current constraint. Re-fetched on every
     /// use, since child copies append to the same list.
     fn freshConstraint(self: *Self, frame: *const FlexLikeFrame) *StaticDispatchConstraint {
-        return &self.store.static_dispatch_constraints.items.items[frame.fresh_start + frame.cons_idx];
+        return &self.store.static_dispatch_constraints.items()[frame.fresh_start + frame.cons_idx];
     }
 
     fn stepFlexLike(self: *Self, frame: *FlexLikeFrame) std.mem.Allocator.Error!bool {
@@ -1521,7 +1534,7 @@ pub const Instantiator = struct {
                         try self.finishFrame(frame.common, fresh_content);
                         return true;
                     }
-                    const constraint = self.store.static_dispatch_constraints.items.items[frame.cons_start + frame.cons_idx];
+                    const constraint = self.store.static_dispatch_constraints.items()[frame.cons_start + frame.cons_idx];
                     frame.stage = .await_fn;
                     if (self.deferredCallable(constraint)) |source| {
                         frame.has_deferred = true;
@@ -1536,7 +1549,7 @@ pub const Instantiator = struct {
                 },
                 .await_fn => {
                     frame.fresh_fn_var = machine.value_stack.pop().?;
-                    const constraint = self.store.static_dispatch_constraints.items.items[frame.cons_start + frame.cons_idx];
+                    const constraint = self.store.static_dispatch_constraints.items()[frame.cons_start + frame.cons_idx];
                     try self.carryDerivedMapPlan(constraint.fn_var, frame.fresh_fn_var);
                     if (!constraint.interpolation.isPresent()) {
                         self.freshConstraint(frame).fn_var = frame.fresh_fn_var;
@@ -1549,7 +1562,7 @@ pub const Instantiator = struct {
                     }
                 },
                 .dispatch_part_or_item => {
-                    const constraint = self.store.static_dispatch_constraints.items.items[frame.cons_start + frame.cons_idx];
+                    const constraint = self.store.static_dispatch_constraints.items()[frame.cons_start + frame.cons_idx];
                     const metadata = self.store.getInterpolationMetadata(constraint.interpolation);
                     self.current_reach = .nested;
                     if (frame.part_idx == metadata.interpolated_parts.len()) {
@@ -1563,7 +1576,7 @@ pub const Instantiator = struct {
                 },
                 .await_part => {
                     const fresh_part_var = machine.value_stack.pop().?;
-                    const constraint = self.store.static_dispatch_constraints.items.items[frame.cons_start + frame.cons_idx];
+                    const constraint = self.store.static_dispatch_constraints.items()[frame.cons_start + frame.cons_idx];
                     const part = self.store.getInterpolationPartAt(self.store.getInterpolationMetadata(constraint.interpolation).interpolated_parts, frame.part_idx);
                     try machine.pending_parts.append(self.store.gpa, .{
                         .var_ = fresh_part_var,
@@ -1629,7 +1642,7 @@ pub const Instantiator = struct {
                 continue;
             }
             if (arrived <= frame.args_count) {
-                const arg_var = self.store.vars.items.items[frame.args_start + arrived - 1];
+                const arg_var = self.store.vars.items[frame.args_start + arrived - 1];
                 self.current_reach = .nested;
                 if (!try self.requestVar(arg_var, false)) return false;
                 continue;
@@ -1657,7 +1670,7 @@ pub const Instantiator = struct {
         while (true) {
             const arrived: u32 = @intCast(machine.value_stack.items.len - frame.vars_base);
             if (arrived < frame.elems_count) {
-                const elem_var = self.store.vars.items.items[frame.elems_start + arrived];
+                const elem_var = self.store.vars.items[frame.elems_start + arrived];
                 self.current_reach = .nested;
                 if (!try self.requestVar(elem_var, false)) return false;
                 continue;
@@ -1676,7 +1689,7 @@ pub const Instantiator = struct {
         while (true) {
             const arrived: u32 = @intCast(machine.value_stack.items.len - frame.vars_base);
             if (arrived < frame.args_count) {
-                const arg_var = self.store.vars.items.items[frame.args_start + arrived];
+                const arg_var = self.store.vars.items[frame.args_start + arrived];
                 const position: NominalArgumentPosition = if (self.nominal_argument_position) |provider|
                     (try provider.resolve(provider.context, frame.nominal, arrived, frame.saved_polarity)) orelse {
                         machine.value_stack.items.len = frame.vars_base;
@@ -1720,7 +1733,7 @@ pub const Instantiator = struct {
         while (true) {
             const arrived: u32 = @intCast(machine.value_stack.items.len - frame.vars_base);
             if (arrived < args_count) {
-                const arg_var = self.store.vars.items.items[@backingInt(frame.func.args.start) + arrived];
+                const arg_var = self.store.vars.items[@backingInt(frame.func.args.start) + arrived];
                 // Argument positions flip the surrounding polarity, and no
                 // row inside an argument is one a use may widen: a use widens
                 // the result, never a row inside a function that result
@@ -1738,7 +1751,7 @@ pub const Instantiator = struct {
                 continue;
             }
             if (arrived < args_count + 1 + deps_count) {
-                const dep_var = self.store.vars.items.items[@backingInt(frame.func.effect_deps.start) + (arrived - args_count - 1)];
+                const dep_var = self.store.vars.items[@backingInt(frame.func.effect_deps.start) + (arrived - args_count - 1)];
                 self.current_polarity = frame.saved_polarity;
                 self.current_reach = .nested;
                 if (!try self.requestVar(dep_var, false)) return false;
@@ -1883,7 +1896,7 @@ pub const Instantiator = struct {
                     if (arrived < tag.args.count) {
                         // Indexing through tag.args.start only happens when the
                         // tag has payloads; an empty run's start addresses no row.
-                        const arg_var = self.store.vars.items.items[@backingInt(tag.args.start) + arrived];
+                        const arg_var = self.store.vars.items[@backingInt(tag.args.start) + arrived];
                         self.current_reach = .nested;
                         if (!try self.requestVar(arg_var, false)) return false;
                         continue;

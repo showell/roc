@@ -17,7 +17,7 @@ test "derived parser: a record used only through field access closes before gene
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
 
-    try test_env.assertDefType("greet", "Str -> Try(Str, [InvalidJson(Str), MissingRequiredField(Str)])");
+    try test_env.assertDefType("greet", "Str -> Try(Str, [InvalidJson(Str)])");
 }
 
 test "derived parser: a field-accessed record's field type stays generic" {
@@ -36,7 +36,7 @@ test "derived parser: a field-accessed record's field type stays generic" {
     try test_env.assertNoErrors();
 }
 
-test "derived parser: callers see the required-field error of a field-accessed record" {
+test "derived parser: callers exhaustively handle the format error of a field-accessed record" {
     const source =
         \\greet = |json| {
         \\    person = Json.parse(json)?
@@ -54,10 +54,10 @@ test "derived parser: callers see the required-field error of a field-accessed r
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
 
-    try test_env.assertOneTypeError("Non Exhaustive Match");
+    try test_env.assertNoErrors();
 }
 
-test "derived parser: an annotation omitting the required-field error of a field-accessed record is rejected" {
+test "derived parser: a field-accessed record requires only its format error" {
     const source =
         \\greet = |json| {
         \\    person = Json.parse(json)?
@@ -71,7 +71,7 @@ test "derived parser: an annotation omitting the required-field error of a field
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
 
-    try test_env.assertOneTypeError("Type Mismatch");
+    try test_env.assertNoErrors();
 }
 
 test "derived parser: a shared value's record keeps collecting fields across definitions" {
@@ -106,7 +106,7 @@ test "derived parser: nested records used only through field access close before
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
 
-    try test_env.assertDefType("city", "Str -> Try(Str, [InvalidJson(Str), MissingRequiredField(Str)])");
+    try test_env.assertDefType("city", "Str -> Try(Str, [InvalidJson(Str)])");
 }
 
 test "derived parser: a nested record used only through field access closes outside any function" {
@@ -181,7 +181,7 @@ test "derived encoder: a boundary-local record literal's field kinds settle befo
     // The codec's error row reaches the signature's implicitly open row, but
     // no caller can change the record's codec, so the scheme needs no
     // codec evidence from its uses.
-    try std.testing.expectEqual(0, test_env.module_env.binding_scheme_codec_requirements.items.items.len);
+    try std.testing.expectEqual(0, test_env.module_env.binding_scheme_codec_requirements.items().len);
 }
 
 test "derived encoder: a record literal the signature reaches keeps its field kinds undetermined" {
@@ -196,7 +196,7 @@ test "derived encoder: a record literal the signature reaches keeps its field ki
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expect(test_env.module_env.binding_scheme_codec_requirements.items.items.len > 0);
+    try std.testing.expect(test_env.module_env.binding_scheme_codec_requirements.items().len > 0);
 }
 
 test "derived encoder: a record literal's field kind pinned by an optional access stays optional" {

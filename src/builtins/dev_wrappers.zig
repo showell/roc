@@ -253,6 +253,7 @@ const listAppendSublist = list.listAppendSublist;
 const listPrepend = list.listPrepend;
 const listSublist = list.listSublist;
 const listSublistBorrowed = list.listSublistBorrowed;
+const listClear = list.listClear;
 const listDropAt = list.listDropAt;
 const listReplace = list.listReplace;
 const listSet = list.listSet;
@@ -294,6 +295,18 @@ pub fn roc_builtins_str_concat(out: *RocStr, a_bytes: ?[*]u8, a_len: usize, a_ca
             return;
         }
     }
+    strConcatOutOfLine(out, a_bytes, a_len, a_cap, b_bytes, b_len, b_cap, update_mode);
+}
+
+/// Wrapper: strConcatC(RocStr, RocStr, UpdateMode, *RocOps) -> RocStr for
+/// the `str_append` low-level: a generated rendering joining a piece onto the
+/// string it is building. Same result and ownership as
+/// `roc_builtins_str_concat`, with no small-string path of its own: the
+/// string being built stops being small after its first pieces, so at these
+/// sites that path is a copy that never pays, and this wrapper is only the
+/// call. The update mode is forwarded to the builtin's uniqueness check;
+/// `.InPlace` skips it.
+pub fn roc_builtins_str_append(out: *RocStr, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, update_mode: utils.UpdateMode) callconv(.c) void {
     strConcatOutOfLine(out, a_bytes, a_len, a_cap, b_bytes, b_len, b_cap, update_mode);
 }
 
@@ -1018,6 +1031,19 @@ pub fn roc_builtins_list_sublist_borrowed(out: *RocList, list_bytes: ?[*]u8, lis
     out.* = listSublistBorrowed(l, element_width, start, len, elements_refcounted, roc_ops);
 }
 
+/// Wrapper: listClear(list) -> List. The update mode is forwarded to the
+/// builtin's uniqueness check; `.InPlace` skips it.
+pub fn roc_builtins_list_clear(out: *RocList, list_bytes: ?[*]u8, list_len: usize, list_cap: usize, alignment: u32, element_width: usize, elements_refcounted: bool, element_decref: ?RcDropFn, update_mode: utils.UpdateMode) callconv(.c) void {
+    const roc_ops = in_process_host.ops();
+    const l = RocList{ .bytes = list_bytes, .length = list_len, .capacity_or_alloc_ptr = list_cap };
+    if (elements_refcounted) {
+        const dec_ctx = elementDecrefContext(requireElementDecref(element_decref, roc_ops));
+        out.* = listClear(l, alignment, element_width, true, dec_ctx, &callbackListElementDecref, update_mode, roc_ops);
+    } else {
+        out.* = listClear(l, alignment, element_width, false, null, @ptrCast(&rcNone), update_mode, roc_ops);
+    }
+}
+
 /// Wrapper: listDropAt(list, index) -> List. The update mode is forwarded to
 /// the builtin's uniqueness check; `.InPlace` skips it.
 pub fn roc_builtins_list_drop_at(out: *RocList, list_bytes: ?[*]u8, list_len: usize, list_cap: usize, alignment: u32, element_width: usize, index: u64, elements_refcounted: bool, element_incref: ?RcIncFn, element_decref: ?RcDropFn, update_mode: utils.UpdateMode) callconv(.c) void {
@@ -1182,7 +1208,7 @@ pub fn roc_builtins_list_incref_single_thread(list_bytes: ?[*]u8, list_len: usiz
     l.increfWithAtomicity(amount, elements_refcounted, .single_thread, roc_ops);
 }
 
-/// Wrapper: decref a List(Str), including decref of each string element when unique
+/// Wrapper: decref a List(Str), including decref of each string element when this releases the last reference
 pub fn roc_builtins_list_decref_str(list_bytes: ?[*]u8, list_len: usize, list_cap: usize) callconv(.c) void {
     const roc_ops = in_process_host.ops();
     const l = RocList{ .bytes = list_bytes, .length = list_len, .capacity_or_alloc_ptr = list_cap };
@@ -1197,7 +1223,7 @@ pub fn roc_builtins_list_decref_str(list_bytes: ?[*]u8, list_len: usize, list_ca
     );
 }
 
-/// Decref a Roc list and optionally run an element decref callback when unique.
+/// Decref a Roc list and optionally run an element decref callback when this releases the last reference.
 pub fn roc_builtins_list_decref_with(list_bytes: ?[*]u8, list_len: usize, list_cap: usize, alignment: u32, element_width: usize, element_decref: ?RcDropFn) callconv(.c) void {
     const roc_ops = in_process_host.ops();
     const l = RocList{ .bytes = list_bytes, .length = list_len, .capacity_or_alloc_ptr = list_cap };
@@ -1228,16 +1254,15 @@ pub fn roc_builtins_list_decref_with_single_thread(list_bytes: ?[*]u8, list_len:
     const roc_ops = in_process_host.ops();
     const l = RocList{ .bytes = list_bytes, .length = list_len, .capacity_or_alloc_ptr = list_cap };
     if (element_decref) |callback| {
-        if (l.isUnique(roc_ops)) {
-            if (l.getAllocationDataPtr(roc_ops)) |source| {
-                const count = l.getAllocationElementCount(true, roc_ops);
-                var i: usize = 0;
-                while (i < count) : (i += 1) {
-                    callback(source + i * element_width);
-                }
+        if (!l.releaseAllocation(.single_thread, roc_ops)) return;
+        if (l.getAllocationDataPtr(roc_ops)) |source| {
+            const count = l.getAllocationElementCount(true, roc_ops);
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                callback(source + i * element_width);
             }
         }
-        utils.decref(l.getAllocationDataPtr(roc_ops), l.capacity_or_alloc_ptr, alignment, true, .single_thread, roc_ops);
+        l.freeAllocation(alignment, true, roc_ops);
     } else {
         decrefDataPtrSingleThreadC(l.getAllocationDataPtr(roc_ops), alignment, false, roc_ops);
     }
@@ -1363,17 +1388,17 @@ pub fn roc_builtins_box_prepare_update(payload_ptr: ?[*]u8, payload_size: usize,
     return fresh;
 }
 
-/// Decref a boxed payload and optionally run payload teardown when unique.
+/// Decref a boxed payload, running payload teardown when this releases the
+/// box's last reference.
 pub fn roc_builtins_box_decref_with(payload_ptr: ?[*]u8, payload_alignment: u32, payload_decref: ?RcDropFn) callconv(.c) void {
-    const roc_ops = in_process_host.ops();
-    const payload_has_refcounted_children = payload_decref != null;
-    if (payload_decref) |callback| {
-        if (utils.isUnique(payload_ptr, roc_ops)) {
-            callback(payload_ptr);
-        }
-    }
+    boxDecrefWith(payload_ptr, payload_alignment, payload_decref, .atomic);
+}
 
-    decrefDataPtrC(payload_ptr, payload_alignment, payload_has_refcounted_children, roc_ops);
+fn boxDecrefWith(payload_ptr: ?[*]u8, payload_alignment: u32, payload_decref: ?RcDropFn, atomicity: utils.RcAtomicity) void {
+    const roc_ops = in_process_host.ops();
+    if (!utils.releaseDataPtr(payload_ptr, atomicity, roc_ops)) return;
+    if (payload_decref) |callback| callback(payload_ptr);
+    freeDataPtrC(payload_ptr, payload_alignment, payload_decref != null, roc_ops);
 }
 
 /// Decref a boxed payload whose allocation is proven thread-confined: the box's
@@ -1382,16 +1407,7 @@ pub fn roc_builtins_box_decref_with(payload_ptr: ?[*]u8, payload_alignment: u32,
 /// parameter; the caller passes a callback whose body already matches the
 /// single-thread statement (see roc_builtins_list_decref_with_single_thread).
 pub fn roc_builtins_box_decref_with_single_thread(payload_ptr: ?[*]u8, payload_alignment: u32, payload_decref: ?RcDropFn) callconv(.c) void {
-    const roc_ops = in_process_host.ops();
-    const payload_has_refcounted_children = payload_decref != null;
-
-    if (payload_decref) |callback| {
-        if (utils.isUnique(payload_ptr, roc_ops)) {
-            callback(payload_ptr);
-        }
-    }
-
-    decrefDataPtrSingleThreadC(payload_ptr, payload_alignment, payload_has_refcounted_children, roc_ops);
+    boxDecrefWith(payload_ptr, payload_alignment, payload_decref, .single_thread);
 }
 
 /// Free a boxed payload and optionally run payload teardown first.
@@ -1425,21 +1441,7 @@ pub fn roc_builtins_erased_callable_decref(payload_ptr: ?[*]u8) callconv(.c) voi
 /// makes no thread-confinement claim, so capture-level count updates behind it
 /// stay atomic (atomic is always sound).
 pub fn roc_builtins_erased_callable_decref_single_thread(payload_ptr: ?[*]u8) callconv(.c) void {
-    const roc_ops = in_process_host.ops();
-    if (payload_ptr) |ptr| {
-        if (utils.isUnique(ptr, roc_ops)) {
-            const payload = erased_callable.payloadPtr(ptr);
-            if (payload.on_drop) |on_drop| {
-                on_drop(erased_callable.capturePtr(ptr), roc_ops);
-            }
-        }
-    }
-    decrefDataPtrSingleThreadC(
-        payload_ptr,
-        erased_callable.payload_alignment,
-        erased_callable.allocation_has_refcounted_children,
-        roc_ops,
-    );
+    erased_callable.decrefWithAtomicity(payload_ptr, .single_thread, in_process_host.ops());
 }
 
 /// Repack a consumed boxed erased callable allocation for a same-layout
@@ -1462,6 +1464,16 @@ pub fn roc_builtins_erased_callable_repack(reuse: ?[*]u8, callable_fn_ptr: erase
 pub fn roc_builtins_erased_callable_free(payload_ptr: ?[*]u8) callconv(.c) void {
     const roc_ops = in_process_host.ops();
     erased_callable.free(payload_ptr, roc_ops);
+}
+
+/// Consume an erased step into one opaque iterator/stream allocation.
+pub fn roc_builtins_boxed_sequence_pack(record: [*]const u8, record_size: usize, step_offset: usize) callconv(.c) [*]u8 {
+    return @import("boxed_sequence.zig").pack(record, record_size, step_offset, in_process_host.ops());
+}
+
+/// Read the private record view of an opaque iterator/stream allocation.
+pub fn roc_builtins_boxed_sequence_unpack(out: [*]u8, step: [*]u8, record_size: usize) callconv(.c) void {
+    @import("boxed_sequence.zig").unpack(out, step, record_size);
 }
 
 /// Enter the loaded dev-shim code image that contains the generated callsite.
@@ -1505,6 +1517,17 @@ pub fn roc_builtins_hot_reload_erased_callable_drop(capture_ptr: ?[*]u8, _: *Roc
         root.roc_hot_reload_release_retained(header.code_ref);
     } else {
         roc_builtins_hot_reload_leave(header.code_ref);
+    }
+}
+
+/// Retain the state and code image of an independently copied shim capture.
+pub fn roc_builtins_hot_reload_erased_callable_copy(capture_ptr: ?[*]u8, amount: isize) callconv(.c) void {
+    const header = erased_callable.hotReloadCaptureHeader(capture_ptr) orelse return;
+    if (header.original_on_copy) |retain| {
+        retain(erased_callable.hotReloadAdjustedCapturePtr(capture_ptr), amount);
+    }
+    if (comptime @hasDecl(@import("root"), "roc_hot_reload_retain_existing")) {
+        for (0..@intCast(amount)) |_| @import("root").roc_hot_reload_retain_existing(header.code_ref);
     }
 }
 
@@ -1569,12 +1592,6 @@ fn writeRocStrFromSlice(out: *RocStr, slice: []const u8, roc_ops: *RocOps) void 
             .length = slice.len,
         };
     }
-}
-
-/// Build a RocStr from static literal bytes owned by generated code.
-pub fn roc_builtins_str_from_literal(out: *RocStr, bytes: [*]const u8, len: usize) callconv(.c) void {
-    const roc_ops = in_process_host.ops();
-    writeRocStrFromSlice(out, bytes[0..len], roc_ops);
 }
 
 /// Wrapper: decToStrC (decomposed i128)

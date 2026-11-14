@@ -153,9 +153,9 @@ NO CHANGE
 						(record-destruct (label "z") (ident "z")
 							(required
 								(p-assign (ident "z")))))))
-			(e-dispatch-call (method "plus") (constraint-fn-var 361)
+			(e-dispatch-call (method "plus") (constraint-fn-var 358)
 				(receiver
-					(e-dispatch-call (method "plus") (constraint-fn-var 359)
+					(e-dispatch-call (method "plus") (constraint-fn-var 356)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "x"))))
@@ -190,7 +190,7 @@ NO CHANGE
 						(record-destruct (label "z") (ident "z")
 							(sub-pattern
 								(p-underscore))))))
-			(e-dispatch-call (method "plus") (constraint-fn-var 381)
+			(e-dispatch-call (method "plus") (constraint-fn-var 378)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -222,7 +222,7 @@ NO CHANGE
 						(record-destruct (label "#others") (ident "#others")
 							(rest-pattern
 								(p-underscore))))))
-			(e-dispatch-call (method "plus") (constraint-fn-var 394)
+			(e-dispatch-call (method "plus") (constraint-fn-var 391)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -254,9 +254,9 @@ NO CHANGE
 						(record-destruct (label "rest") (ident "rest")
 							(rest-pattern
 								(p-assign (ident "rest")))))))
-			(e-dispatch-call (method "plus") (constraint-fn-var 409)
+			(e-dispatch-call (method "plus") (constraint-fn-var 406)
 				(receiver
-					(e-dispatch-call (method "plus") (constraint-fn-var 405)
+					(e-dispatch-call (method "plus") (constraint-fn-var 402)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "x"))))

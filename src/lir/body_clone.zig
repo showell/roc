@@ -873,25 +873,25 @@ pub fn localIdLessThan(_: void, a: LocalId, b: LocalId) bool {
 /// host, and a non-Roc ABI proc's calling convention is fixed by its boundary.
 pub fn rewritableProcBody(store: *const LirStore, proc_id: LIR.LirProcSpecId) ?CFStmtId {
     const proc = store.getProcSpecImmediate(proc_id);
-    if (proc.hosted != null or proc.abi != .roc) return null;
-    return proc.body;
+    if (proc.hosted.get() != null or proc.abi != .roc) return null;
+    return proc.body.get();
 }
 
 /// Every statement reachable from a proc body, visited exactly once. Shared
 /// join targets are reached through whichever predecessor arrives first.
 pub const ReachableStmts = struct {
-    store: *LirStore,
+    store: *const LirStore,
     allocator: Allocator,
     work: std.ArrayList(CFStmtId),
     visited: collections.DenseMap(CFStmtId, void),
     lease: ?*WalkPool.Lease = null,
 
     /// Start a walk rooted at `body`.
-    pub fn init(store: *LirStore, body: CFStmtId) Allocator.Error!ReachableStmts {
+    pub fn init(store: *const LirStore, body: CFStmtId) Allocator.Error!ReachableStmts {
         return initWithAllocator(store, body, store.allocator);
     }
 
-    pub fn initWithAllocator(store: *LirStore, body: CFStmtId, allocator: Allocator) Allocator.Error!ReachableStmts {
+    pub fn initWithAllocator(store: *const LirStore, body: CFStmtId, allocator: Allocator) Allocator.Error!ReachableStmts {
         var work = std.ArrayList(CFStmtId).empty;
         errdefer work.deinit(allocator);
         try work.append(allocator, body);
@@ -904,7 +904,7 @@ pub const ReachableStmts = struct {
     }
 
     /// Lease an empty traversal, including its retained work stack and visited map.
-    pub fn initWithScratch(store: *LirStore, body: CFStmtId, scratch: *AnalysisScratch) Allocator.Error!ReachableStmts {
+    pub fn initWithScratch(store: *const LirStore, body: CFStmtId, scratch: *AnalysisScratch) Allocator.Error!ReachableStmts {
         const lease = try scratch.walks.acquire();
         var walk: ReachableStmts = .{
             .store = store,
@@ -1208,7 +1208,7 @@ pub fn cloneCallVariant(
     spec: CallVariantSpec,
 ) Allocator.Error!LIR.LirProcSpecId {
     const source_spec = store.getProcSpec(source);
-    const source_body = source_spec.body orelse
+    const source_body = source_spec.body.get() orelse
         base.invariant("{s}", .{"call-variant clone reached a proc with no body"});
     const source_args = store.getLocalSpan(source_spec.args);
 
@@ -1246,7 +1246,7 @@ pub fn cloneCallVariant(
     }
 
     const body = try cloner.cloneStmt(source_body);
-    const erased_reuse_arg = if (source_spec.erased_reuse_arg) |source_arg|
+    const erased_reuse_arg = if (source_spec.erased_reuse_arg.get()) |source_arg|
         try cloner.mapLocal(source_arg)
     else
         null;
@@ -1261,9 +1261,9 @@ pub fn cloneCallVariant(
         .name = store.freshSyntheticSymbol(),
         .identity = try callVariantIdentity(store, layouts, source_spec.identity, spec),
         .args = try store.addLocalSpan(variant_args.items),
-        .erased_reuse_arg = erased_reuse_arg,
+        .erased_reuse_arg = .of(erased_reuse_arg),
         .frame_locals = try store.addLocalSpan(frame_locals.items[0..unique_len]),
-        .body = body,
+        .body = .some(body),
         .ret_layout = spec.ret_layout,
         .abi = .roc,
     }, store.procLoc(source));
@@ -1352,7 +1352,7 @@ pub fn CallResultFusion(comptime Spec: type) type {
             if (!Spec.resultEligible(self.state, result_layout)) return false;
 
             const callee = self.store.getProcSpecImmediate(call.proc);
-            if (callee.body == null or callee.hosted != null or callee.abi != .roc) return false;
+            if (callee.body == .none or callee.hosted.get() != null or callee.abi != .roc) return false;
             if (callee.ret_layout != result_layout) return false;
 
             var chain = std.ArrayList(LocalId).empty;
@@ -1866,6 +1866,8 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                             .capture = try self.mapMaybeLocal(s.capture),
                             .capture_layout = s.capture_layout,
                             .on_drop = s.on_drop,
+                            .on_copy = s.on_copy,
+                            .frozen_capture_layout = s.frozen_capture_layout,
                             .reuse = try self.mapMaybeLocal(s.reuse),
                             .reuse_unique = s.reuse_unique,
                         }),
@@ -2548,7 +2550,7 @@ test "rewritableProcBody refuses procs whose body is not the compiler's to clone
         .identity = LIR.ProcIdentity.forTest(1),
         .args = try store.addLocalSpan(&.{}),
         .frame_locals = try store.addLocalSpan(&.{unit}),
-        .body = body,
+        .body = .some(body),
         .ret_layout = .zst,
         .abi = .roc,
     }, .none);
@@ -2559,7 +2561,7 @@ test "rewritableProcBody refuses procs whose body is not the compiler's to clone
         .identity = LIR.ProcIdentity.forTest(2),
         .args = try store.addLocalSpan(&.{}),
         .frame_locals = try store.addLocalSpan(&.{}),
-        .body = null,
+        .body = .none,
         .ret_layout = .zst,
         .abi = .roc,
     }, .none);
@@ -2570,7 +2572,7 @@ test "rewritableProcBody refuses procs whose body is not the compiler's to clone
         .identity = LIR.ProcIdentity.forTest(3),
         .args = try store.addLocalSpan(&.{}),
         .frame_locals = try store.addLocalSpan(&.{unit}),
-        .body = body,
+        .body = .some(body),
         .ret_layout = .zst,
         .abi = .erased_callable,
     }, .none);
@@ -3002,7 +3004,7 @@ test "dynamic product metadata survives call variant cloning" {
         // Descriptor after its value also exercises forward references.
         .args = try store.addLocalSpan(&.{ value, desc }),
         .frame_locals = try store.addLocalSpan(&.{ value, desc, unit }),
-        .body = body,
+        .body = .some(body),
         .ret_layout = .zst,
         .abi = .roc,
     }, .none);
